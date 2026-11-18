@@ -1,41 +1,56 @@
-# ZQuest Classic Android Preview
+<p align="center">
+  <img style="image-rendering: pixelated" width=400px src="./resources/assets/zc/ZC_Logo.png" alt="ZQuest Classic logo"/>
+</p>
 
-Unofficial native Android player preview; not an official ZQuest Classic release.
+# ZQuest Classic Mobile
 
-Download `ZQuestClassic-Android-Preview.apk` below. It supports ARM64 phones and
-x86-64 Android environments, Android 6.0/API 23 or newer. It is a debug-signed
-build, so dismiss Android's first-launch test-app notice.
+An unofficial, touch-first Android port of the [ZQuest Classic](https://github.com/ZQuestClassic/ZQuestClassic) player. Play the same `.qst` quests on your phone with an emulator-style on-screen pad, a native cog menu, and true quick save states.
 
-Open the app to see the quest library. Choose a folder (the picker opens in
-Downloads) to browse `.qst` and `.zip` quests there, or import an individual file.
-ZIP companion files are kept, and duplicate imports reuse the existing copy.
+[Latest Android builds](https://github.com/reeseroyster/zquestclassic-android/releases) · [Upstream project](https://github.com/ZQuestClassic/ZQuestClassic) · [How to play](https://zquestclassic.com/docs/how-to-play/)
 
-In game, **Home** returns to the library, **Menu** opens ZC's pause menu, and
-**Pad** toggles the on-screen controls. Touches elsewhere in the game no longer
-open the pause menu; use Menu or Escape. The Pad choice is remembered.
+> **What this is:** this port was built almost entirely by an AI agent (Hermes, on a Nous Research model) as a proof of concept — "can a desktop Zelda-like engine become a real mobile app?" It has since grown into a genuinely playable app: quests load, controls work, settings persist, and save states restore the live world. It is still a preview, not an official release, and it is **not affiliated with the ZQuest Classic team**. All engine credit belongs to them; this repo only adds the Android shell and mobile UX.
 
-## Test status
+## Features
 
-Tested on a Pixel 10 Pro with six quests from `Download/quests`; all imported,
-started and played. Menu, Home and Pad were exercised. A neutral gameplay-area
-tap was verified not to open the menu, and the explicit Menu button still does.
-Smoke test, not a full playthrough. The APK passes Android's 16 KB page-size
-compatibility checks. A teardown crash and bundled placeholder quest entries
-were also fixed.
+- **Emulator-style touch pad** — GBA/NES-inspired layout (A/B, L/R, Start/Map) with a floating analog stick, modelled on Dolphin/PPSSPP overlays.
+- **Native cog menu** — a mobile-first replacement for the desktop menu: Home, Save, Load, Quick Save, Quick Load, Pad, Settings, Pause, Step, Keyboard.
+- **True quick save states** — per-quest snapshots that restore the exact map/screen, hero position, enemies, items, weapons, FFCs and screen objects, as if nothing after the save happened. Separate from normal named save slots.
+- **ZQuest-themed UI** — library and menus styled with ZQuest's own palette and hard-edged panels; adaptive launcher icon.
+- **Phone-correct rendering** — aspect-correct fit, immersive fullscreen, rotation, and runtime `WindowInsets` so the UI clears the status bar and cutouts on any device.
+- **Full configuration surface** — the engine's settings, control-scheme editor, and text entry all work on-device.
 
-SHA-256: `3ac6a70cb6a4f76bc0925f710908bd111728f4463e3039cde968c68a6280225f`
+## Supported devices
 
-## Source
+- Android 6.0+ (`minSdk 23`), `targetSdk 35`.
+- Native builds for `arm64-v8a` and `x86_64`.
+- Tested on a Pixel 10 Pro and in Waydroid (Lineage 20).
 
-Patch applies to upstream base
-[`3e5476411344a770489cb5aa44eb80de2eac164d`](https://github.com/ZQuestClassic/ZQuestClassic/commit/3e5476411344a770489cb5aa44eb80de2eac164d).
-Requires NDK r27 or newer.
+## Install
+
+**Obtainium (recommended):** add `https://github.com/reeseroyster/zquestclassic-android` as a GitHub source, enable *Include prereleases*, and track the `app-debug.apk` asset. Updates then arrive as new prereleases.
+
+**Manual:** download `app-debug.apk` from the [latest release](https://github.com/reeseroyster/zquestclassic-android/releases) and sideload it. Then grant a quest folder (or import a `.qst`) from the library and tap a quest to play.
+
+## Building
+
+The Android app lives in [`android/`](./android). With an Android SDK + NDK (r27d), JDK 21, CMake and Gradle on the path:
 
 ```sh
-git clone https://github.com/ZQuestClassic/ZQuestClassic.git
-cd ZQuestClassic
-git checkout 3e5476411344a770489cb5aa44eb80de2eac164d
-curl -L -o /tmp/android-port.patch https://github.com/ueltyx/zquestclassic-android/releases/latest/download/android-port.patch
-git apply /tmp/android-port.patch
-./android/build.sh
+cd android
+gradle --no-daemon :app:assembleDebug
+# APK at app/build/outputs/apk/debug/app-debug.apk
 ```
+
+The engine is the upstream ZQuest Classic C++ core compiled for Android via Allegro; the mobile shell is Java (`PlayerActivity` / `MainActivity`) plus a small JNI layer for save states and input.
+
+## Images
+
+| Library | Gameplay |
+| --- | --- |
+| ![Library](./.github/screenshots/library.png) | ![Gameplay](./.github/screenshots/gameplay.png) |
+
+## Credits & license
+
+Engine, quests format, and all original game code: [ZQuest Classic](https://github.com/ZQuestClassic/ZQuestClassic) and its contributors. This repository is an independent Android port and preview distribution.
+
+GPLv3, same as upstream. See the [LICENSE](./LICENSE).
