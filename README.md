@@ -1,5 +1,5 @@
 <p align="center">
-  <img style="image-rendering: pixelated" width=400px src="https://raw.githubusercontent.com/ZQuestClassic/ZQuestClassic/main/resources/assets/zc/ZC_Logo.png" alt="ZQuest Classic logo"/>
+  <img style="image-rendering: pixelated" width=400px src="./.github/logo-mobile.png" alt="ZQuest Classic Mobile logo"/>
 </p>
 
 # ZQuest Classic Mobile
