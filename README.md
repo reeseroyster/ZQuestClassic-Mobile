@@ -56,6 +56,10 @@ The app adapts to any screen orientation — here it is in portrait and landscap
 
 <img src="./.github/screenshots/gameplay.png" width="640" alt="ZQuest Classic Mobile gameplay, landscape">
 
+**In-game settings**
+
+<img src="./.github/screenshots/settings.png" width="640" alt="ZQuest Classic Mobile in-game settings menu">
+
 ## License
 
 GPLv3, same as upstream. See [LICENSE](https://github.com/ZQuestClassic/ZQuestClassic/blob/main/LICENSE).
