@@ -46,23 +46,31 @@ The engine itself is upstream's C++ core; this repo only adds the Android layer 
 
 ## Images
 
-The app adapts to any screen orientation — here it is in portrait and landscape.
+The app adapts to any screen orientation — here it is in portrait and landscape,
+across a few different quests.
 
-**Quest library · portrait**
-
-<img src="./.github/screenshots/library.png" width="300" alt="ZQuest Classic Mobile quest library, portrait">
-
-**Gameplay · portrait**
-
-<img src="./.github/screenshots/gameplay-portrait.png" width="300" alt="ZQuest Classic Mobile gameplay, portrait">
-
-**Gameplay · landscape**
-
-<img src="./.github/screenshots/gameplay.png" width="640" alt="ZQuest Classic Mobile gameplay, landscape">
-
-**In-game settings**
-
-<img src="./.github/screenshots/settings.png" width="640" alt="ZQuest Classic Mobile in-game settings menu">
+<table>
+  <tr>
+    <td align="center">
+      <img src="./.github/screenshots/library.png" width="340" alt="ZQuest Classic Mobile quest library, portrait"><br>
+      <em>Quest library · portrait</em>
+    </td>
+    <td align="center">
+      <img src="./.github/screenshots/gameplay-portrait.png" width="340" alt="ZQuest Classic Mobile gameplay, portrait"><br>
+      <em>Gameplay · portrait</em>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="./.github/screenshots/gameplay.png" width="560" alt="ZQuest Classic Mobile gameplay, landscape"><br>
+      <em>Gameplay · landscape</em>
+    </td>
+    <td align="center">
+      <img src="./.github/screenshots/settings.png" width="560" alt="ZQuest Classic Mobile in-game settings menu"><br>
+      <em>In-game settings</em>
+    </td>
+  </tr>
+</table>
 
 ## License
 
