@@ -1,0 +1,83 @@
+stderr:
+
+Compiling 'errors_strings.zs'
+Pass 1: Parsing
+ERROR: expected a single character value - did you mean to use double quotes for a string? [errors_strings.zs Line 2 Column 46 ''should have been double quotes'']
+
+
+1    void strings() {
+2        char32 c1 = 'should have been double quotes'; // char too long
+                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+ERROR: Unknown escape character. [errors_strings.zs Line 3 Column 18 ''\c'']
+
+
+1    void strings() {
+2        char32 c1 = 'should have been double quotes'; // char too long
+3        char32 c2 = '\c'; // invalid escape
+                     ^~~~
+
+
+ERROR: expected a single character value - did you mean to use double quotes for a string? [errors_strings.zs Line 4 Column 46 ''should have been double quotes'']
+
+
+2    char32 c1 = 'should have been double quotes'; // char too long
+3    char32 c2 = '\c'; // invalid escape
+4    char32 c3 = 'should have been double quotes';
+                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+Failure!
+Compile finished with exit code '-1' (compiled with warnings)
+
+stdout:
+
+{
+  "success": false,
+  "code": -1,
+  "diagnostics": [
+    {
+      "range": {
+        "start": {
+          "line": 1,
+          "character": 13
+        },
+        "end": {
+          "line": 1,
+          "character": 45
+        }
+      },
+      "severity": 1,
+      "message": "ERROR: expected a single character value - did you mean to use double quotes for a string?"
+    },
+    {
+      "range": {
+        "start": {
+          "line": 2,
+          "character": 13
+        },
+        "end": {
+          "line": 2,
+          "character": 17
+        }
+      },
+      "severity": 1,
+      "message": "ERROR: Unknown escape character."
+    },
+    {
+      "range": {
+        "start": {
+          "line": 3,
+          "character": 13
+        },
+        "end": {
+          "line": 3,
+          "character": 45
+        }
+      },
+      "severity": 1,
+      "message": "ERROR: expected a single character value - did you mean to use double quotes for a string?"
+    }
+  ]
+}

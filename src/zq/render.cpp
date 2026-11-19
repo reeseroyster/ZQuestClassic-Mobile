@@ -1,0 +1,157 @@
+#include "zq/render.h"
+#include "zalleg/pal_tables.h"
+#include "zq/render_tooltip.h"
+#include "zalleg/render.h"
+#include "zconfig.h"
+#include "zalleg/gui.h"
+#include "zq/zquest.h"
+
+extern int32_t prv_mode;
+extern bool DragAspect;
+
+static auto rti_root = RenderTreeItem("root");
+static auto rti_screen = LegacyBitmapRTI("screen");
+static bool screen_never_freeze;
+static bool center_root_rti = true;
+static vector<size_t> unfrozen_dialogs;
+
+RenderTreeItem& gui_mouse_target()
+{
+	if (rti_dialogs.has_children())
+		return *rti_dialogs.get_children().back();
+	return rti_screen;
+}
+
+int window_mouse_x()
+{
+	return rti_screen.rel_mouse().first;
+}
+int window_mouse_y()
+{
+	return rti_screen.rel_mouse().second;
+}
+
+bool use_linear_bitmaps()
+{
+	static bool value = zc_get_config("zquest", "scaling_mode", 0) == 1;
+	return value;
+}
+
+static void init_render_tree()
+{
+	if (rti_root.has_children())
+		return;
+
+	rti_root.set_size(screen->w, screen->h);
+
+	set_bitmap_create_flags(true);
+	rti_screen.set_size(screen->w, screen->h);
+	rti_screen.bitmap = create_a5_bitmap(screen->w, screen->h);
+	rti_screen.a4_bitmap = screen;
+	rti_screen.visible = true;
+
+	rti_root.add_child(&rti_screen);
+	rti_root.add_child(&rti_dialogs);
+
+	al_set_new_bitmap_flags(0);
+
+	_init_render(al_get_bitmap_format(rti_screen.bitmap));
+}
+
+static void configure_render_tree()
+{
+	static bool scaling_force_integer = zc_get_config("zquest", "scaling_force_integer", 0) != 0;
+
+	int resx = al_get_display_width(all_get_display());
+	int resy = al_get_display_height(all_get_display());
+
+	{
+		int w = rti_screen.width;
+		int h = rti_screen.height;
+		auto [xscale, yscale] = fit_scale(resx, resy, w, h, DragAspect, scaling_force_integer);
+		rti_root.set_transform(center_root_rti ?
+			letterbox_transform(resx, resy, w, h, xscale, yscale) :
+			Transform{.xscale = xscale, .yscale = yscale});
+
+		// TODO: don't recreate screen bitmap when alternating fullscreen mode.
+		rti_screen.a4_bitmap = zqdialog_bg_bmp ? zqdialog_bg_bmp : screen;
+	}
+
+	// Not necessary, but a few things use `rti_dialogs.visible` for convenience.
+	rti_dialogs.visible = rti_dialogs.has_children();
+
+	// Freeze dialogs that won't be changing.
+	if (screen_never_freeze)
+		rti_screen.freeze = false;
+	else
+		rti_screen.freeze = rti_dialogs.has_children();
+	int i = 0;
+	size_t unfrz_count = unfrozen_dialogs.empty() ? 0 : unfrozen_dialogs.back();
+	while (i < rti_dialogs.get_children().size())
+	{
+		rti_dialogs.get_children()[i]->freeze = i < rti_dialogs.get_children().size() - 1 - unfrz_count;
+		i++;
+	}
+
+	reload_dialog_tint();
+}
+
+RenderTreeItem* get_root_rti()
+{
+	return &rti_root;
+}
+
+void set_center_root_rti(bool center)
+{
+	center_root_rti = center;
+}
+
+RenderTreeItem* get_screen_rti()
+{
+	return &rti_screen;
+}
+
+void zq_hide_screen(bool hidden)
+{
+	rti_screen.visible = !hidden;
+}
+
+void zq_set_screen_never_freeze(bool value)
+{
+	screen_never_freeze = value;
+}
+
+void zq_push_unfrozen_dialogs(size_t count)
+{
+	unfrozen_dialogs.push_back(count);
+}
+void zq_pop_unfrozen_dialogs()
+{
+	unfrozen_dialogs.pop_back();
+}
+
+void zq_freeze_all_rti(RenderTreeItem* rti)
+{
+	if (!rti) rti = &rti_root;
+
+	for (auto child : rti->get_children())
+	{
+		child->freeze = true;
+		zq_freeze_all_rti(child);
+	}
+}
+
+void render_zq()
+{
+	ALLEGRO_COLOR clear_color = al_map_rgb(RAMpal[0].r, RAMpal[0].g, RAMpal[0].b);
+	render_tree_present(&rti_root, clear_color, [] {
+		init_render_tree();
+		configure_render_tree();
+	});
+}
+
+void clear_tooltip()
+{
+	ttip_uninstall_all();
+}
+

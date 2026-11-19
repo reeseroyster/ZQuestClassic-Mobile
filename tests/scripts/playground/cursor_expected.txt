@@ -1,0 +1,60 @@
+stderr:
+
+Compiling 'cursor.zs'
+Pass 1: Parsing
+Pass 2: Preprocessing
+Pass 3: Registration
+Pass 4: Analyzing Code
+Pass 5: Checking code paths
+Pass 6: Generating object code
+Pass 7: Assembling
+Success!
+Compile finished with exit code '0' (success)
+
+stdout:
+
+{
+  "success": true,
+  "diagnostics": [],
+  "metadata": {
+    "currentFileSymbols": 4,
+    "symbols": 14,
+    "identifiers": 20,
+    "elided": true
+  }
+}
+
+zasm:
+
+QUIT; void run() Body
+PUSHR D0; void run(int) Params
+PUSHARGSV 0 0.0002; void run(int) Body Start
+SETR D4 SP2
+NOP
+SETV D2 0; while(true) #2 Body [Opt:AlwaysOn] Start
+PUSHR D2
+POP D0
+SETR D2 MOUSEARR
+STORE D2 0.0001
+SETV D2 1
+PUSHR D2
+POP D0
+SETR D2 MOUSEARR
+STORE D2 0
+PUSHV 3; InlineFunc[void screendata::DrawCombo(int, int, int, int, int, int, int, int, int, int, int, int, int, int, bool, int)] Params Start
+LOAD D2 0.0001
+PUSHR D2
+LOAD D2 0
+PUSHR D2
+LOAD D2 0.0002
+PUSHR D2
+PUSHARGSV 1 0.0002
+PUSHV 3
+PUSHARGSV -1 0.0002
+PUSHARGSV 0 0.0005
+PUSHV 1
+PUSHV 128; InlineFunc[void screendata::DrawCombo(int, int, int, int, int, int, int, int, int, int, int, int, int, int, bool, int)] Params End
+DRAWCOMBOR; InlineFunc[void screendata::DrawCombo(int, int, int, int, int, int, int, int, int, int, int, int, int, int, bool, int)] Body Start
+POPARGS D5 0.0016; InlineFunc[void screendata::DrawCombo(int, int, int, int, int, int, int, int, int, int, int, int, int, int, bool, int)] Body End
+WAITFRAME; InlineFunc[void Waitframe()] Body AND while(true) #2 Body [Opt:AlwaysOn] End
+GOTO 5; while() #2 End AND [Opt:NeverRet] AND void run(int) Body End

@@ -1,0 +1,48 @@
+diff --git i/src/android/android_display.c w/src/android/android_display.c
+index d5ccdf689..8a6d4a4cf 100644
+--- i/src/android/android_display.c
++++ w/src/android/android_display.c
+@@ -234,11 +234,21 @@ void _al_android_destroy_surface(JNIEnv *env, jobject surface, bool post)
+ 
+ void  _al_android_make_current(JNIEnv *env, ALLEGRO_DISPLAY_ANDROID *d)
+ {
++   /* al_uninstall_system runs registered destructors newest first, so a bitmap
++      can be destroyed after the display it belongs to, leaving display->android
++      or its surface NULL. Calling into the surface then dereferences NULL and
++      kills the process during an otherwise clean shutdown. */
++   if (d == NULL || d->surface_object == NULL)
++      return;
++
+    _jni_callVoidMethodV(env, d->surface_object, "egl_makeCurrent", "()V");
+ }
+ 
+ void _al_android_clear_current(JNIEnv *env, ALLEGRO_DISPLAY_ANDROID *d)
+ {
++   if (d == NULL || d->surface_object == NULL)
++      return;
++
+    _jni_callVoidMethodV(env, d->surface_object, "egl_clearCurrent", "()V");
+ }
+ 
+diff --git i/src/opengl/ogl_bitmap.c w/src/opengl/ogl_bitmap.c
+index 4e01d7e73..02247c355 100644
+--- i/src/opengl/ogl_bitmap.c
++++ w/src/opengl/ogl_bitmap.c
+@@ -592,6 +592,17 @@ static void ogl_destroy_bitmap(ALLEGRO_BITMAP *bitmap)
+    ASSERT(!al_is_sub_bitmap(bitmap));
+ 
+    bmp_disp = _al_get_bitmap_display(bitmap);
++
++   /* al_uninstall_system runs destructors newest first, so a bitmap can be
++      destroyed after the display it belongs to, leaving the display and its
++      OpenGL extras gone. Dereferencing them here kills the process during an
++      otherwise clean shutdown. The GL context is going away regardless, so
++      just release our own extras and stop. */
++   if (bmp_disp == NULL || bmp_disp->ogl_extras == NULL) {
++      al_free(ogl_bitmap);
++      return;
++   }
++
+    disp = al_get_current_display();
+    if (bmp_disp->ogl_extras->is_shared == false &&
+        bmp_disp != disp) {

@@ -1,0 +1,354 @@
+# Generates and updates replay tests for the scripts in `tests/scripts/playground/auto`
+#
+# The replay tests this script generates are `tests/replays/playground/auto_*.zplay`
+#
+# When adding or modifying existing scripts in the `auto` folder, you must
+# run this script. See tests/scripts/README.md for more information.
+#
+# To just run all the auto replays tests:
+#
+# python tests/update_auto_script_tests.py --test
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+from dataclasses import dataclass
+from pathlib import Path
+
+from lib.replay_helpers import parse_result_txt_file
+from replays import ReplayTestResults
+
+script_dir = Path(os.path.dirname(os.path.realpath(__file__)))
+root_dir = script_dir.parent
+auto_tests_dir = script_dir / 'scripts/playground/auto'
+auto_replays_dir = root_dir / 'tests/replays/playground'
+qst_path = script_dir / 'replays/playground/playground.qst'
+tmp_dir = root_dir / '.tmp/update_auto_script_tests'
+is_ci = 'CI' in os.environ
+
+sys.path.append(str((root_dir / 'scripts').absolute()))
+import run_target
+
+
+@dataclass
+class Test:
+    script_path: Path
+    replay_path: Path
+
+    def name(self):
+        return self.script_path.stem
+
+
+# `M` meta fields that capture a replay's creation identity. These are carried
+# over when a replay is re-recorded, so regenerating an existing replay doesn't
+# churn them (the dynamic fields like `frames`, `length` and `time_updated` are
+# regenerated from the new recording).
+PERSISTED_META_KEYS = ['uuid', 'time_created', 'zc_version_created']
+
+
+def read_persisted_meta(replay_path: Path) -> dict:
+    if not replay_path.exists():
+        return {}
+    meta = {}
+    for line in replay_path.read_text().splitlines():
+        if line.startswith('M '):
+            key, _, value = line[2:].partition(' ')
+            if key in PERSISTED_META_KEYS:
+                meta[key] = value
+    return meta
+
+
+def reached_test_end(replay_path: Path) -> bool:
+    # A replay that ran to completion logs '[Test] done' (from Test::End).
+    return replay_path.exists() and '[Test] done' in replay_path.read_text()
+
+
+tests = [
+    Test(path, root_dir / f'{auto_replays_dir}/auto_{path.stem}.zplay')
+    for path in auto_tests_dir.rglob('*.zs')
+    if path.name != 'test_runner.zs' and path.name != 'auto.zs'
+]
+tests_missing_replays = [t for t in tests if not t.replay_path.exists()]
+
+
+def compile():
+    print('recompiling playground.qst')
+
+    # TODO: set this via CLI
+    include_paths = [
+        str(root_dir / 'resources/include'),
+        str(root_dir / 'resources/headers'),
+        str(root_dir / 'tests/scripts/playground'),
+        str(root_dir / 'tests/scripts'),
+    ]
+    (run_target.get_build_folder() / 'includepaths.txt').write_text(
+        ';'.join(include_paths)
+    )
+
+    allegro_log_path = tmp_dir / 'allegro.log'
+    if allegro_log_path.exists():
+        allegro_log_path.unlink()
+    args = [
+        '-headless',
+        '-smart-assign',
+        qst_path,
+    ]
+    try:
+        run_target.check_run(
+            'zeditor',
+            args,
+            env={
+                **os.environ,
+                'ALLEGRO_LEGACY_TRACE': str(allegro_log_path),
+            },
+        )
+    except Exception as e:
+        e.add_note(allegro_log_path.read_text())
+        raise e
+
+
+def create_replay(
+    test: Test, persisted_meta: dict | None = None, *, headless: bool, debug: bool
+):
+    verb = 're-recording' if persisted_meta else 'creating'
+    print(
+        f'{verb} replay for {test.script_path.relative_to(root_dir)}: {test.replay_path.relative_to(root_dir)}'
+    )
+
+    log = run_target.get_build_folder() / 'allegro.log'
+    if log.exists():
+        log.unlink()
+    args = []
+    if headless:
+        args.append('-headless')
+    args += [
+        '-test',
+        qst_path,
+        '5',
+        '0',
+        '-record',
+        test.replay_path,
+        '-replay-name',
+        test.name(),
+        '-replay-script-trace',
+    ]
+    # Debug mode records the per-frame state/gfx hashes used to assert the
+    # replay. Only do this headless: those hashes are compared headless by
+    # run_replay_tests, so recording them with a window would bake in mismatched
+    # values.
+    if debug:
+        args.append('-replay-debug')
+    try:
+        run_target.check_run('zplayer', args)
+    except Exception as e:
+        e.add_note(log.read_text())
+        raise e
+
+    content = re.sub(
+        r'M qst .*\n',
+        'M qst playground.qst\n',
+        test.replay_path.read_text(),
+    )
+    content = re.sub(
+        r'M version .*\n',
+        'M version latest\n',
+        content,
+    )
+    for key, value in (persisted_meta or {}).items():
+        content = re.sub(
+            rf'(?m)^M {re.escape(key)} .*$',
+            f'M {key} {value}',
+            content,
+        )
+    test.replay_path.write_text(content)
+
+
+def run_replays(tests: list[Test], update=False):
+    if not tests:
+        return
+
+    if update:
+        print('updating auto script test replays')
+    else:
+        print('running auto script test replays')
+
+    output_dir = tmp_dir / 'replays_output'
+    shutil.rmtree(output_dir, ignore_errors=True)
+
+    args = [
+        sys.executable,
+        root_dir / 'tests/run_replay_tests.py',
+        '--build_folder',
+        run_target.get_build_folder(),
+        '--test_results',
+        output_dir,
+        '--retries',
+        '2',
+        '--no-jit',
+    ]
+    if update:
+        args.append('--update')
+    args.extend(t.replay_path for t in tests)
+
+    output = subprocess.run(args, stdout=subprocess.PIPE, encoding='utf-8')
+    test_results_path = output_dir / 'test_results.json'
+    if not test_results_path.exists():
+        print(output.stdout)
+        raise Exception('could not find test_results.json')
+
+    if update:
+        output.check_returncode()
+        return
+
+    if output.returncode:
+        test_results_json = json.loads(test_results_path.read_text('utf-8'))
+        results = ReplayTestResults(**test_results_json)
+        results.print_failures(output_dir)
+        exit(output.returncode)
+
+
+def validate(tests: list[Test]):
+    print('validating auto script tests')
+
+    failed_verification = False
+    for test in tests:
+        content = test.replay_path.read_text()
+        lines = content.splitlines()
+
+        errors = []
+        has_started = False
+        has_done = False
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            if '[Test] started' in line:
+                has_started = True
+            elif '[Test] done' in line:
+                has_done = True
+            elif '[Test] failed' in line:
+                errors.append(line)
+                i += 1
+                # Capture the subsequent stack trace lines.
+                while i < len(lines) and '  at ' in lines[i]:
+                    errors.append(lines[i])
+                    i += 1
+                continue
+
+            i += 1
+
+        if not has_started:
+            errors.append('missing call to Test::Init()')
+        if not has_done:
+            errors.append('test ended abnormally')
+
+        if errors:
+            failed_verification = True
+            print(f'Test {test.name()} failed:')
+            print('\n'.join(errors))
+            print()
+
+    if failed_verification:
+        exit(1)
+
+
+# Meta fields that get re-stamped on every replay write. A replay whose script
+# didn't ultimately change can still be rewritten during an update (e.g. its
+# content churned under a mid-development bug and then reverted once the bug was
+# fixed), leaving only these volatile fields differing from the committed
+# baseline. That's pure noise, so we discard it.
+VOLATILE_META_PREFIXES = ('M time_updated ', 'M zc_version_updated ', 'M qst_modified ')
+
+
+def discard_metadata_only_churn(tests: list[Test]):
+    for test in tests:
+        f = str(test.replay_path)
+        diff = subprocess.run(
+            ['git', 'diff', '-U0', '--', f],
+            cwd=root_dir,
+            stdout=subprocess.PIPE,
+            encoding='utf-8',
+        ).stdout.splitlines()
+        body = [
+            line
+            for line in diff
+            if line[:1] in '+-' and not line.startswith(('+++', '---'))
+        ]
+        if body and all(line[1:].startswith(VOLATILE_META_PREFIXES) for line in body):
+            subprocess.run(['git', 'checkout', '--', f], cwd=root_dir)
+            print(
+                f'reverted metadata-only churn: {test.replay_path.relative_to(root_dir)}'
+            )
+
+
+def update_auto_script_tests():
+    auto_zh = '// Generated by tests/update_auto_script_tests.py\n\n'
+    auto_zh += '\n'.join(sorted([f'#include "auto/{t.name()}.zs"' for t in tests]))
+    auto_zh += '\n'
+    (auto_tests_dir / 'auto.zs').write_text(auto_zh)
+
+    if is_ci:
+        if tests_missing_replays:
+            names = ', '.join(t.name() for t in tests_missing_replays)
+            raise Exception(
+                f'No replay found for auto test: {names}\nYou must run `python tests/update_auto_script_tests.py`'
+            )
+
+        validate(tests)
+        run_replays(tests)
+        return
+
+    compile()
+
+    # Refresh existing replays in place with --update. Update mode replays the
+    # recorded RNG seeds (and most steps), so a replay whose script didn't change
+    # comes out nearly identical -- unlike a full re-record, which regenerates
+    # every random seed and churns every replay.
+    persisted_meta = {t.name(): read_persisted_meta(t.replay_path) for t in tests}
+    existing = [t for t in tests if t.replay_path.exists()]
+    run_replays(existing, update=True)
+
+    # Update mode can't extend a replay past its recorded length, so a test whose
+    # script grew won't reach Test::End. Re-record those (and brand-new tests)
+    # from scratch -- only the changed replays churn their seeds. A re-recording
+    # self-terminates at Test::End, so growing a script needs no manual editing.
+    for test in tests:
+        if reached_test_end(test.replay_path):
+            continue
+
+        existed = test.replay_path.exists()
+        create_replay(
+            test,
+            persisted_meta[test.name()],
+            headless=existed,
+            debug=existed,
+        )
+    validate(tests)
+    discard_metadata_only_churn(tests)
+
+    print(
+        f'done - verify that there are no unexpected changes to the replays in {auto_replays_dir.relative_to(root_dir)}'
+    )
+
+
+parser = argparse.ArgumentParser(
+    description='Generates and updates replay tests for the scripts in `tests/scripts/playground/auto`'
+)
+parser.add_argument(
+    '--test',
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help='Runs all the auto replay tests, without updating',
+)
+
+args = parser.parse_args()
+if args.test:
+    run_replays(tests)
+else:
+    update_auto_script_tests()

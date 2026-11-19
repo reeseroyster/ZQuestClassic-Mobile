@@ -1,0 +1,867 @@
+import {
+	createConnection,
+	TextDocuments,
+	Diagnostic,
+	DiagnosticSeverity,
+	ProposedFeatures,
+	InitializeParams,
+	DidChangeConfigurationNotification,
+	DidChangeConfigurationParams,
+	CompletionItem,
+	TextDocumentPositionParams,
+	TextDocumentSyncKind,
+	InitializeResult,
+	HoverParams,
+	Hover,
+	DocumentSymbolParams,
+	MarkupKind,
+	DefinitionParams,
+	Position,
+	Location,
+	SignatureHelpParams,
+	SignatureHelp,
+	DocumentHighlightParams,
+	DocumentHighlight,
+} from 'vscode-languageserver/node';
+import { URI } from 'vscode-uri';
+import {
+	TextDocument
+} from 'vscode-languageserver-textdocument';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import { cachedGlobalCompletionItems, checkIfInZCRepo, cleanupFile, cleanupFile2, docJobResults, DocumentMetaData, fileMatches, getBinAndResourcesFolders, getZScriptFilesInWorkspace, globalClasses, globalTmpDir, globalVariables, JobResult, runCompiler, Settings } from './helpers.js';
+import { onCompletion, updateCompletionItems } from './completion.js';
+import { onSignatureHelp } from './signature-help.js';
+import { onDocumentHighlight } from './document-highlight.js';
+
+// Create a connection for the server, using Node's IPC as a transport.
+// Also include all preview / proposed LSP features.
+const connection = createConnection(ProposedFeatures.all);
+
+// A rejected promise nobody awaits would otherwise kill the server process
+// (node's default since v15), and the client never restarts a server that
+// dies before initialization finishes, so every feature would stay silently
+// dead for the rest of the session. Log to stderr (the client forwards it
+// to the output channel) and keep running.
+process.on('unhandledRejection', (reason) => {
+	const text = reason instanceof Error ? reason.stack ?? reason.message : String(reason);
+	process.stderr.write(`[zscript-lsp] unhandled promise rejection: ${text}\n`);
+});
+process.on('uncaughtException', (e) => {
+	process.stderr.write(`[zscript-lsp] uncaught exception: ${e.stack ?? e.message}\n`);
+	process.exit(1);
+});
+
+// Create a simple text document manager.
+const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
+
+let configUpdateController: AbortController | null = null;
+
+let hasConfigurationCapability = false;
+let hasWorkspaceFolderCapability = false;
+let hasDiagnosticRelatedInformationCapability = false;
+
+let isScanning = false;
+let scanAbortController: AbortController | null = null;
+
+async function scanWorkspace() {
+	// Cancel any in-progress scan if a new one is requested (e.g. settings changed).
+	if (isScanning) {
+		scanAbortController?.abort();
+	}
+
+	isScanning = true;
+	scanAbortController = new AbortController();
+	const signal = scanAbortController.signal;
+
+	try {
+		const folders = await connection.workspace.getWorkspaceFolders();
+		if (!folders) return;
+
+		for (const folder of folders) {
+			const folderPath = URI.parse(folder.uri).fsPath;
+			const files = await getZScriptFilesInWorkspace(folderPath);
+
+			for (const file of files) {
+				if (signal.aborted) return;
+
+				const uri = URI.file(file).toString();
+
+				// Don't process it if the user currently has it open (documents manager handles that)
+				// or if we already cached it.
+				if (docJobResults.has(uri) || documents.get(uri)) continue;
+
+				try {
+					const content = await fs.promises.readFile(file, 'utf8');
+					const result = await processScript(uri, content, signal);
+
+					if (result && result.metadata && !signal.aborted) {
+						// Only save the metadata. We intentionally discard the diagnostics array 
+						// here so we don't clutter the user's Problems panel with errors 
+						// for files they aren't actively editing.
+						docJobResults.set(uri, { diagnostics: [], metadata: result.metadata });
+					}
+				} catch (e) {
+					// Silently ignore unreadable or uncompilable files
+				}
+			}
+		}
+	} finally {
+		if (!signal.aborted) {
+			isScanning = false;
+		}
+	}
+}
+
+connection.onInitialize(async (params: InitializeParams) => {
+	const capabilities = params.capabilities;
+
+	// Does the client support the `workspace/configuration` request?
+	// If not, we fall back using global settings.
+	hasConfigurationCapability = !!(
+		capabilities.workspace && !!capabilities.workspace.configuration
+	);
+	hasWorkspaceFolderCapability = !!(
+		capabilities.workspace && !!capabilities.workspace.workspaceFolders
+	);
+	hasDiagnosticRelatedInformationCapability = !!(
+		capabilities.textDocument &&
+		capabilities.textDocument.publishDiagnostics &&
+		capabilities.textDocument.publishDiagnostics.relatedInformation
+	);
+
+	const result: InitializeResult = {
+		capabilities: {
+			textDocumentSync: TextDocumentSyncKind.Incremental,
+			// Tell the client that this server supports code completion.
+			completionProvider: {
+				resolveProvider: true,
+				triggerCharacters: ['>'],
+			},
+			signatureHelpProvider: {
+				triggerCharacters: ['(', ','],
+			},
+			documentHighlightProvider: true,
+			hoverProvider: true,
+			definitionProvider: true,
+			documentSymbolProvider: {
+				label: 'ZScript',
+			},
+			referencesProvider: true,
+		}
+	};
+	if (hasWorkspaceFolderCapability) {
+		result.capabilities.workspace = {
+			workspaceFolders: {
+				supported: true
+			}
+		};
+	}
+
+	return result;
+});
+
+connection.onInitialized(async () => {
+	try {
+		await onInitialized();
+	} catch (e) {
+		connection.console.error(`Failed to initialize: ${e}`);
+	}
+});
+
+async function onInitialized() {
+	if (hasConfigurationCapability) {
+		// Register for all configuration changes.
+		await connection.client.register(DidChangeConfigurationNotification.type, undefined);
+	}
+	if (hasWorkspaceFolderCapability) {
+		connection.workspace.onDidChangeWorkspaceFolders(event => {
+			connection.console.log('Workspace folders changed. Rescanning...');
+
+			for (const removed of event.removed) {
+				const removedPath = URI.parse(removed.uri).fsPath;
+				for (const [uri, _] of docJobResults.entries()) {
+					if (URI.parse(uri).fsPath.startsWith(removedPath)) {
+						docJobResults.delete(uri);
+					}
+				}
+			}
+
+			void scanWorkspace();
+		});
+	}
+
+	const settings = await getDocumentSettings('');
+	configUpdateController = new AbortController();
+	void updateCompletionItems(settings, connection, configUpdateController.signal).then(() => {
+		return scanWorkspace();
+	}).catch(e => {
+		connection.console.error(`Failed to build initial cache: ${e}`);
+	});
+}
+
+// The global settings, used when the `workspace/configuration` request is not supported by the client.
+// Please note that this is not the case when using this server with the client provided in this example
+// but could happen with other clients.
+const defaultSettings: Settings = {};
+let globalSettings: Settings = defaultSettings;
+
+// Cache the settings of all open documents
+const documentSettings: Map<string, Thenable<Settings>> = new Map();
+
+connection.onDidChangeConfiguration(async (change) => {
+	try {
+		await onDidChangeConfiguration(change);
+	} catch (e) {
+		connection.console.error(`Failed to apply configuration change: ${e}`);
+	}
+});
+
+async function onDidChangeConfiguration(change: DidChangeConfigurationParams) {
+	if (configUpdateController) {
+		configUpdateController.abort();
+	}
+	configUpdateController = new AbortController();
+	const signal = configUpdateController.signal;
+
+	[...activeJobs.keys()].forEach(doc => {
+		abandonJob(doc);
+		connection.sendDiagnostics({ uri: doc.uri, diagnostics: [] });
+	});
+	docJobResults.clear();
+	cachedGlobalCompletionItems.length = 0;
+	globalClasses.clear();
+	globalVariables.clear();
+
+	if (hasConfigurationCapability) {
+		// Reset all cached document settings
+		documentSettings.clear();
+	} else {
+		globalSettings = <Settings>(
+			(change.settings.zscriptLanguageServer || defaultSettings)
+		);
+	}
+
+	// Revalidate all open text documents
+	const jobs = documents.all().map(doc => createJob(doc));
+	const jobPromises = jobs.map(job => job.wait());
+	const settings = await getDocumentSettings('');
+	await Promise.all([...jobPromises, updateCompletionItems(settings, connection, signal)]);
+	await scanWorkspace();
+}
+
+connection.onDidChangeWatchedFiles(e => {
+	// TODO: probably have to re-init?
+	e.changes;
+});
+
+function getDocumentSettings(uri: string): Thenable<Settings> {
+	if (!hasConfigurationCapability) {
+		return Promise.resolve(globalSettings);
+	}
+	let result = documentSettings.get(uri);
+	if (!result) {
+		result = connection.workspace.getConfiguration({
+			scopeUri: uri,
+			section: 'zscript'
+		});
+		documentSettings.set(uri, result);
+	}
+	return result;
+}
+
+// Only keep settings for open documents
+documents.onDidClose(e => {
+	documentSettings.delete(e.document.uri);
+	docJobResults.delete(e.document.uri);
+	abandonJob(e.document);
+});
+
+// The content of a text document has changed. This event is emitted
+// when the text document first opened or when its content has changed.
+// TODO: this fires (then closes instantly) when doing ctrl+hover on a symbol.
+//       Need to wait for next version of LSP server to fix: https://github.com/microsoft/vscode-languageserver-node/issues/848#issuecomment-2503444503
+documents.onDidChangeContent(e => {
+	const job = activeJobs.get(e.document);
+	if (job) {
+		job.restart();
+	} else if (!pendingJobs.has(e.document)) {
+		createJob(e.document);
+	}
+});
+
+function parseOutput(settings: Settings, stdout: string, stderr: string, tmpScript: string, tmpInput: string): JobResult {
+	if (stdout.startsWith('{')) {
+		const result = JSON.parse(stdout) as JobResult;
+		if (settings.printCompilerOutput) {
+			console.log(result);
+			if (stderr) {
+				console.log('stderr:', stderr);
+			}
+		}
+		return result;
+	}
+
+	// For older releases, diagnostics and metadata must be manually parsed from stdout.
+	// JSON output was not added until 3.0.0-prerelease.61+2024-08-05.
+
+	const [compilerOutput, metadataStr] = stdout.split('=== METADATA', 2);
+	if (settings.printCompilerOutput) {
+		console.log(compilerOutput);
+	}
+
+	const diagnostics: Diagnostic[] = [];
+	for (const line of compilerOutput.split('\n')) {
+		if (line.includes('syntax error')) {
+			const m = line.match(/syntax error, (.*) \[(.*) Line (\d+) Column (\d+).*\].*/);
+			let message = '';
+			let lineNum = 0;
+			let colNum = 0;
+			let fname = '';
+			if (m) {
+				fname = cleanupFile(m[2]);
+				message = m[1].trim();
+				if (fileMatches(fname, "ZQ_BUFFER") || fileMatches(fname, tmpInput)) {
+					lineNum = 0;
+					colNum = 0;
+					message = `Syntax error in temp file (check your ZScript Extension settings):\n${message}`;
+				}
+				else if (fileMatches(fname, tmpScript)) {
+					lineNum = Number(m[3]) - 1;
+					colNum = Number(m[4]) - 2;
+				}
+				else {
+					lineNum = 0;
+					colNum = 0;
+					message = `Syntax error in "${fname}":\n${message}`;
+				}
+			} else {
+				message = line.split('syntax error, ', 2)[1].trim();
+			}
+
+			const diagnostic: Diagnostic = {
+				severity: DiagnosticSeverity.Error,
+				range: {
+					start: { line: lineNum, character: colNum },
+					end: { line: lineNum, character: colNum + 1 },
+				},
+				message,
+				source: 'zscript',
+			};
+			diagnostics.push(diagnostic);
+		} else if (line.includes('Error') || line.includes('Warning')) {
+			const m = line.match(/(.*)Line (\d+).*Columns (\d+)-(\d+) - (.*)/);
+			let message = '';
+			let lineNum = 0;
+			let colStartNum = 0;
+			let colEndNum = 0;
+			let sev = 'Warning';
+			let fname = '';
+			if (m) {
+				fname = cleanupFile(m[1]);
+				message = m[5].trim();
+				if (message.startsWith('Error'))
+					sev = 'Error';
+				if (fname.length == 0 || fileMatches(fname, "ZQ_BUFFER") || fileMatches(fname, tmpInput)) //error in temp file
+				{
+					lineNum = 0;
+					colStartNum = 0;
+					colEndNum = 0;
+					message = `${sev} in temp file (check your ZScript Extension settings):\n${message}`;
+				}
+				else if (fileMatches(fname, tmpScript)) {
+					lineNum = Number(m[2]) - 1;
+					colStartNum = Number(m[3]) - 1;
+					colEndNum = Number(m[4]) - 1;
+				}
+				else {
+					lineNum = 0;
+					colStartNum = 0;
+					colEndNum = 0;
+					message = `${sev} in "${fname}":\n${message}`;
+				}
+			} else {
+				message = line.trim();
+			}
+
+			const diagnostic: Diagnostic = {
+				severity: sev == 'Error' ? DiagnosticSeverity.Error : DiagnosticSeverity.Warning,
+				range: {
+					start: { line: lineNum, character: colStartNum },
+					end: { line: lineNum, character: colEndNum },
+				},
+				message,
+				source: 'zscript',
+			};
+			diagnostics.push(diagnostic);
+		} else if (line.includes('ERROR:') || line.includes('WARNING:')) {
+			const m = line.match(/(.*) \[(.*) Line (\d+) Column (\d+).*/);
+			let message = '';
+			let lineNum = 0;
+			let colNum = 0;
+			let sev = 'Warning';
+			let fname = '';
+			if (m) {
+				fname = cleanupFile(m[2]);
+				message = m[1].trim();
+				if (message.startsWith('ERROR:'))
+					sev = 'Error';
+				if (fileMatches(fname, "ZQ_BUFFER") || fileMatches(fname, tmpInput)) {
+					lineNum = 0;
+					colNum = 0;
+					message = `${sev} in temp file (check your ZScript Extension settings):\n${message}`;
+				}
+				else if (fileMatches(fname, tmpScript)) {
+					lineNum = Number(m[3]) - 1;
+					colNum = Number(m[4]);
+				}
+				else {
+					lineNum = 0;
+					colNum = 0;
+					message = `${sev} in "${fname}":\n${message}`;
+				}
+			} else {
+				message = line.trim();
+			}
+
+			const diagnostic: Diagnostic = {
+				severity: sev == 'Error' ? DiagnosticSeverity.Error : DiagnosticSeverity.Warning,
+				range: {
+					start: { line: lineNum, character: 0 },
+					end: { line: lineNum, character: colNum },
+				},
+				message,
+				source: 'zscript',
+			};
+			diagnostics.push(diagnostic);
+		}
+	}
+
+	let metadata;
+	if (metadataStr) {
+		try {
+			metadata = JSON.parse(metadataStr);
+		} catch (e: any) {
+			connection.console.error(e.toString());
+		}
+	}
+
+	return { diagnostics, metadata };
+}
+
+function getTmpScriptPath(uri: string): string {
+	const uriHash = crypto.createHash('md5').update(uri).digest('hex');
+	const folder = `${globalTmpDir}/${uriHash}`;
+	fs.mkdirSync(folder, { recursive: true });
+	return cleanupFile(`${folder}/tmp.zs`);
+}
+
+function getTmpInputPath(uri: string): string {
+	const uriHash = crypto.createHash('md5').update(uri).digest('hex');
+	const folder = `${globalTmpDir}/${uriHash}`;
+	fs.mkdirSync(folder, { recursive: true });
+	return cleanupFile(`${folder}/tmp2.zs`);
+}
+
+async function processScript(uri: string, content: string, signal: AbortSignal): Promise<JobResult | null> {
+	const tmpScript = getTmpScriptPath(uri);
+	const tmpInput = getTmpInputPath(uri);
+
+	const settings = await getDocumentSettings(uri);
+	let includeText = "#option NO_ERROR_HALT on\n";
+
+	if (!settings.installationFolder) {
+		connection.sendDiagnostics({
+			uri, diagnostics: [{
+				severity: DiagnosticSeverity.Error,
+				range: {
+					start: { line: 0, character: 0 },
+					end: { line: 0, character: 0 },
+				},
+				message: 'Must set zscript.installationFolder setting',
+				source: 'zscript'
+			}]
+		});
+		return null;
+	}
+
+	if (settings.defaultIncludePaths) {
+		settings.defaultIncludePaths.forEach(str => {
+			includeText += `#includepath "${str}"\n`;
+		});
+	}
+	if (settings.defaultIncludeFiles) {
+		settings.defaultIncludeFiles.forEach(str => {
+			includeText += `#include "${str}"\n`;
+		});
+	}
+
+	includeText += `#include "${tmpScript}"\n`;
+	let stdout = '';
+	let stderr = '';
+	let success = false;
+	fs.writeFileSync(tmpInput, includeText);
+	fs.writeFileSync(tmpScript, content);
+	if (settings.printCompilerOutput) {
+		console.log(`Attempting to compile buffer:\n-----\n${includeText}\n-----`);
+	}
+	try {
+		let originPath = URI.parse(uri).fsPath;
+		if (originPath.match(/[a-z]:\\.*/)) {
+			const letter = originPath.at(0);
+			if (letter) //capitalize drive letters
+				originPath = letter.toUpperCase() + originPath.slice(1);
+		}
+		const args = [
+			'-unlinked',
+			'-delay_cassert',
+			'-input', tmpInput,
+			'-force_ignore', originPath,
+			'-metadata',
+			'-metadata-tmp-path', tmpScript,
+			'-metadata-orig-path', originPath,
+			'-json',
+			'-no-codegen',
+		];
+		if (settings.ignoreConstAssert)
+			args.push('-ignore_cassert');
+
+		const { resourcesFolder } = getBinAndResourcesFolders(settings);
+		const cwd = checkIfInZCRepo(originPath) ?? resourcesFolder;
+		const cp = await runCompiler({
+			settings,
+			connection,
+			uri,
+			cwd,
+			signal,
+			args,
+		});
+
+		if (!cp) {
+			return null;
+		}
+
+		success = true;
+		stdout = cp.stdout;
+		stderr = cp.stderr;
+	} catch (e: any) {
+		if (signal.aborted) {
+			return null;
+		}
+		if (e.code === undefined) throw e;
+		stdout = e.stdout || e.toString();
+	}
+
+	const { diagnostics, metadata } = parseOutput(settings, stdout, stderr, tmpScript, tmpInput);
+
+	// Fallback, incase compiling failed but we failed to parse out an error.
+	if (!success && diagnostics.length === 0) {
+		diagnostics.push({
+			severity: DiagnosticSeverity.Error,
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 0 },
+			},
+			message: [stdout, stderr].join('\n\n'),
+			source: 'zscript',
+		});
+	}
+
+	return { diagnostics, metadata };
+}
+
+type ProcessScriptJob = ReturnType<typeof createJob>;
+
+const MAX_JOBS = 5;
+const activeJobs = new Map<TextDocument, ProcessScriptJob>();
+const pendingJobs = new Map<TextDocument, ProcessScriptJob>();
+
+function createJob(doc: TextDocument) {
+	let resolve: (result: JobResult | null) => void, reject: (reason: Error) => void;
+	const promise = new Promise<JobResult | null>((resolve_, reject_) => {
+		resolve = resolve_;
+		reject = reject_;
+	});
+
+	// Each run gets its own controller: restart() aborts the current one, and
+	// the restarted run must not inherit an already-aborted signal.
+	let controller = new AbortController();
+	let restarting = false;
+	let cancelled = false;
+	let result: JobResult | null = null;
+	const job = {
+		doc,
+		start() {
+			console.log(`start ${doc.uri}`);
+			controller = new AbortController();
+			const signal = controller.signal;
+			processScript(doc.uri, doc.getText(), signal)
+				.then(r => {
+					// A cancelled or restarted run may still finish (or already have
+					// finished) with output from a stale document or an old compiler
+					// version. Never publish it, or it clobbers the newer job's result.
+					if (r && !signal.aborted) {
+						result = r;
+
+						connection.sendDiagnostics({ uri: doc.uri, diagnostics: r.diagnostics });
+
+						// Fallback: If the new script is syntactically invalid and returns no metadata,
+						// carry over the last known good metadata so autocomplete/hover keep working.
+						const oldResult = docJobResults.get(doc.uri);
+						if (!result.metadata && oldResult && oldResult.metadata) {
+							result.metadata = oldResult.metadata;
+						}
+
+						docJobResults.set(doc.uri, result);
+					}
+				})
+				.catch(e => {
+					connection.console.error(`Failed to process ${doc.uri}: ${e}`);
+				})
+				.finally(() => {
+					if (cancelled) {
+						return;
+					}
+
+					if (restarting) {
+						restarting = false;
+						job.start();
+						return;
+					}
+
+					console.log(`done ${doc.uri}`);
+					activeJobs.delete(doc);
+					startNextJobs();
+					resolve(result);
+				});
+		},
+		restart() {
+			console.log(`restart ${doc.uri}`);
+			restarting = true;
+			controller.abort();
+		},
+		cancel() {
+			console.log(`cancel ${doc.uri}`);
+			cancelled = true;
+			controller.abort();
+			activeJobs.delete(doc);
+			startNextJobs();
+			resolve(null);
+		},
+		wait() {
+			return promise;
+		},
+	};
+
+	if (activeJobs.size < MAX_JOBS) {
+		activeJobs.set(doc, job);
+		job.start();
+	} else {
+		console.log(`queued ${doc.uri}`);
+		pendingJobs.set(doc, job);
+	}
+
+	return job;
+}
+
+function abandonJob(doc: TextDocument) {
+	pendingJobs.delete(doc);
+
+	const job = activeJobs.get(doc);
+	if (job) {
+		activeJobs.delete(doc);
+		job.cancel();
+	}
+}
+
+function startNextJobs() {
+	while (activeJobs.size < MAX_JOBS && pendingJobs.size) {
+		const [nextJobDoc, nextJob] = [...pendingJobs.entries()][0];
+		pendingJobs.delete(nextJobDoc);
+		activeJobs.set(nextJobDoc, nextJob);
+		nextJob.start();
+	}
+}
+
+async function getOrWaitForScriptMetadata(doc: TextDocument): Promise<DocumentMetaData | null> {
+	let result = docJobResults.get(doc.uri) ?? null;
+	if (result) {
+		return result.metadata ?? null;
+	}
+
+	let job = activeJobs.get(doc) ?? pendingJobs.get(doc);
+	if (!job) {
+		job = createJob(doc);
+	}
+	result = await job.wait();
+
+	return result?.metadata ?? null;
+}
+
+connection.onDidChangeWatchedFiles(_change => {
+	// Monitored files have change in VSCode
+	connection.console.log('We received an file change event');
+});
+
+// This handler provides the initial list of the completion items.
+connection.onCompletion(
+	async (p: TextDocumentPositionParams): Promise<CompletionItem[]> => {
+		const doc = documents.get(p.textDocument.uri);
+		if (!doc) {
+			return cachedGlobalCompletionItems;
+		}
+
+		const metadata = await getOrWaitForScriptMetadata(doc);
+		if (!metadata || !metadata.currentFileSymbols) {
+			return cachedGlobalCompletionItems;
+		}
+
+		return onCompletion({ document: doc, metadata, params: p });
+	}
+);
+
+// This handler resolves additional information for the item selected in
+// the completion list (currently no extra data is given).
+connection.onCompletionResolve(
+	(item: CompletionItem): CompletionItem => {
+		return item;
+	}
+);
+
+connection.onSignatureHelp(
+	async (params: SignatureHelpParams): Promise<SignatureHelp | null> => {
+		const doc = documents.get(params.textDocument.uri);
+		if (!doc) return null;
+
+		return onSignatureHelp({
+			document: doc,
+			params,
+		})
+	}
+);
+
+connection.onDocumentHighlight(
+	async (params: DocumentHighlightParams): Promise<DocumentHighlight[] | null> => {
+		const doc = documents.get(params.textDocument.uri);
+		if (!doc) return null;
+
+		const metadata = await getOrWaitForScriptMetadata(doc);
+		if (!metadata) return null;
+
+		return onDocumentHighlight({
+			document: doc,
+			metadata,
+			params,
+		});
+	});
+
+async function resolvePosition(doc: TextDocument, pos: Position) {
+	const metadata = await getOrWaitForScriptMetadata(doc);
+	if (!metadata)
+		return null;
+
+	const identifier = metadata.identifiers.find(ident =>
+		ident.loc.line == pos.line &&
+		pos.character >= ident.loc.character &&
+		pos.character < ident.loc.character + ident.loc.length);
+	if (!identifier) {
+		return null;
+	}
+
+	return { metadata, identifier };
+}
+
+connection.onDocumentSymbol(async (p: DocumentSymbolParams) => {
+	const doc = documents.get(p.textDocument.uri);
+	if (!doc)
+		return null;
+
+	const metadata = await getOrWaitForScriptMetadata(doc);
+	return metadata?.currentFileSymbols;
+});
+
+connection.onHover(async (p: HoverParams): Promise<Hover | null> => {
+	const doc = documents.get(p.textDocument.uri);
+	if (!doc)
+		return null;
+
+	const result = await resolvePosition(doc, p.position);
+	if (!result)
+		return null;
+
+	const { metadata, identifier } = result;
+	const value = metadata.symbols[identifier.symbol].doc;
+	if (!value)
+		return null;
+
+	return {
+		contents: { kind: MarkupKind.Markdown, value },
+	};
+});
+
+connection.onDefinition(async (p: DefinitionParams) => {
+	const doc = documents.get(p.textDocument.uri);
+	if (!doc)
+		return null;
+
+	const result = await resolvePosition(doc, p.position);
+	if (!result)
+		return null;
+
+	const { metadata, identifier } = result;
+	const symbol = metadata.symbols[identifier.symbol];
+	const tmpScriptPath = getTmpScriptPath(symbol.loc.uri);
+	if (cleanupFile2(symbol.loc.uri) === tmpScriptPath || symbol.loc.uri === 'file://' + tmpScriptPath)
+		symbol.loc.uri = p.textDocument.uri;
+	return symbol.loc;
+});
+
+connection.onReferences(async (p) => {
+	const doc = documents.get(p.textDocument.uri);
+	if (!doc)
+		return null;
+
+	const result = await resolvePosition(doc, p.position);
+	if (!result)
+		return null;
+
+	const { identifier } = result;
+	const locations: Location[] = [];
+	for (const [uri, result] of docJobResults) {
+		const metadata = result.metadata;
+		if (!metadata) {
+			continue;
+		}
+
+		// TODO: currently, symbol ids are not the same across multiple compilations, so can
+		// only find references within the same document.
+		// Idea for how to fix:
+		//    1. Compile all scripts found in `initWorkspace` in one go
+		//    2. Will help to support relative imports
+		//    3. Will help for an error within an import to not end the compilation (for purposes of getting metadata)
+		if (uri !== p.textDocument.uri) {
+			continue;
+		}
+
+		locations.push(...metadata.identifiers
+			.filter(ident => ident.symbol === identifier.symbol)
+			.map(ident => {
+				return {
+					uri,
+					range: {
+						start: ident.loc,
+						end: { line: ident.loc.line, character: ident.loc.character + ident.loc.length },
+					},
+				};
+			}));
+	}
+
+	return locations;
+});
+
+// Make the text document manager listen on the connection
+// for open, change and close text document events
+documents.listen(connection);
+
+// Listen on the connection
+connection.listen();

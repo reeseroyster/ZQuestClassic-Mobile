@@ -1,0 +1,559 @@
+#include "zc/debugger/vm.h"
+#include "base/expected.h"
+#include "core/qst.h"
+#include "core/zdefs.h"
+#include "user_object.h"
+#include "components/zasm/debug_data.h"
+#include "components/zasm/defines.h"
+#include "components/zasm/pc.h"
+#include "components/zasm/table.h"
+#include "zc/scripting/common.h"
+#include "zc/scripting/script_object.h"
+#include "zc/zelda.h"
+#include <cstdint>
+#include <optional>
+
+namespace {
+
+struct InDebuggerScopeGuard
+{
+	bool prev_script_is_within_debugger_vm;
+	bool prev_suppress_script_error_logging;
+
+	InDebuggerScopeGuard(bool suppress_errors_in_sandbox)
+	{
+		prev_script_is_within_debugger_vm = script_is_within_debugger_vm;
+		script_is_within_debugger_vm = true;
+		prev_suppress_script_error_logging = suppress_script_error_logging;
+		suppress_script_error_logging = suppress_errors_in_sandbox;
+	}
+	~InDebuggerScopeGuard()
+	{
+		script_is_within_debugger_vm = prev_script_is_within_debugger_vm;
+		suppress_script_error_logging = prev_suppress_script_error_logging;
+	}
+};
+
+const DebugType* getDebugTypeOfUntypedArrayElement(script_object_type engine_type, int raw_value, const DebugType* source_array_type)
+{
+	if (engine_type == script_object_type::none)
+		return &BasicTypes[TYPE_UNTYPED];
+
+	auto script_obj = get_script_object(raw_value);
+	if (!script_obj)
+		return &BasicTypes[TYPE_UNTYPED];
+
+	if (engine_type == script_object_type::object)
+	{
+		if (auto obj = dynamic_cast<user_object*>(script_obj))
+		{
+			const DebugScope* scope = zasm_debug_data.resolveClassScope(obj->ctor_pc);
+			return zasm_debug_data.getType(scope);
+		}
+	}
+	else if (engine_type == script_object_type::array)
+	{
+		// TODO: this returns the type for untyped[]. Could probably do better.
+		return source_array_type;
+	}
+	else
+	{
+		std::string name;
+		switch (engine_type)
+		{
+			case script_object_type::bitmap: name = "bitmap"; break;
+			case script_object_type::dir: name = "directory"; break;
+			case script_object_type::file: name = "file"; break;
+			case script_object_type::paldata: name = "paldata"; break;
+			case script_object_type::rng: name = "randgen"; break;
+			case script_object_type::stack: name = "stack"; break;
+			case script_object_type::websocket: name = "websocket"; break;
+			case script_object_type::weapondata: name = "weapondata"; break;
+			default: return &BasicTypes[TYPE_UNTYPED];
+		}
+
+		for (auto& type : zasm_debug_data.types)
+		{
+			if (type.tag != TYPE_CLASS)
+				continue;
+
+			if (zasm_debug_data.getTypeName(&type) == name)
+				return &type;
+		}
+	}
+
+	return &BasicTypes[TYPE_UNTYPED];
+}
+
+// Whether a class type is a user-defined class (whose instances are user_objects), rather than an
+// engine type like npc or ffc. Engine types expose their members as registers.
+bool isUserClass(const DebugType* type)
+{
+	type = type->asNonConst(zasm_debug_data);
+	if (type->tag != TYPE_CLASS)
+		return false;
+
+	const DebugScope* scope = &zasm_debug_data.scopes[type->extra];
+	while (true)
+	{
+		for (auto symbol : zasm_debug_data.getChildSymbols(scope))
+		{
+			if (symbol->storage == LOC_REGISTER)
+				return false;
+		}
+
+		if (scope->inheritance_index == -1)
+			break;
+		scope = &zasm_debug_data.scopes[scope->inheritance_index];
+	}
+
+	return true;
+}
+
+const script_object_type getEngineTypeForValue(DebugValue value)
+{
+	const DebugType* type = value.type;
+	if (type->isArray(zasm_debug_data))
+		return script_object_type::array;
+
+	std::string name = zasm_debug_data.getTypeName(type->asNonConst(zasm_debug_data));
+	if (name == "bitmap") return script_object_type::bitmap;
+	if (name == "directory") return script_object_type::dir;
+	if (name == "file") return script_object_type::file;
+	if (name == "paldata") return script_object_type::paldata;
+	if (name == "randgen") return script_object_type::rng;
+	if (name == "stack") return script_object_type::stack;
+	if (name == "websocket") return script_object_type::websocket;
+	if (name == "weapondata") return script_object_type::weapondata;
+
+	if (isUserClass(type) && dynamic_cast<user_object*>(get_script_object(value.raw_value)))
+		return script_object_type::object;
+
+	return script_object_type::none;
+}
+
+} // end namespace
+
+int32_t VM::readStack(int32_t offset)
+{
+	if (!current_data)
+		return 0;
+
+	auto ri = &current_data->ref;
+	int frame_count = ri->retsp + 1;
+	int index = frame_count - current_frame_index - 1;
+	if (index < 0 || index >= frame_count || index >= (int)ri->debugger_stack_frames.size())
+	{
+		DCHECK(false);
+		return 0;
+	}
+
+	int sframe = ri->debugger_stack_frames.at(index).stack_frame_base;
+	uint32_t sp = sframe + offset;
+	if (sp >= MAX_STACK_SIZE)
+		return -10000;
+
+	return current_data->stack[sp];
+}
+
+int32_t VM::readGlobal(int32_t idx)
+{
+	return game->global_d[idx];
+}
+
+int32_t VM::readScript(int32_t idx)
+{
+	if (!current_data)
+		return 0;
+
+	auto ri = &current_data->ref;
+	if (unsigned(idx) >= ri->script_d.size())
+		return 0;
+	return ri->script_d[idx];
+}
+
+int32_t VM::readRegister(int32_t id)
+{
+	InDebuggerScopeGuard scope_guard(suppress_errors_in_sandbox);
+
+	if (id == CLASS_THISKEY)
+		return getThisPointer();
+
+	int result = get_register(id);
+	return result;
+}
+
+std::optional<DebugValue> VM::readObjectMember(DebugValue object, const DebugSymbol* sym)
+{
+	InDebuggerScopeGuard scope_guard(suppress_errors_in_sandbox);
+
+	std::optional<int> raw_value;
+
+	if (sym->storage == LOC_REGISTER)
+	{
+		auto type = zasm_debug_data.getType(sym->type_id)->asNonConst(zasm_debug_data);
+		if (type->isArray(zasm_debug_data))
+		{
+			raw_value = find_or_create_internal_script_array({sym->offset, object.raw_value})->id;
+		}
+		else
+		{
+			auto refvar = get_register_ref_dependency(sym->offset);
+			if (refvar.has_value())
+			{
+				int prev_val = get_register(refvar.value());
+				set_register(refvar.value(), object.raw_value);
+				raw_value = get_register(sym->offset);
+				set_register(refvar.value(), prev_val);
+			}
+			else
+			{
+				raw_value = get_register(sym->offset);
+			}
+		}
+	}
+	else if (sym->storage == LOC_CLASS)
+	{
+		if (auto obj = get_script_object(object.raw_value))
+		{
+			if (auto user_obj = dynamic_cast<user_object*>(obj))
+			{
+				if (sym->offset < user_obj->data.size())
+					raw_value = user_obj->data[sym->offset];
+			}
+		}
+	}
+
+	if (!raw_value)
+		return std::nullopt;
+
+	DebugValue value{};
+	value.is_lvalue = true;
+	value.raw_value = raw_value.value();
+	value.type = zasm_debug_data.getType(sym->type_id);
+	return value;
+}
+
+std::optional<std::vector<DebugValue>> VM::readArray(DebugValue array)
+{
+	InDebuggerScopeGuard scope_guard(suppress_errors_in_sandbox);
+
+	ArrayManager am(array.raw_value);
+	if (am.invalid()) return std::nullopt;
+
+	const DebugType* default_elem_type = zasm_debug_data.getType(array.type->extra);
+	std::vector<int32_t> data = am.data();
+
+	std::vector<DebugValue> result;
+	for (int i = 0; i < data.size(); i++)
+	{
+		// Elements within untyped arrays have dynamic typing.
+		if (default_elem_type->isUntyped(zasm_debug_data) && am.script_array())
+		{
+			script_object_type type = am.script_array()->get_type_in_untyped_array(i);
+			int id = data[i];
+			const DebugType* elem_type = getDebugTypeOfUntypedArrayElement(type, id, array.type);
+			// This type shouldn't ever be null, but just incase...
+			if (elem_type)
+			{
+				result.push_back(DebugValue{id, elem_type});
+				continue;
+			}
+		}
+
+		result.push_back(DebugValue{data[i], default_elem_type});
+	}
+
+	return result;
+}
+
+std::optional<DebugValue> VM::readArrayElement(DebugValue array, int index)
+{
+	InDebuggerScopeGuard scope_guard(suppress_errors_in_sandbox);
+
+	ArrayManager am(array.raw_value);
+	if (am.invalid()) return std::nullopt;
+	if (am.size() <= index) return std::nullopt;
+
+	if (index < 0)
+	{
+		index = am.normalize_index(index);
+		if (index < 0) return std::nullopt;
+	}
+
+	int value = am.get(index);
+
+	// Elements within untyped arrays have dynamic typing.
+	const DebugType* default_elem_type = zasm_debug_data.getType(array.type->extra);
+	if (default_elem_type->isUntyped(zasm_debug_data) && am.script_array())
+	{
+		script_object_type type = am.script_array()->get_type_in_untyped_array(index);
+		int id = value;
+		const DebugType* elem_type = getDebugTypeOfUntypedArrayElement(type, id, array.type);
+		return DebugValue{id, elem_type};
+	}
+
+	return DebugValue{value, default_elem_type};
+}
+
+std::optional<int32_t> VM::readArraySize(DebugValue array)
+{
+	InDebuggerScopeGuard scope_guard(suppress_errors_in_sandbox);
+
+	ArrayManager am(array.raw_value);
+	if (am.invalid())
+		return std::nullopt;
+
+	return am.size();
+}
+
+std::optional<std::string> VM::readString(int32_t string_ptr)
+{
+	InDebuggerScopeGuard scope_guard(suppress_errors_in_sandbox);
+
+	ArrayManager am(string_ptr);
+	if (am.invalid())
+		return std::nullopt;
+
+	std::string str;
+	ArrayH::getString(string_ptr, str);
+	return str;
+}
+
+void VM::writeGlobal(int32_t offset, int32_t value)
+{
+	game->global_d[offset] = value;
+}
+
+void VM::writeScript(int32_t offset, int32_t value)
+{
+	if (!current_data)
+		return;
+
+	auto ri = &current_data->ref;
+	if (unsigned(offset) >= ri->script_d.size())
+		return;
+	ri->script_d[offset] = value;
+}
+
+void VM::writeStack(int32_t offset, int32_t value)
+{
+	InDebuggerScopeGuard scope_guard(suppress_errors_in_sandbox);
+
+	if (!current_data)
+		return;
+
+	auto ri = &current_data->ref;
+	int frame_count = ri->retsp + 1;
+	int index = frame_count - current_frame_index - 1;
+	if (index < 0 || index >= frame_count || index >= (int)ri->debugger_stack_frames.size())
+	{
+		DCHECK(false);
+		return;
+	}
+
+	int sframe = ri->debugger_stack_frames.at(index).stack_frame_base;
+	uint32_t sp = sframe + offset;
+	if (sp >= MAX_STACK_SIZE)
+		return;
+
+	current_data->stack[sp] = value;
+}
+
+void VM::writeRegister(int32_t offset, int32_t value)
+{
+	InDebuggerScopeGuard scope_guard(suppress_errors_in_sandbox);
+
+	set_register(offset, value);
+}
+
+bool VM::writeObjectMember(DebugValue object, const DebugSymbol* sym, DebugValue value)
+{
+	InDebuggerScopeGuard scope_guard(suppress_errors_in_sandbox);
+
+	if (sym->storage == LOC_REGISTER)
+	{
+		auto type = zasm_debug_data.getType(sym->type_id)->asNonConst(zasm_debug_data);
+		if (type->isArray(zasm_debug_data))
+			return false;
+
+		auto refvar = get_register_ref_dependency(sym->offset);
+		if (refvar.has_value())
+		{
+			int prev_val = get_register(refvar.value());
+			set_register(refvar.value(), object.raw_value);
+			set_register(sym->offset, value.raw_value);
+			set_register(refvar.value(), prev_val);
+		}
+		else
+		{
+			set_register(sym->offset, value.raw_value);
+		}
+
+		return true;
+	}
+	else if (sym->storage == LOC_CLASS)
+	{
+		if (auto obj = get_script_object(object.raw_value))
+		{
+			if (auto user_obj = dynamic_cast<user_object*>(obj))
+			{
+				if (sym->offset < user_obj->data.size())
+				{
+					// Retain, then release, like the engine (writeclass_impl) - so assigning a
+					// member the object it already solely references doesn't free it.
+					if (user_obj->isMemberObjectType(sym->offset))
+					{
+						script_object_ref_inc(value.raw_value);
+						script_object_ref_dec(user_obj->data[sym->offset]);
+					}
+					user_obj->data[sym->offset] = value.raw_value;
+					return true;
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
+bool VM::writeArrayElement(DebugValue array, int32_t index, DebugValue value)
+{
+	InDebuggerScopeGuard scope_guard(suppress_errors_in_sandbox);
+
+	ArrayManager am(array.raw_value);
+	if (am.invalid()) return false;
+	if (am.size() <= index) return false;
+
+	if (index < 0)
+	{
+		index = am.normalize_index(index);
+		if (index < 0) return false;
+	}
+
+	am.set(index, value.raw_value, getEngineTypeForValue(value));
+
+	return true;
+}
+
+// TODO: this only mostly works. Need to actually handle special cases like assigning a variable in
+// an untyped array, or to an object member field.
+void VM::decreaseObjectReference(DebugValue value, [[maybe_unused]] const DebugSymbol* sym)
+{
+	script_object_ref_dec(value.raw_value);
+}
+
+void VM::increaseObjectReference(DebugValue value, [[maybe_unused]] const DebugSymbol* sym)
+{
+	script_object_ref_inc(value.raw_value);
+}
+
+expected<int32_t, std::string> VM::executeSandboxed(pc_t start_pc, int this_zasm_var, int this_raw_value, const std::vector<int32_t>& args)
+{
+	InDebuggerScopeGuard scope_guard(suppress_errors_in_sandbox);
+
+	extern refInfo *ri;
+	extern script_data *curscript;
+	extern int32_t(*stack)[MAX_STACK_SIZE];
+	extern int32_t(*ret_stack)[MAX_CALL_FRAMES];
+
+	// run_script_int reads the zasm program through curscript. Until the engine has
+	// started running scripts (e.g. a saved function-call watch evaluated during the
+	// opening wipe), there is no program to execute against.
+	if (!curscript || !curscript->valid())
+		return make_unexpected("Cannot call functions before scripts have started");
+
+	refInfo* prev_ri = ri;
+	int32_t(*prev_stack)[MAX_STACK_SIZE] = stack;
+	int32_t(*prev_ret_stack)[MAX_CALL_FRAMES] = ret_stack;
+
+	refInfo tmp_ri{};
+	int32_t tmp_stack[MAX_STACK_SIZE] = {0};
+	int32_t tmp_ret_stack[MAX_CALL_FRAMES] = {0};
+
+	tmp_ri.screenref = current_data ? current_data->ref.screenref : (origin_scr ? origin_scr->screen : 0);
+
+	ri = &tmp_ri;
+	ri->pc = start_pc;
+	ri->sp -= args.size();
+	ri->retsp = 1;
+
+	if (this_zasm_var)
+		set_register(this_zasm_var, this_raw_value);
+
+	stack = &tmp_stack;
+	for (int i = 0; i < args.size(); i++)
+		tmp_stack[MAX_STACK_SIZE - 1 - i] = args[i];
+
+	ret_stack = &tmp_ret_stack;
+
+	int script_engine_result = run_script_int();
+	bool success = script_engine_result == RUNSCRIPT_OK;
+
+	ri = prev_ri;
+	stack = prev_stack;
+	ret_stack = prev_ret_stack;
+
+	if (!success)
+	{
+		if (tmp_ri.waitframes)
+			return make_unexpected("Cannot call Waitframe for expressions evaluated in the debugger");
+		if (script_engine_result == RUNSCRIPT_INFINITE_LOOP)
+			return make_unexpected("Detected possible infinite loop, aborting function call");
+		if (tmp_ri.overflow)
+			return make_unexpected("Function call overflowed");
+		return make_unexpected(fmt::format("Function call failed for an unknown reason ({})", script_engine_result));
+	}
+
+	return tmp_ri.d[D(2)];
+}
+
+DebugValue VM::createArray(std::vector<int32_t> args, const DebugType* array_type)
+{
+	auto array = create_script_array();
+	for (int arg : args)
+		array->arr.Push(arg);
+	return DebugValue{(int)array->id, array_type};
+}
+
+DebugValue VM::createString(const std::string& str)
+{
+	const DebugType* string_type = nullptr;
+	for (auto& type : zasm_debug_data.types)
+	{
+		if (type.tag == TYPE_ARRAY && type.extra == TYPE_CHAR32)
+		{
+			string_type = &type;
+			break;
+		}
+	}
+
+	if (!string_type)
+		return {};
+
+	auto array = create_script_array();
+	for (char arg : str)
+		array->arr.Push(arg * 10000);
+	array->arr.Push(0);
+
+	return DebugValue{(int)array->id, string_type};
+}
+
+int32_t VM::getThisPointer()
+{
+	if (!current_data)
+		return 0;
+
+	auto ri = &current_data->ref;
+	// debugger_stack_frames is an arena indexed by retsp; the live frame count
+	// is retsp + 1 (see debugger_stack_frame_store).
+	int frame_count = ri->retsp + 1;
+	int index = frame_count - current_frame_index - 1;
+	if (index < 0 || index >= frame_count || index >= (int)ri->debugger_stack_frames.size())
+	{
+		DCHECK(false);
+		return 0;
+	}
+
+	return ri->debugger_stack_frames.at(index).this_ptr;
+}

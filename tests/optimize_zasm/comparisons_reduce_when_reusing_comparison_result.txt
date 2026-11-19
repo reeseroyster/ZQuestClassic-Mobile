@@ -1,0 +1,56 @@
+; The caller reads each function's result, so it must stay in D2.
+Function run_none-0
+    0: CALLFUNC        7                            [Block 0 -> ][Function #1]
+    1: TRACER          D2
+    2: CALLFUNC        21                           [Function #2]
+    3: TRACER          D2
+    4: CALLFUNC        36                           [Function #3]
+    5: TRACER          D2
+    6: QUIT
+
+
+Function Function #1
+    7: LOADD           D2               50000       [Block 0 -> 1, 2]
+    8: CASTBOOLF       D2
+    9: COMPAREV        D2               1
+   10: SETMORE         D2
+   11: COMPAREV        D2               1
+   12: GOTOMORE        16
+   13: LOADD           D2               60000       [Block 1 -> 2]
+   14: CASTBOOLF       D2
+   15: COMPAREV        D2               1
+   16: SETMORE         D2                           [Block 2 -> 3, 4]
+   17: COMPAREV        D2               0
+   18: GOTOCMP         20               ==
+   19: SETV            D2               1           [Block 3 -> 4]
+   20: RETURNFUNC                                   [Block 4 -> ]
+
+
+Function Function #2
+   21: LOADD           D2               0           [Block 0 -> 1, 2]
+   22: LOADD           D3               10000
+   23: COMPARER        D3               D2
+   24: SETMORE         D2
+   25: COMPAREV        D2               0
+   26: SETTRUEI        D2
+   27: COMPAREV        D2               1
+   28: GOTOCMP         30               >=
+   29: TRACEV          1                            [Block 1 -> 2]
+   30: SETMOREI        D2                           [Block 2 -> 4]
+   31: COMPAREV        D2               0
+   32: SETTRUEI        D2
+   33: GOTO            35
+   34: TRACEV          1                            [Block 3 -> 4]
+   35: RETURNFUNC                                   [Block 4 -> ]
+
+
+Function Function #3
+   36: SETV            D3               5           [Block 0 -> 1, 2]
+   37: COMPAREV        D3               10
+   38: SETLESS         D2
+   39: COMPAREV        D2               0
+   40: GOTOTRUE        43
+   41: TRACER          D2                           [Block 1 -> ]
+   42: QUIT
+   43: SETV            D2               99          [Block 2 -> ]
+   44: RETURNFUNC

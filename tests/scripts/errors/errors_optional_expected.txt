@@ -1,0 +1,70 @@
+stderr:
+
+Compiling 'errors_optional.zs'
+Pass 1: Parsing
+Pass 2: Preprocessing
+Pass 3: Registration
+Pass 4: Analyzing Code
+errors_optional.zs Line 13 @ Columns 2-10 - Warning S108: Array mismatch for types char32[] and int
+
+11    // ok
+12    int optional_params_3(char32[] a = "") {
+13        return a;
+          ^~~~~~~~
+
+
+Pass 5: Checking code paths
+Pass 6: Generating object code
+errors_optional.zs Line 27 @ Columns 37-40 - Error T019: Attempting to divide by 0.
+
+25    
+26    // not ok
+27    int optional_params_6(int a = <int>(3/0)) {
+                                          ^~~
+
+
+Failure!
+Compile finished with exit code '19' (compiled with errors)
+
+stdout:
+
+{
+  "success": false,
+  "code": 19,
+  "diagnostics": [
+    {
+      "range": {
+        "start": {
+          "line": 12,
+          "character": 1
+        },
+        "end": {
+          "line": 12,
+          "character": 9
+        }
+      },
+      "severity": 2,
+      "message": "S108: Array mismatch for types char32[] and int"
+    },
+    {
+      "range": {
+        "start": {
+          "line": 26,
+          "character": 36
+        },
+        "end": {
+          "line": 26,
+          "character": 39
+        }
+      },
+      "severity": 1,
+      "message": "T019: Attempting to divide by 0."
+    }
+  ],
+  "metadata": {
+    "currentFileSymbols": 7,
+    "symbols": 15,
+    "identifiers": 25,
+    "elided": true
+  }
+}

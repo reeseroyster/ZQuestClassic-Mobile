@@ -1,0 +1,166 @@
+#include "core/msg_scroll.h"
+#include "base/general.h"
+#include "base/util.h"
+
+void MsgScrollState::clear()
+{
+	can_scroll = segmented = active_scrolling = false;
+	scroll_pos = target_scroll_pos = max_visible_pos = 0;
+	body_height = 1;
+	active_speed = 1;
+	passive_speed = 1;
+}
+
+void MsgScrollState::set_body_height(int height, int margin_up, int margin_down)
+{
+	body_height = zc_max(1, height - margin_up - margin_down);
+}
+
+int MsgScrollState::max_scroll() const
+{
+	if (!can_scroll)
+		return 0;
+	if (max_visible_pos <= body_height)
+		return 0;
+	return zc_max(0, max_visible_pos - body_height);
+}
+
+int MsgScrollState::bound(int v) const
+{
+	return vbound(v, 0, max_scroll());
+}
+
+void MsgScrollState::clamp()
+{
+	scroll_pos = bound(scroll_pos);
+	target_scroll_pos = bound(target_scroll_pos);
+}
+
+bool MsgScrollState::update_max_scroll(int pos)
+{
+	if (segmented && pos > 0)
+	{
+		// round up to the end of the segment containing the last row
+		int seg = (pos - 1) / segment_stride();
+		pos = seg * segment_stride() + body_height;
+	}
+
+	if (pos <= max_visible_pos)
+		return false;
+	max_visible_pos = pos;
+	return true;
+}
+
+bool MsgScrollState::ensure_scrolled_to(int pos, int h)
+{
+	int epos = pos + h;
+
+	bool grew = update_max_scroll(epos);
+
+	if (target_scroll_pos + body_height < epos)
+	{
+		if (segmented)
+			target_scroll_pos = pos - (pos % segment_stride());
+		else target_scroll_pos = epos - body_height;
+	}
+	else if (target_scroll_pos > pos)
+	{
+		if (segmented)
+			target_scroll_pos = pos - (pos % segment_stride());
+		else target_scroll_pos = pos;
+	}
+
+	return grew;
+}
+
+bool MsgScrollState::tick()
+{
+	if (!can_scroll || scroll_pos == target_scroll_pos)
+		return false;
+	uint spd = active_scrolling ? active_speed : passive_speed;
+	if (!spd)
+		scroll_pos = target_scroll_pos;
+	else
+		scroll_pos = util::move_towards(scroll_pos, target_scroll_pos, spd);
+	if (scroll_pos == target_scroll_pos)
+		active_scrolling = false;
+	return true;
+}
+
+void MsgScrollState::scroll_input(bool up, bool down)
+{
+	if (up == down)
+		return; // cancel out
+	if (down ? scroll_pos >= max_scroll() : scroll_pos <= 0)
+		return; // invalid scroll direction
+	if (segmented)
+	{
+		active_scrolling = true;
+		target_scroll_pos = bound(target_scroll_pos + (down ? segment_stride() : -segment_stride()));
+	}
+	else
+	{
+		scroll_pos = bound(scroll_pos + (down ? active_speed : -active_speed));
+		target_scroll_pos = scroll_pos;
+	}
+}
+
+void MsgScrollState::wheel(int delta)
+{
+	if (!delta || !can_scroll)
+		return;
+	if (segmented)
+	{
+		if (scroll_pos != target_scroll_pos)
+			return; // only segmented scroll from still
+		if (target_scroll_pos % segment_stride())
+			target_scroll_pos -= (target_scroll_pos % segment_stride());
+		if (delta > 0 && target_scroll_pos < max_scroll())
+			target_scroll_pos += segment_stride();
+		else if (delta < 0 && target_scroll_pos > 0)
+			target_scroll_pos -= segment_stride();
+	}
+	else
+	{
+		target_scroll_pos = bound(target_scroll_pos + 4*delta);
+	}
+}
+
+std::optional<int> MsgScrollState::segment_crossed(int ty, int ty2)
+{
+	if (!segmented)
+		return std::nullopt;
+	int seg = ty / segment_stride();
+	if (ty2 <= seg * segment_stride() + body_height)
+		return std::nullopt; // still fits within this segment's body
+	max_visible_pos = seg * segment_stride() + body_height;
+	return (seg + 1) * segment_stride();
+}
+
+namespace msg_layout
+{
+
+bool bottom_margin_clip(int cursor_y, int height, int margin_down,
+	bool can_scroll, bool old_margins_qr, bool old_frame_qr)
+{
+	return !can_scroll && !old_margins_qr
+		&& cursor_y >= (height + (old_frame_qr?16:0) - margin_down);
+}
+
+bool wrap_needed(int cursor_x, int hspace, int advance_w, int width,
+	int margin_right)
+{
+	return cursor_x + hspace + advance_w > width - margin_right;
+}
+
+bool char_wrap_needed(int cursor_x, int tlength, int width,
+	int margin_right, bool wrap_flag, bool rem_word_is_space)
+{
+	if (cursor_x + tlength <= width - margin_right)
+		return false;
+	if (cursor_x > width - margin_right || !wrap_flag)
+		return true;
+	return !rem_word_is_space;
+}
+
+}

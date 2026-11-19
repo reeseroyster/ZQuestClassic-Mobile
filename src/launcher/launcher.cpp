@@ -1,0 +1,361 @@
+#include "zalleg/zalleg.h"
+#include "core/zdefs.h"
+#include "launcher/launcher.h"
+#include "zalleg/render.h"
+#include "launcher/launcher_dialog.h"
+#include "base/process_management.h"
+#include "base/zapp.h"
+#include "fontsdat.h"
+#include "zq/render_tooltip.h"
+#include "zsyssimple.h"
+
+#define QUIT_LAUNCHER() \
+do{ \
+	return 1; \
+} \
+while(false)
+
+int32_t readsize = 0, writesize = 0;
+int32_t zq_screen_w=LARGE_W;
+int32_t zq_screen_h=LARGE_H;
+BITMAP *mouse_bmp;
+int32_t gui_colorset = 99;
+
+void init_launcher_palette();
+
+int32_t cursorColor(int32_t col)
+{
+	switch(col)
+	{
+		case dvc(1):
+		case dvc(4):
+			return jwin_pal[jcCURSORMISC];
+		case dvc(2):
+			return jwin_pal[jcCURSOROUTLINE];
+		case dvc(3):
+			return jwin_pal[jcCURSORLIGHT];
+		case dvc(5):
+			return jwin_pal[jcCURSORDARK];
+	}
+	return col;
+}
+void load_mouse()
+{
+	gui_mouse_focus=0;
+	MouseSprite::set(-1);
+	byte mousepx[16][16] = { { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, }, { 0, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 0, }, { 0, 241, 242, 243, 245, 245, 245, 245, 245, 245, 245, 245, 243, 241, 0, 0, }, { 0, 0, 241, 242, 243, 243, 245, 245, 245, 245, 245, 245, 243, 241, 0, 0, }, { 0, 0, 0, 241, 242, 243, 243, 243, 245, 245, 245, 243, 241, 0, 0, 0, }, { 0, 0, 0, 0, 241, 242, 243, 243, 243, 243, 245, 243, 241, 0, 0, 0, }, { 0, 0, 0, 0, 0, 241, 242, 243, 243, 243, 243, 241, 0, 0, 0, 0, }, { 0, 0, 0, 0, 0, 0, 241, 242, 243, 243, 243, 241, 0, 0, 0, 0, }, { 0, 0, 0, 0, 0, 0, 0, 241, 242, 243, 243, 241, 0, 0, 0, 0, }, { 0, 0, 0, 0, 0, 0, 0, 0, 241, 242, 241, 0, 0, 0, 0, 0, }, { 0, 0, 0, 0, 0, 0, 0, 0, 0, 241, 241, 0, 0, 0, 0, 0, }, { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 241, 0, 0, 0, 0, 0, }, { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, }, { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, }, { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, }, { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, } };
+	for(auto x = 0; x < 16; ++x)
+		for(auto y = 0; y < 16; ++y)
+		{
+			putpixel(mouse_bmp, x, y, cursorColor(mousepx[x][y]));
+		}
+	MouseSprite::assign(0, mouse_bmp);
+	MouseSprite::set(0);
+}
+
+void hit_close_button()
+{
+    close_button_quit=true;
+    return;
+}
+
+static void render_launcher();
+
+int32_t main(int32_t argc, char* argv[])
+{
+	zalleg_setup_allegro(App::launcher, argc, argv);
+
+	if (used_switch(argc, argv, "-update"))
+	{
+		std::string output;
+		bool success = run_and_get_output(locate_zapp_file(ZUPDATER_FILE), {"-headless", "-cache"}, output);
+		success &= output.find("Success!") != std::string::npos;
+		printf("%s\n", output.c_str());
+		set_is_exiting();
+		allegro_exit();
+		zapp_exit(success ? 0 : 1);
+	}
+
+	if (!render_timer_start())
+	{
+		Z_error_fatal("couldn't allocate timer\n");
+		QUIT_LAUNCHER();
+	}
+	
+	LOCK_VARIABLE(dclick_status);
+	LOCK_VARIABLE(dclick_time);
+	lock_dclick_function();
+	install_int(dclick_check, 20);
+	
+	set_color_depth(8);
+
+	int gfx_mode = GFX_AUTODETECT_WINDOWED;
+	int window_width = zc_get_config("ZLAUNCH", "window_width", -1);
+	int window_height = zc_get_config("ZLAUNCH", "window_height", -1);
+
+	zalleg_create_window("ZQuest Classic Launcher", gfx_mode, zq_screen_w, zq_screen_h, window_width, window_height, 2);
+	zalleg_redraw_display = render_launcher;
+
+	Z_message("Loading bitmaps..."); //{
+	mouse_bmp = create_bitmap_ex(8,16,16);
+	
+	if(!(mouse_bmp && screen))
+	{
+		Z_error_fatal("failed\n");
+		QUIT_LAUNCHER();
+	}
+	Z_message("OK\n");
+	
+	Z_message("Loading configs...");
+	gui_colorset = zc_get_config("ZLAUNCH","gui_colorset",99);
+	Z_message("OK\n");
+	
+	Z_message("Initializing palette...");
+	init_launcher_palette();
+	Z_message("OK\n");
+	
+	
+	Z_message("Initializing mouse...");
+	load_mouse();
+	Z_message("OK\n");
+	
+	set_close_button_callback((void (*)()) hit_close_button);
+	//
+	Z_message("Launcher opened successfully.\n");
+	
+	LauncherDialog().show();
+
+	Z_message("Exiting launcher...\n");
+	
+	flush_config_file();
+	set_is_exiting();
+	allegro_exit();
+	return 0;
+}
+END_OF_MAIN()
+
+//Things required to compile from shared files... le sigh -Em
+bool is_compact = false;
+bool DragAspect = true;
+double aspect_ratio = LARGE_H / double(LARGE_W);
+int window_min_width = 0, window_min_height = 0;
+
+bool is_reserved_key(int c)
+{
+	switch(c)
+	{
+		case KEY_ESC:
+			return true;
+	}
+	return false;
+}
+bool is_reserved_keycombo(int c, int modflag)
+{
+	if(c==KEY_F4 && (modflag&KB_ALT_FLAG))
+		return true;
+	return false;
+}
+//{ Nil funcs
+
+int32_t d_timer_proc(int32_t, DIALOG *, int32_t)
+{
+	return D_O_K;
+}
+
+string get_box_cfg_hdr([[maybe_unused]] int num)
+{
+	return "misc";
+}
+
+void large_dialog(DIALOG *)
+{
+}
+
+//}
+
+void init_launcher_palette()
+{
+	get_palette(RAMpal);
+	//{ Hardcoded instead of datafile
+	for(auto q = 0; q < 224; ++q)
+	{
+		RAMpal[q].r = 16; RAMpal[q].g =  0; RAMpal[q].b = 16;
+	}
+	RAMpal[224].r =  0; RAMpal[224].g =  0; RAMpal[224].b =  0;
+	RAMpal[225].r =  0; RAMpal[225].g =  0; RAMpal[225].b = 42;
+	RAMpal[226].r =  0; RAMpal[226].g = 39; RAMpal[226].b =  0;
+	RAMpal[227].r =  0; RAMpal[227].g = 42; RAMpal[227].b = 42;
+	RAMpal[228].r = 44; RAMpal[228].g =  9; RAMpal[228].b =  9;
+	RAMpal[229].r = 42; RAMpal[229].g =  0; RAMpal[229].b = 42;
+	RAMpal[230].r = 41; RAMpal[230].g = 26; RAMpal[230].b =  2;
+	RAMpal[231].r = 42; RAMpal[231].g = 42; RAMpal[231].b = 42;
+	RAMpal[232].r = 21; RAMpal[232].g = 21; RAMpal[232].b = 21;
+	RAMpal[233].r = 21; RAMpal[233].g = 21; RAMpal[233].b = 63;
+	RAMpal[234].r = 21; RAMpal[234].g = 63; RAMpal[234].b = 21;
+	RAMpal[235].r = 21; RAMpal[235].g = 63; RAMpal[235].b = 63;
+	RAMpal[236].r = 63; RAMpal[236].g = 21; RAMpal[236].b = 21;
+	RAMpal[237].r = 63; RAMpal[237].g = 21; RAMpal[237].b = 63;
+	RAMpal[238].r = 63; RAMpal[238].g = 63; RAMpal[238].b = 21;
+	RAMpal[239].r = 63; RAMpal[239].g = 63; RAMpal[239].b = 63;
+	RAMpal[240].r =  0; RAMpal[240].g =  0; RAMpal[240].b = 32;
+	RAMpal[241].r =  0; RAMpal[241].g =  0; RAMpal[241].b =  0;
+	RAMpal[242].r = 16; RAMpal[242].g = 16; RAMpal[242].b = 16;
+	RAMpal[243].r = 32; RAMpal[243].g = 32; RAMpal[243].b = 32;
+	RAMpal[244].r = 52; RAMpal[244].g = 51; RAMpal[244].b = 49;
+	RAMpal[245].r = 63; RAMpal[245].g = 63; RAMpal[245].b = 63;
+	RAMpal[246].r = 63; RAMpal[246].g = 63; RAMpal[246].b = 55;
+	RAMpal[247].r = 63; RAMpal[247].g = 55; RAMpal[247].b = 39;
+	RAMpal[248].r =  0; RAMpal[248].g =  0; RAMpal[248].b = 19;
+	RAMpal[249].r =  2; RAMpal[249].g =  8; RAMpal[249].b = 26;
+	RAMpal[250].r =  8; RAMpal[250].g = 14; RAMpal[250].b = 31;
+	RAMpal[251].r = 15; RAMpal[251].g = 21; RAMpal[251].b = 37;
+	RAMpal[252].r = 21; RAMpal[252].g = 28; RAMpal[252].b = 42;
+	RAMpal[253].r = 28; RAMpal[253].g = 35; RAMpal[253].b = 48;
+	RAMpal[254].r = 34; RAMpal[254].g = 42; RAMpal[254].b = 53;
+	RAMpal[255].r = 41; RAMpal[255].g = 49; RAMpal[255].b = 59;
+	//}
+
+	for (int i = 0; i < 256; i++)
+	{
+		RAMpal[i].r = _rgb_scale_6[RAMpal[i].r];
+		RAMpal[i].g = _rgb_scale_6[RAMpal[i].g];
+		RAMpal[i].b = _rgb_scale_6[RAMpal[i].b];
+	}
+
+	load_colorset(gui_colorset);
+	
+	zc_set_palette(RAMpal);
+	clear_to_color(screen,vc(0));
+}
+
+static RenderTreeItem rti_root("root");
+static LegacyBitmapRTI rti_screen("screen");
+
+RenderTreeItem& gui_mouse_target()
+{
+	if (rti_dialogs.has_children())
+		return *rti_dialogs.get_children().back();
+	return rti_screen;
+}
+
+int window_mouse_x()
+{
+	return rti_screen.rel_mouse().first;
+}
+int window_mouse_y()
+{
+	return rti_screen.rel_mouse().second;
+}
+
+bool use_linear_bitmaps()
+{
+	static bool value = zc_get_config("ZLAUNCH", "scaling_mode", 0) == 1;
+	return value;
+}
+static void init_render_tree()
+{
+	if (rti_root.has_children())
+		return;
+
+	set_bitmap_create_flags(true);
+	rti_screen.bitmap = al_create_bitmap(screen->w, screen->h);
+	rti_screen.a4_bitmap = screen;
+	rti_screen.set_size(screen->w, screen->h);
+
+	rti_root.add_child(&rti_screen);
+	rti_root.add_child(&rti_dialogs);
+
+	al_set_new_bitmap_flags(0);
+	
+	_init_render(al_get_bitmap_format(rti_screen.bitmap));
+}
+
+static void configure_render_tree()
+{
+	int resx = al_get_display_width(all_get_display());
+	int resy = al_get_display_height(all_get_display());
+
+	rti_root.visible = true;
+
+	{
+		static bool scaling_force_integer = zc_get_config("ZLAUNCH", "scaling_force_integer", 0) == 1;
+
+		int w = rti_screen.width;
+		int h = rti_screen.height;
+		auto [xscale, yscale] = fit_scale(resx, resy, w, h, false, scaling_force_integer);
+		auto transform = letterbox_transform(resx, resy, w, h, xscale, yscale);
+		rti_screen.set_transform(transform);
+		rti_screen.visible = true;
+		// TODO: it seems `rti_screen` is unnecessary, given this `rti_dialogs` also draws the main Window component.
+		rti_dialogs.set_transform(transform);
+		rti_dialogs.visible = true;
+	}
+	reload_dialog_tint();
+}
+
+static void render_launcher()
+{
+	render_tree_present(&rti_root, al_map_rgb_f(0, 0, 0), [] {
+		init_render_tree();
+		configure_render_tree();
+	});
+}
+
+void zq_push_unfrozen_dialogs(size_t){}
+void zq_pop_unfrozen_dialogs(){}
+
+bool update_hw_pal = false;
+void update_hw_screen()
+{
+	if (is_headless())
+		return;
+
+	zalleg_process_display_events();
+	if(update_hw_pal)
+	{
+		zc_set_palette(RAMpal);
+		load_mouse();
+	}
+	update_hw_pal=false;
+
+	render_timer_wait();
+	render_launcher();
+}
+
+void clear_tooltip()
+{
+	
+}
+void ttip_uninstall_all()
+{
+	
+}
+void gui_tooltip_show(std::string const&, int32_t, int32_t, int32_t, int32_t)
+{
+	
+}
+void gui_tooltip_hide()
+{
+	
+}
+
+// TODO: I experimented with making zcbase/zcgui shared/object libraries, and the followed was needed to compile zlauncher:
+// The following is needed because of ~mapscr, which is in zcbase.
+// void ffcdata::solid_update(bool push) {}
+// bool ffcdata::setSolid(bool set) {return false;}
+// void ffcdata::updateSolid() {}
+// void ffcdata::doContactDamage(int32_t hdir) {}
+
+// bool solid_object::setSolid(bool set) {return false;}
+// bool solid_object::getSolid() const {return false;}
+// void solid_object::updateSolid() {}
+// bool solid_object::collide(solid_object const* other) const {return false;}
+// bool solid_object::collide(zfix tx, zfix ty, zfix tw, zfix th) const {return false;}
+// void solid_object::solid_update(bool push) {}
+// void solid_object::solid_push(solid_object* pusher) {}
+
+// // Needed for other things in zcbase to resolve.
+// void replay_step_comment(std::string comment) {}
+// bool fake_pack_writing=false;
+bool replay_is_active() {return false;}
+bool replay_version_check([[maybe_unused]] int min, [[maybe_unused]] int max) {return false;}

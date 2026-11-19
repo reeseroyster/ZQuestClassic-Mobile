@@ -1,0 +1,136 @@
+#include "zc/zasm_pipeline.h"
+#include "zc/scripting/jit/jit.h"
+#include "zc/zasm_optimize.h"
+#include "zc/zasm_utils.h"
+#include <thread>
+#include <fmt/format.h>
+
+// Raw pointer on purpose: if an exit path forgets zasm_pipeline_shutdown, a
+// static unique_ptr would join the worker threads during static destruction,
+// racing threads that touch already-destroyed statics. Leaking is safe - the
+// threads die with the process.
+static WorkerPool* worker_pool;
+static const int MAX_THREADS = 16;
+
+template <typename... Args>
+static void zasm_pipeline_trace(fmt::format_string<Args...> s, Args&&... args)
+{
+    std::string text = fmt::format(s, std::forward<Args>(args)...);
+	al_trace("[zasm-pipeline] %s\n", text.c_str());
+}
+
+int jit_requested_threads(int min_threads)
+{
+	int num_threads = get_flag_int("-jit-threads").value_or(zc_get_config("ZSCRIPT", "jit_threads", -2));
+	if (num_threads == 0)
+		return 0;
+
+	auto processor_count = std::thread::hardware_concurrency();
+	if (num_threads < 0)
+		num_threads = std::max(min_threads, (int)processor_count / -num_threads);
+
+	return num_threads;
+}
+
+static int get_worker_thread_count()
+{
+	// No engine worker pool on web; the wasm backend threads its own
+	// precompile (see jit_precompile_scripts_impl).
+	if (is_web())
+		return 0;
+
+	return std::min(MAX_THREADS, jit_requested_threads(0));
+}
+
+static void init_worker_pool(int num_threads)
+{
+	if (num_threads > 0)
+	{
+		worker_pool = new WorkerPool(num_threads);
+		zasm_pipeline_trace("created worker pool with {} threads", num_threads);
+	}
+}
+
+static bool pipeline_initialized;
+
+// If enabled, runs the zasm optimizer synchronously (but in parallel on as many threads as
+// available).
+//
+// Then, if enabled starts the JIT system. If precompile is enabled, all scripts will be compiled
+// before the function returns. Otherwise, the JIT will compile functions in the worker pool as they
+// become hot.
+//
+// Note: running the optimizer in the worker pool async (while the game is playing) was explored,
+// and mostly implemented in a3e48bba. But it was removed because the optimizer runs fast enough,
+// and the extra complications and compromises (not all passes could run) are not worth it.
+void zasm_pipeline_init(bool force_precompile)
+{
+	CHECK(!pipeline_initialized);
+
+	if (!jit_is_enabled() && !zasm_optimize_is_enabled())
+	{
+		zasm_pipeline_trace("zasm optimizer and jit are disabled");
+		return;
+	}
+
+	// Only count non-trivial scripts.
+	int num_scripts = 0;
+	bool parallel = false;
+	zasm_for_every_script(parallel, [&](auto script){
+		if (script->size >= 10)
+			num_scripts += 1;
+	});
+
+	if (num_scripts == 0)
+	{
+		zasm_pipeline_trace("no scripts");
+		return;
+	}
+
+	int num_worker_threads = get_worker_thread_count();
+	bool precompile = force_precompile || is_feature_enabled("-jit-precompile", "ZSCRIPT", "jit_precompile", false);
+
+	// Currently can only compile WASM on main browser thread, so always precompile scripts.
+	if (is_web())
+		precompile = true;
+	if (get_flag_int("-test-bisect").has_value() || get_flag_int("-test-jit-bisect").has_value())
+		precompile = true;
+	if (!precompile && !num_worker_threads && jit_is_enabled())
+	{
+		zasm_pipeline_trace("no threads assigned for worker pool, so must precompile");
+		precompile = true;
+	}
+
+	zasm_pipeline_trace("optimizer: {}, jit: {}", zasm_optimize_is_enabled(), jit_is_enabled());
+	if (precompile)
+		zasm_pipeline_trace("precompiling scripts");
+
+	zasm_optimize_sync();
+
+	if (jit_is_enabled())
+	{
+		init_worker_pool(num_worker_threads);
+		jit_startup(precompile);
+	}
+
+	pipeline_initialized = true;
+}
+
+void zasm_pipeline_shutdown()
+{
+	if (worker_pool)
+	{
+		worker_pool->terminate();
+		delete worker_pool;
+		worker_pool = nullptr;
+	}
+
+	jit_shutdown();
+
+	pipeline_initialized = false;
+}
+
+WorkerPool* zasm_pipeline_worker_pool()
+{
+	return worker_pool;
+}

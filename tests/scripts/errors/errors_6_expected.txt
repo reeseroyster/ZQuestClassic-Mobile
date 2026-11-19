@@ -1,0 +1,45 @@
+stderr:
+
+Compiling 'errors_6.zs'
+Pass 1: Parsing
+Pass 2: Preprocessing
+Pass 3: Registration
+errors_6.zs Line 12 @ Columns 5-6 - Error S008: There is already a variable with name a in this scope.
+
+10    
+11    int a = 1;
+12    int a = 1;
+          ^
+
+
+Failure!
+Compile finished with exit code '8' (compiled with errors)
+
+stdout:
+
+{
+  "success": false,
+  "code": 8,
+  "diagnostics": [
+    {
+      "range": {
+        "start": {
+          "line": 11,
+          "character": 4
+        },
+        "end": {
+          "line": 11,
+          "character": 5
+        }
+      },
+      "severity": 1,
+      "message": "S008: There is already a variable with name a in this scope."
+    }
+  ],
+  "metadata": {
+    "currentFileSymbols": 10,
+    "symbols": 1,
+    "identifiers": 1,
+    "elided": true
+  }
+}

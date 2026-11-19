@@ -1,0 +1,16 @@
+; Like comparisons_reduce_always_false, but the comparison result register D2
+; is read (live-out) in both successors. The branch folds to a constant (a
+; 10000/0 result never equals 0.0001) while D2 itself is (tile == 0), so the
+; reduction must re-emit D2 from its own compare rather than drop the write or
+; splice a SETCMP into an empty branch sequence (which crashed).
+Function run_none-0
+    0: SETR            D2               SPRITE_TILE [Block 0 -> 1, 2]
+    1: COMPAREV        D2               0
+    2: SETCMP          D2               I==
+    3: COMPAREV        D2               1823720000
+    4: SETCMP          D2               BI==
+    5: COMPAREV        D2               1
+    6: GOTOCMP         9                ==
+    7: TRACER          D2                           [Block 1 -> ]
+    8: QUIT
+    9: TRACER          D2                           [Block 2 -> ]

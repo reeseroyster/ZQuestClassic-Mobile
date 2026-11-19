@@ -1,0 +1,2711 @@
+// There are multiple tests that ensure the correctness of these optimizations:
+//
+// 1. python tests/test_optimize_zasm_unit.py
+//
+//    Optimizes small synthetic snippets of ZASM, each saved as a snapshot test.
+//    See the files in tests/optimize_zasm and their expected values in tests/snapshots/optimize_zasm_unit
+//    To see all at once: python tests/test_optimize_zasm_unit.py --print
+//
+// 2. python tests/test_optimize_zasm.py
+//
+//    Optimizes the scripts in all the quests in tests/replays, and creates a snapshot test for the summary
+//    of the optimizer
+//
+// 3. zplayer -test-zc will run a few unit tests, located in zasm_optimize_test.cpp.
+//
+// 4. python scripts/run_for_every_qst.py --starting_index 235 ./build/Debug/zplayer -extract-zasm %s -optimize-zasm -optimize-zasm-experimental 2>&1 | code -
+//
+//    Run in debug mode (for asserts) on every quest in the database.
+//
+// 5. Finally, all the replay tests run with these optimizations applied, and since as of this writing no replays
+//    were recorded w/ these optimizations, they grant a high confidence that these optimizations are sound.
+
+#include "zc/zasm_optimize.h"
+#include "zc/zasm_optimize_internal.h"
+#include "base/general.h"
+#include "base/util.h"
+#include "base/zapp.h"
+#include "core/zdefs.h"
+#include "parser/parserDefs.h"
+#include "components/zasm/pc.h"
+#include "zc/ffscript.h"
+#include "zc/scripting/jit/jit.h"
+#include "zc/parallel.h"
+#include "zc/script_debug.h"
+#include "zc/zasm_utils.h"
+#include "components/zasm/table.h"
+#include "components/zasm/serialize.h"
+#include "zconfig.h"
+#include "zc/zscriptversion.h"
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <fstream>
+#include <memory>
+#include <optional>
+#include <stdbool.h>
+#include <string>
+#include <ranges>
+#include <utility>
+#include <algorithm>
+#include <mutex>
+#include <sstream>
+#include <fmt/format.h>
+
+bool zasm_optimize_verbose;
+
+bool zasm_optimize_is_enabled()
+{
+	static bool enabled = is_feature_enabled("-optimize-zasm", "ZSCRIPT", "optimize_zasm", true);
+	return enabled;
+}
+
+// TODO: remove when more stable.
+// Need to clean up the code for what registers/commands have side effects, use implicit registers, etc.
+// Need to verify nothing was missed.
+static bool should_run_experimental_passes()
+{
+	static bool enabled = get_flag_bool("-optimize-zasm-experimental").value_or(false);
+	return enabled;
+}
+
+static bool should_run_optimizer_in_parallel()
+{
+	static bool parallel = !is_web() && !get_flag_bool("-optimize-zasm-no-parallel").value_or(false) && !get_flag_int("-test-bisect").has_value();
+	return parallel;
+}
+
+template <typename... Args>
+static void zasm_optimize_trace(fmt::format_string<Args...> s, Args&&... args)
+{
+    std::string text = fmt::format(s, std::forward<Args>(args)...);
+	al_trace("[optimizer] %s\n", text.c_str());
+}
+
+// Very useful tool for identifying a single bad optimization.
+// Use with a tool like `find-first-fail`: https://gitlab.com/ole.tange/tangetools/-/blob/master/find-first-fail/find-first-fail
+// 1. Enable ENABLE_BISECT_TOOL below.
+// 2. Make a new script `tmp.sh` calling a failing replay:
+//        python tests/run_replay_tests.py --filter stellar --frame 40000 --extra_args="-replay-fail-assert-instant -test-bisect $1"
+// 3. Run the bisect script (may need to increase the end range up to 100000 or more):
+//        bash ~/tools/find-first-fail.sh -s 0 -e 10000 -v -q bash tmp.sh
+// 4. For the number given, set `-test-bisect` to that, and set a breakpoint
+//    where specified in bisect_tool_should_skip. Whatever block being processed is the one to focus on.
+// #define ENABLE_BISECT_TOOL
+static bool bisect_tool_should_skip()
+{
+#ifdef ENABLE_BISECT_TOOL
+	static int64_t c = 0;
+	static int64_t x = get_flag_int("-test-bisect").value();
+	// Skip the first x calls.
+	bool skip = 0 <= c && c < x;
+	c++;
+	if (!skip)
+		// Set a breakpoint here.
+		x = x;
+	return skip;
+#else
+	return false;
+#endif
+}
+
+template<class... Args>
+bool one_of(const unsigned int var, const Args&... args)
+{
+  return ((var == args) || ...);
+}
+
+template <typename T>
+static void for_every_side_effect_d_registers_only(const ffscript& instr, T fn)
+{
+	std::array<bool, 8> r{}, w{};
+
+	auto& command_meta_cache = zasm_get_command_meta_cache();
+	auto& meta = command_meta_cache[instr.command];
+	for (int i = 0; i < 8; i++)
+	{
+		r[i] = meta.implicit_read_mask & (1 << i);
+		w[i] = meta.implicit_write_mask & (1 << i);
+	}
+
+	const int32_t* p_arg = &instr.arg1;
+	for (int argn = 0; argn < 3; ++argn)
+	{
+		const auto& arg_info = meta.args[argn];
+		if (!arg_info.is_reg) continue;
+
+		int reg = p_arg[argn];
+		if (reg < 8)
+		{
+			if (arg_info.reads)
+				r[reg] = true;
+			if (arg_info.writes)
+				w[reg] = true;
+		}
+
+		for (auto reg : get_register_dependencies(reg))
+		{
+			if (reg < 8)
+				r[reg] = true;
+		}
+	}
+
+	for (int i = 0; i < 8; i++)
+	{
+		bool read = r[i];
+		bool write = w[i];
+		if (read || write)
+			fn(read, write, i);
+	}
+}
+
+template <typename T>
+static void for_every_register_side_effect(const ffscript& instr, T fn)
+{
+	for (auto [reg, rw] : get_command_implicit_dependencies(instr.command))
+	{
+		bool read = rw == ARGTY::READWRITE_REG || rw == ARGTY::READ_REG;
+		bool write = rw == ARGTY::READWRITE_REG || rw == ARGTY::WRITE_REG;
+		fn(read, write, reg, -1);
+	}
+
+	for_every_register_side_effect_args_only(instr, [&](bool read, bool write, int reg, int argn){
+		if (auto r = get_register_ref_dependency(reg))
+			fn(true, false, *r, -1);
+		for (auto r : get_register_dependencies(reg))
+			fn(true, false, r, -1);
+		fn(read, write, reg, argn);
+	});
+}
+
+#define C(i) (ctx.script->zasm[i])
+#define E(i) (ctx.cfg.block_edges[i])
+
+static OptContext create_context_no_cfg(StructuredZasm& structured_zasm, zasm_script* script, const ZasmFunction& fn, std::shared_ptr<const ZasmFunctionLivenessList> function_liveness = nullptr)
+{
+	OptContext ctx{};
+	ctx.structured_zasm = &structured_zasm;
+	ctx.function_liveness = std::move(function_liveness);
+	ctx.script = script;
+	ctx.fn = fn;
+	ctx.debug = zasm_optimize_verbose;
+	ctx.cfg_stale = true;
+	return ctx;
+}
+
+static void add_context_cfg(OptContext& ctx)
+{
+	if (!ctx.cfg_stale)
+		return;
+
+	ctx.cfg = zasm_construct_cfg(ctx.script, {{ctx.fn.start_pc, ctx.fn.final_pc}});
+	ctx.block_unreachable.clear();
+	ctx.cfg_stale = false;
+}
+
+static ZasmFunctionLivenessList analyze_function_liveness(const zasm_script* script, const StructuredZasm& structured_zasm)
+{
+	std::vector<std::pair<pc_t, pc_t>> pc_ranges;
+	for (const auto& fn : structured_zasm.functions)
+		pc_ranges.emplace_back(fn.start_pc, fn.final_pc);
+	return zasm_analyze_function_liveness(script, zasm_construct_cfg(script, pc_ranges), structured_zasm, false);
+}
+
+static void add_context_liveness(OptContext& ctx)
+{
+	if (!ctx.function_liveness)
+		ctx.function_liveness = std::make_shared<const ZasmFunctionLivenessList>(analyze_function_liveness(ctx.script, *ctx.structured_zasm));
+	ctx.liveness_vars = zasm_run_liveness_analysis(ctx.script, ctx.cfg, *ctx.structured_zasm, *ctx.function_liveness);
+}
+
+OptContext create_context(StructuredZasm& structured_zasm, zasm_script* script, const ZasmFunction& fn)
+{
+	auto ctx = create_context_no_cfg(structured_zasm, script, fn);
+	add_context_cfg(ctx);
+	return ctx;
+}
+
+static void remove(OptContext& ctx, pc_t start, pc_t final)
+{
+	for (int i = start; i <= final; i++)
+		C(i).command = NOP;
+	ctx.saved += final - start + 1;
+}
+
+static void remove(OptContext& ctx, pc_t pc)
+{
+	C(pc).command = NOP;
+	ctx.saved += 1;
+}
+
+template <typename T>
+static void for_every_register_side_effect_args_only(const ffscript& instr, T fn)
+{
+	auto sc = get_script_command(instr.command);
+
+	if (sc->is_register(0))
+	{
+		auto [read, write] = get_command_rw(instr.command, 0);
+		fn(read, write, instr.arg1, 0);
+	}
+
+	if (sc->is_register(1))
+	{
+		auto [read, write] = get_command_rw(instr.command, 1);
+		fn(read, write, instr.arg2, 1);
+	}
+
+	if (sc->is_register(2))
+	{
+		auto [read, write] = get_command_rw(instr.command, 2);
+		fn(read, write, instr.arg3, 2);
+	}
+}
+
+template <typename T>
+static void for_every_side_effect_all_args(ffscript& instr, T fn)
+{
+	auto sc = get_script_command(instr.command);
+
+	if (sc->args >= 1)
+	{
+		auto [read, write] = get_command_rw(instr.command, 0);
+		fn(read, write, instr.arg1, 0);
+	}
+
+	if (sc->args >= 2)
+	{
+		auto [read, write] = get_command_rw(instr.command, 1);
+		fn(read, write, instr.arg2, 1);
+	}
+
+	if (sc->args >= 3)
+	{
+		auto [read, write] = get_command_rw(instr.command, 2);
+		fn(read, write, instr.arg3, 2);
+	}
+}
+
+static bool reads_register_with_side_effects(const ffscript& instr)
+{
+	bool result = false;
+	for_every_register_side_effect_args_only(instr, [&](bool read, bool, int reg, int){
+		if (read && register_read_has_side_effects(reg))
+			result = true;
+	});
+	return result;
+}
+
+template<typename T>
+static void optimize_by_block(OptContext& ctx, T cb)
+{
+	for (pc_t i = 0; i < ctx.cfg.block_starts.size(); i++)
+	{
+		if (ctx.block_unreachable.contains(i))
+			continue;
+
+		pc_t start_pc = ctx.cfg.block_starts[i];
+		pc_t final_pc = i == ctx.cfg.block_starts.size() - 1 ?
+			ctx.fn.final_pc :
+			ctx.cfg.block_starts[i + 1] - 1;
+		cb(i, start_pc, final_pc);
+	}
+}
+
+static bool optimize_goto_next_instruction(OptContext& ctx)
+{
+	for (pc_t i = 0; i < ctx.script->size; i++)
+	{
+		// If this is a GOTO to the next instruction, remove it.
+		// This produces better blocks in the CFG construction because:
+		// - usages of the CFG may assume blocks with a conditional branch MUST have two edges to distinct blocks
+		// - it also is a minor optimization
+		if (command_is_goto(C(i).command) && C(i).arg1 == i + 1)
+		{
+			if (bisect_tool_should_skip())
+				continue;
+
+			remove(ctx, i);
+		}
+	}
+
+	return true;
+}
+
+static bool optimize_conseq_additive(OptContext& ctx)
+{
+	add_context_cfg(ctx);
+
+	bool is_entry_fn = ctx.fn.is_entry_function;
+
+	optimize_by_block(ctx, [&]([[maybe_unused]] pc_t block_index, pc_t start_pc, pc_t final_pc){
+		// Signed: a merge can set `j = start == start_pc`, and the loop's `j--`
+		// must not wrap around (pc_t is unsigned) when start_pc is 0.
+		for (int64_t j = final_pc; j > (int64_t)start_pc; j--)
+		{
+			word command = C(j).command;
+			int arg1 = C(j).arg1;
+
+			// Use a switch to identify any of the optimizable commands.
+			word to_command;
+			bool write_at_end = false;
+			switch (command)
+			{
+				case PUSHR:     to_command = PUSHARGSR;   break;
+				case PUSHV:     to_command = PUSHARGSV;   break;
+				case PUSHVARGR: to_command = PUSHVARGSR;  break;
+				case PUSHVARGV: to_command = PUSHVARGSV;  break;
+				case POP:       to_command = POPARGS;     write_at_end = true; break;
+				default:        continue; // Not an instruction we can combine
+			}
+
+			// The combined push reads its register once.
+			if ((command == PUSHR || command == PUSHVARGR) && register_read_has_side_effects(arg1))
+				continue;
+
+			if ((command == PUSHV || command == PUSHR) && ctx.structured_zasm->function_calls.contains(j + 1))
+			{
+				// Don't break the thing that function calls are derived from in older ZASM.
+				continue;
+			}
+
+			pc_t start = j;
+			pc_t end = j;
+			// Note: `start > start_pc` (not `>=`): the merge must stay within this
+			// block. Using `>=` would read C(start_pc - 1) — out of bounds when the
+			// block starts at pc 0, and otherwise able to merge across a block
+			// boundary (the previous block's last instruction).
+			while (start > start_pc)
+			{
+				int prev_command = C(start - 1).command;
+				int prev_arg1 = C(start - 1).arg1;
+				if (prev_command != command)
+					break;
+
+				// D5 is a special "null" register - it is never valid to read
+				// from it, so we are free to remove writes.
+				// ...except for the initial script call, which may have set run_args[5].
+				if (!(prev_arg1 == arg1 || (!is_entry_fn && prev_arg1 == D(5))))
+					break;
+
+				start--;
+			}
+
+			int count = end - start + 1;
+			if (count > 1)
+			{
+				if (bisect_tool_should_skip())
+					continue;
+
+				if (write_at_end)
+				{
+					C(end) = {to_command, arg1, count};
+					remove(ctx, start, end - 1);
+				}
+				else
+				{
+					C(start) = {to_command, arg1, count};
+					remove(ctx, start + 1, end);
+				}
+
+				j = start;
+			}
+		}
+	});
+
+	return true;
+}
+
+// Fixed-point strength reduction: turn a multiply by a power of two into a shift.
+//
+//   MULTV reg, 2^k * 10000 -> LSHIFTV32 reg, k     reg * 2^k
+//
+// MULTV otherwise lowers to a 64-bit imul + fixed-point divide; a left shift is
+// much cheaper. Values are fixed-point (x10000), so the multiplier is arg2/10000.
+// Only applied to generic D-registers (D0..D7), which have no read/write side
+// effects. Identity ops (x*1, x+0, x*0, x/1) are not handled here -- the compiler
+// already folds those, so scanning for them would be wasted work.
+static bool optimize_strength_reduce(OptContext& ctx)
+{
+	auto is_generic = [](int r) { return r >= D(0) && r < D(INITIAL_D); };
+
+	for (pc_t i = ctx.fn.start_pc; i <= ctx.fn.final_pc; i++)
+	{
+		ffscript& op = C(i);
+		if (op.command != MULTV || !is_generic(op.arg1))
+			continue;
+
+		// Integer multiplier that is a power of two (> 1).
+		if (op.arg2 <= 10000 || op.arg2 % 10000 != 0)
+			continue;
+		int m = op.arg2 / 10000;
+		if ((m & (m - 1)) != 0)
+			continue;
+
+		if (bisect_tool_should_skip())
+			continue;
+
+		int k = 0;
+		for (int mm = m; mm > 1; mm >>= 1)
+			k++;
+		// LSHIFTV32 is a raw left shift; reg << k == reg * 2^k, matching the
+		// (integer) fixed-point multiply in both the interpreter and the JIT.
+		C(i) = {LSHIFTV32, op.arg1, k * 10000};
+		ctx.improved++;
+	}
+
+	return true;
+}
+
+static bool is_podarray_run_write(const ffscript& op)
+{
+	// Immediate-index, type-none POD element write (VV = const value, VR = register value).
+	return (op.command == WRITEPODARRAYVV || op.command == WRITEPODARRAYVR) && op.arg3 == 0;
+}
+
+static bool is_podarray_run_start(const ffscript& op)
+{
+	// Run must begin at element 0.
+	return is_podarray_run_write(op) && op.arg1 == 0;
+}
+
+// The functions of a script may be optimized at the same time, so the literals the collapsed runs
+// need are reserved up front (see zasm_optimize_script) - adding one must never reallocate them.
+static std::mutex podarray_literals_mutex;
+
+// Collapse a run of per-element array writes into a single bulk array write:
+//
+//   WRITEPODARRAYVV 0      v0       WRITEPODARRAY   rINDEX {v0, 0, v2, ...}
+//   WRITEPODARRAYVR 10000  D5   ->  WRITEPODARRAYVR 10000  D5
+//   WRITEPODARRAYVV 20000  v2
+//   ...
+//
+// Older quests initialize arrays as a long sequence of per-element writes
+// (WRITEPODARRAYVV for a constant value, WRITEPODARRAYVR for a register value);
+// the modern compiler emits a single WRITEPODARRAY for the constant part. The
+// constant elements are folded into the bulk vector; register-valued elements
+// get a placeholder in the vector and their original write is re-emitted right
+// after the bulk write to overwrite the placeholder. Only plain POD writes (type
+// none) of a contiguous range starting at index 0 qualify, since WRITEPODARRAY
+// (setArray) bulk-writes from index 0.
+static bool optimize_collapse_podarray_init(OptContext& ctx)
+{
+	for (pc_t i = ctx.fn.start_pc; i <= ctx.fn.final_pc; i++)
+	{
+		if (!is_podarray_run_start(C(i)))
+			continue;
+
+		// Extend over the maximal contiguous, sequentially-indexed run.
+		pc_t j = i;
+		int expected_index = 0;
+		int n_const = 0;
+		while (j <= ctx.fn.final_pc && is_podarray_run_write(C(j)) && C(j).arg1 == expected_index)
+		{
+			if (C(j).command == WRITEPODARRAYVV)
+				n_const++;
+			j++;
+			expected_index += 10000;
+		}
+
+		int len = j - i;
+		// Only worthwhile if at least two constant elements fold into the bulk write.
+		if (n_const < 2)
+			continue;
+
+		if (bisect_tool_should_skip())
+			continue;
+
+		std::vector<int32_t> values;
+		values.reserve(len);
+		std::vector<ffscript> leftovers;
+		for (pc_t k = i; k < j; k++)
+		{
+			if (C(k).command == WRITEPODARRAYVV)
+			{
+				values.push_back(C(k).arg2);
+			}
+			else // WRITEPODARRAYVR: register value -> placeholder, re-emit after the bulk write
+			{
+				values.push_back(0);
+				leftovers.push_back({WRITEPODARRAYVR, C(k).arg1, C(k).arg2, C(k).arg3});
+			}
+		}
+
+		uint16_t literal;
+		{
+			std::lock_guard lock(podarray_literals_mutex);
+			auto& literals = ctx.script->literals;
+			// Only the runs counted up front were reserved. None of the earlier passes
+			// creates a run, so this should not happen, but adding one would reallocate.
+			if (literals.size() >= literals.capacity())
+				continue;
+			literal = literals.add({.vec = std::move(values)});
+		}
+		if (!literal)
+			continue;
+
+		C(i) = {WRITEPODARRAY, rINDEX};
+		C(i).literal = literal;
+		pc_t w = i + 1;
+		for (const auto& lo : leftovers)
+			C(w++) = lo;
+		for (; w < j; w++)
+			C(w).command = NOP;
+
+		ctx.saved += n_const - 1;
+		i = j - 1;
+	}
+
+	return true;
+}
+
+// SETR, ADDV, LOADI -> LOAD
+// SETR, ADDV, STOREI -> STORE
+// Ex:
+//   SETR            D6              D4
+//   ADDV            D6              40000
+//   LOADI           D2              D6
+// ->
+//   LOAD            D2              4
+static bool optimize_load_store(OptContext& ctx)
+{
+	if (bisect_tool_should_skip())
+		return false;
+
+	for (pc_t i = ctx.fn.start_pc + 2; i < ctx.fn.final_pc; i++)
+	{
+		int command = C(i).command;
+		int arg1 = C(i).arg1;
+		int arg2 = C(i).arg2;
+		if (!one_of(command, LOADI, STOREI) || arg2 != rSFTEMP) continue;
+
+		bool bail = false;
+		int setr_pc = i - 2;
+		while (!(C(setr_pc).command == SETR && C(setr_pc).arg1 == rSFTEMP && C(setr_pc).arg2 == rSFRAME))
+		{
+			if (setr_pc == ctx.fn.start_pc)
+			{
+				bail = true;
+				break;
+			}
+			setr_pc -= 1;
+		}
+
+		ASSERT(!bail);
+		if (bail)
+			continue;
+
+		if (C(setr_pc + 1).command != ADDV)
+		{
+			ASSERT(false);
+			continue;
+		}
+
+		int addv_arg2 = C(setr_pc + 1).arg2;
+		word new_command = command == LOADI ? LOADD : STORED;
+		C(i) = {new_command, arg1, addv_arg2};
+		remove(ctx, setr_pc, setr_pc + 1);
+	}
+
+	for (pc_t i = ctx.fn.start_pc; i < ctx.fn.final_pc; i++)
+	{
+		int command = C(i).command;
+		int arg1 = C(i).arg1;
+		int arg2 = C(i).arg2;
+
+		if (command == SETR && arg1 == rSFRAME && arg2 == SP)
+		{
+			C(i).arg2 = SP2;
+			continue;
+		}
+
+		if (!one_of(command, LOADD, STORED, STOREDV)) continue;
+
+		word new_command;
+		switch (command)
+		{
+			case LOADD: new_command = LOAD; break;
+			case STORED: new_command = STORE; break;
+			case STOREDV: new_command = STOREV; break;
+		}
+		ASSERT(arg2 % 10000 == 0);
+		C(i) = {new_command, arg1, arg2 / 10000};
+	}
+
+	return true;
+}
+
+// SETV, PUSHR -> PUSHV
+// Ex:
+//   SETV            D2              5420000
+//   PUSHR           D2
+// ->
+//   PUSHV           D2              5420000
+static bool optimize_setv_pushr(OptContext& ctx)
+{
+	add_context_cfg(ctx);
+	optimize_by_block(ctx, [&]([[maybe_unused]] pc_t block_index, pc_t start_pc, pc_t final_pc){
+		for (int j = start_pc; j < final_pc; j++)
+		{
+			if (C(j).command != SETV) continue;
+			if (C(j + 1).command != PUSHR) continue;
+			// Only a D-register: the SETV is removed, and writing to any other register
+			// (like a global variable) has an effect beyond the PUSHR.
+			if (!(C(j).arg1 >= D(0) && C(j).arg1 < D(INITIAL_D))) continue;
+			if (C(j).arg1 != C(j + 1).arg1) continue;
+			if (bisect_tool_should_skip()) continue;
+
+			// `zasm_construct_structured` is sensitive to a PUSH being just before
+			// a function call, so unlike other places assign the NOP to the first
+			// instruction.
+			C(j + 1) = {PUSHV, C(j).arg2};
+			remove(ctx, j);
+		}
+	});
+
+	return true;
+}
+
+// SETR, PUSHR -> PUSHV
+// Ex:
+//   SETR            D2              GD0
+//   PUSHR           D2
+// ->
+//   PUSHR           GD0
+static bool optimize_setr_pushr(OptContext& ctx)
+{
+	add_context_cfg(ctx);
+	optimize_by_block(ctx, [&]([[maybe_unused]] pc_t block_index, pc_t start_pc, pc_t final_pc){
+		for (int j = start_pc; j < final_pc; j++)
+		{
+			if (C(j).command != SETR) continue;
+			if (C(j + 1).command != PUSHR) continue;
+			// Only a D-register: the SETR is removed, and writing to any other register
+			// (like a global variable) has an effect beyond the PUSHR.
+			if (!(C(j).arg1 >= D(0) && C(j).arg1 < D(INITIAL_D))) continue;
+			if (C(j).arg1 == rSFRAME) continue;
+			if (C(j).arg1 != C(j + 1).arg1) continue;
+			if (j + 2 <= final_pc)
+			{
+				bool reads_from_reg = false;
+				for_every_register_side_effect(C(j + 2), [&](bool read, [[maybe_unused]] bool write, int reg, [[maybe_unused]] int argn){
+					if (reg == C(j).arg1 && read)
+						reads_from_reg = true;
+				});
+				if (reads_from_reg) continue;
+			}
+			if (bisect_tool_should_skip()) continue;
+
+			// `zasm_construct_structured` is sensitive to a PUSH being just before
+			// a function call, so unlike other places assign the NOP to the first
+			// instruction.
+			C(j + 1) = {PUSHR, C(j).arg2};
+			remove(ctx, j);
+		}
+	});
+
+	return true;
+}
+
+// Remove PUSH/POPs used to preserve registers that aren't used.
+static bool optimize_stack(OptContext& ctx)
+{
+	add_context_cfg(ctx);
+	optimize_by_block(ctx, [&]([[maybe_unused]] pc_t block_index, pc_t start_pc, pc_t final_pc){
+		for (int j = start_pc; j < final_pc; j++)
+		{
+			if (C(j).command != PUSHR) continue;
+
+			int reg = C(j).arg1;
+			int count = 0;
+			for (int k = j + 1; k <= final_pc; k++)
+			{
+				int command = C(k).command;
+				int arg2 = C(k).arg2;
+				if (command == POP && C(k).arg1 == reg)
+				{
+					if (count != 0)
+						break;
+
+					if (bisect_tool_should_skip())
+						break;
+
+					remove(ctx, j); // Remove PUSHR.
+					remove(ctx, k); // Remove POP.
+					break;
+				}
+
+				if (command == CALLFUNC)
+					break;
+
+				// These commands access the stack relative to the stack pointer. Removing
+				// the PUSHR would shift the stack pointer for them, so they could read or
+				// write the wrong slot. Be conservative and keep the stack usage.
+				if (one_of(command, PEEK, PEEKATV, STACKWRITEATRV, STACKWRITEATVV, STACKWRITEATVV_IF))
+					break;
+
+				switch (command)
+				{
+					case POP:
+						count--;
+						break;
+					case POPARGS:
+						count -= arg2;
+						break;
+					case PUSHR:
+					case PUSHV:
+						count++;
+						break;
+					case PUSHARGSR:
+					case PUSHARGSV:
+						count += arg2;
+						break;
+				}
+
+				if (count < 0)
+					break;
+
+				// If the register that was preserved on the stack was written to between the PUSH
+				// and the POP, it doesn't necessarily mean that the register needs to be preserved.
+				// It's possible that the register is never read from after, or is written to before
+				// the next read. To know for sure, we need to do data-flow analyis, such as in
+				// optimize_dead_code. For now, be conservative and leave some optimizations on the
+				// table: keep this stack usage if anything writes to the register between the
+				// PUSH/POP.
+				bool writes_to_reg = false;
+				for_every_register_side_effect(C(k), [&]([[maybe_unused]] bool read, bool write, int arg, [[maybe_unused]] int argn){
+					if (arg == reg && write)
+						writes_to_reg = true;
+				});
+				if (writes_to_reg)
+					break;
+			}
+		}
+	});
+
+	return true;
+}
+
+SimulationValue evaluate_binary_op(int cmp, SimulationValue a, SimulationValue b)
+{
+	ASSERT(cmp <= (CMP_FLAGS|CMP_BOOL|CMP_SETI));
+	int flags = cmp & CMP_FLAGS;
+	bool seti = cmp & CMP_SETI;
+	bool boolcast = cmp & CMP_BOOL;
+
+	// check_cmp only defines == and != for bool-cast comparisons; any other is always false.
+	if (flags == 0 || (boolcast && flags != CMP_EQ && flags != CMP_NE))
+		return num_zero;
+	if (flags == CMP_FLAGS)
+		return seti ? num(10000) : num_one;
+
+	if (a.type == ValueType::Uninitialized || b.type == ValueType::Uninitialized)
+		return {ValueType::Uninitialized};
+	if (a.type == ValueType::Unknown || b.type == ValueType::Unknown)
+		return {ValueType::Unknown};
+
+	if (a.is_number() && b.is_number())
+	{
+		if (boolcast)
+		{
+			bool v = !!a.data == !!b.data;
+			if (flags == CMP_NE) v = !v;
+			return num(v ? (seti ? 10000 : 1) : 0);
+		}
+
+		bool b_val = false;
+		if (flags & CMP_EQ) b_val |= a.data == b.data;
+		if (flags & CMP_LT) b_val |= a.data < b.data;
+		if (flags & CMP_GT) b_val |= a.data > b.data;
+
+		int v = b_val ? 1 : 0;
+		if (seti) v *= 10000;
+		return num(v);
+	}
+
+	bool should_swap = false;
+	if (a.type != ValueType::Expression && b.type == ValueType::Expression)
+		should_swap = true;
+	if (a.is_number())
+		should_swap = true;
+	if (should_swap)
+	{
+		std::swap(a, b);
+
+		// Flip the comparison.
+		bool lt = flags & CMP_LT;
+		bool gt = flags & CMP_GT;
+		bool eq = flags & CMP_EQ;
+		std::swap(lt, gt);
+		cmp = 0;
+		cmp |= (lt ? CMP_LT : 0);
+		cmp |= (gt ? CMP_GT : 0);
+		cmp |= (eq ? CMP_EQ : 0);
+		cmp |= (seti ? CMP_SETI : 0);
+		cmp |= (boolcast ? CMP_BOOL : 0);
+		flags = cmp & CMP_FLAGS;
+	}
+
+	// The consumer re-materializes the comparison from the returned expression's
+	// flags, so a returned expression must carry the consumer's SETI (its value
+	// form), not the form of whatever comparison it was derived from.
+	auto with_seti = [&](SimulationValue v) {
+		if (v.type == ValueType::Expression)
+			v.data = seti ? (v.data | CMP_SETI) : (v.data & ~CMP_SETI);
+		return v;
+	};
+
+	if (a.type == ValueType::Expression && b.is_number())
+	{
+		// An expression takes exactly two values at runtime: 0, or its "true" value
+		// (10000 or 1 depending on its own SETI). Evaluate the comparison against
+		// the number for both, exactly as check_cmp would, and fold to a constant,
+		// the expression, or its negation. Doing this exhaustively (rather than by
+		// pattern) is what keeps e.g. `(x < y) == true` (a bool-cast compare against
+		// 10000), `<int>(x < y) != 2` (never false) and `<int>(x != 0) == 1` right.
+		int a_true = (a.data & CMP_SETI) ? 10000 : 1;
+		auto holds = [&](int v) {
+			if (boolcast)
+			{
+				// check_cmp only defines == and != for bool-cast comparisons.
+				bool lhs = v != 0;
+				bool rhs = b.data != 0;
+				if (flags == CMP_EQ) return lhs == rhs;
+				if (flags == CMP_NE) return lhs != rhs;
+				return false;
+			}
+			bool r = false;
+			if (flags & CMP_EQ) r |= v == b.data;
+			if (flags & CMP_LT) r |= v < b.data;
+			if (flags & CMP_GT) r |= v > b.data;
+			return r;
+		};
+		bool when_false = holds(0);
+		bool when_true = holds(a_true);
+		if (when_false == when_true)
+			return num(when_true ? (seti ? 10000 : 1) : 0);
+		return with_seti(when_true ? a : a.negate());
+	}
+
+	if (a.type == ValueType::Register && b.is_number())
+		return expr(a, cmp, b);
+
+	if (a.type == b.type && ((flags & CMP_EQ) || flags == CMP_NE) && a == b)
+	{
+		if ((flags & CMP_EQ))
+			return seti ? num(10000) : num_one;
+		return num_zero;
+	}
+
+	if (!(flags & CMP_EQ) && a == b)
+		return num_zero;
+
+	if (a.type == ValueType::Register && b.type == ValueType::Register)
+	{
+		auto result = SimulationValue{ValueType::Expression, cmp};
+		result.op1 = std::make_shared<SimulationValue>(a);
+		result.op2 = std::make_shared<SimulationValue>(b);
+		return result;
+	}
+
+	if (a.type == ValueType::Expression && b.type == ValueType::Expression)
+	{
+		if (flags == CMP_EQ && a.is_mutually_exclusive(b))
+			return num_zero;
+
+		auto result = SimulationValue{ValueType::Expression, cmp};
+		result.op1 = std::make_shared<SimulationValue>(a);
+		result.op2 = std::make_shared<SimulationValue>(b);
+		return result;
+	}
+
+	return {ValueType::Unknown};
+}
+
+static void infer_assign(OptContext&, SimulationState& state, int reg, const SimulationValue& rhs)
+{
+	// If this is <reg == any>, just set the register to op2.
+	if (rhs.type == ValueType::Expression && rhs.data == CMP_EQ)
+	{
+		bool just_one_register = (rhs.op1->type == ValueType::Register) ^ (rhs.op2->type == ValueType::Register);
+		ASSERT(just_one_register);
+		if (just_one_register)
+		{
+			if (rhs.op1->type == ValueType::Register && rhs.op1->data == reg)
+			{
+				state.d[reg] = *rhs.op2;
+				return;
+			}
+			if (rhs.op2->type == ValueType::Register && rhs.op2->data == reg)
+			{
+				state.d[reg] = *rhs.op1;
+				return;
+			}
+		}
+	}
+
+	state.d[reg] = rhs;
+}
+
+static void infer(SimulationValue& v, const SimulationValue& given)
+{
+	if (given.is_equality_expression() && *given.op1 == v)
+		v = *given.op2;
+	else if (given.is_mutually_exclusive(v))
+		v = num_zero;
+	else
+		v.replace_value(given, num_one);
+}
+
+static void infer_values_given_branch(OptContext& ctx, SimulationState& state)
+{
+	int branch_command = C(state.pc).command;
+	int branch_arg2 = C(state.pc).arg2;
+	int branch_cmp = command_to_cmp(branch_command, branch_arg2);
+	auto expression = evaluate_binary_op(branch_cmp, state.operand_1, state.operand_2);
+	ASSERT(expression.is_expression() || expression.is_number());
+
+	// If branching comparison is between a register and a value,
+	// assign that register to what it must be to pass the condition.
+	// TODO: this feels like it could be improved.
+	if (!(state.operand_1_backing_reg != -1 && state.operand_2_backing_reg != -1))
+	{
+		if (state.operand_1_backing_reg != -1 && state.operand_2_backing_reg == -1)
+		{
+			bool seti = state.d[state.operand_1_backing_reg].is_expression() && state.d[state.operand_1_backing_reg].data & CMP_SETI;
+			if ((branch_cmp & CMP_FLAGS) == CMP_GE && state.operand_2 == num_one)
+				state.d[state.operand_1_backing_reg] = state.operand_1 = seti ? num(10000) : num_one;
+			else if ((branch_cmp & CMP_FLAGS) == CMP_EQ && state.operand_2 == num_zero)
+				state.d[state.operand_1_backing_reg] = state.operand_1 = num_zero;
+			else
+				infer_assign(ctx, state, state.operand_1_backing_reg,
+					expr(reg(state.operand_1_backing_reg), branch_cmp, state.operand_2));
+		}
+		// Doing the other case hasn't seemed necessary yet.
+	}
+
+	if (expression.is_number())
+		return;
+
+	for (int i = 0; i < 8; i++)
+		infer(state.d[i], expression);
+	infer(state.operand_1, expression);
+	infer(state.operand_2, expression);
+}
+
+static void simulate_set_value(OptContext&, SimulationState& state, int reg, SimulationValue value)
+{
+	for (auto& v : state.stack)
+	{
+		if (v == reg(reg))
+			v = {ValueType::Unknown};
+	}
+	for (int i = 0; i < INITIAL_D; i++)
+	{
+		if (state.d[i] == reg(reg) && i != reg)
+			state.d[i] = {ValueType::Unknown};
+	}
+
+	if (!(reg >= D(0) && reg < D(INITIAL_D)))
+	{
+		state.side_effects = true;
+		return;
+	}
+
+	state.d[reg] = value;
+}
+
+// Simulates execution of a single instruction, updating values for each register
+// and the comparison result.
+static void simulate(OptContext& ctx, SimulationState& state)
+{
+	#define IS_GENERIC_REG(x) (x >= D(0) && x < D(INITIAL_D))
+
+	int command = C(state.pc).command;
+	int arg1 = C(state.pc).arg1;
+	int arg2 = C(state.pc).arg2;
+
+	// Function calls invalidate all registers.
+	if (command == CALLFUNC)
+	{
+		for (int i = 0; i < 8; i++)
+			state.d[i] = {ValueType::Unknown};
+		for (auto& v : state.stack)
+		{
+			if (!v.is_number())
+				v = {ValueType::Unknown};
+		}
+		return;
+	}
+
+	switch (command)
+	{
+		case COMPARER:
+			if (arg1 == SWITCHKEY || arg2 == SWITCHKEY)
+			{
+				state.bail = true;
+				return;
+			}
+			// Lost Isle is an example of a quest with handwritten ZASM that uses
+			// z-registers directly in compare statements, instead of via a generic
+			// register.
+			if (!IS_GENERIC_REG(arg1) || !IS_GENERIC_REG(arg2))
+			{
+				state.bail = true;
+				return;
+			}
+			ASSERT(arg1 >= D(0) && arg1 < D(INITIAL_D));
+			ASSERT(arg2 >= D(0) && arg2 < D(INITIAL_D));
+			state.operand_1 = state.d[arg1];
+			state.operand_2 = state.d[arg2];
+			state.operand_1_backing_reg = arg1;
+			state.operand_2_backing_reg = arg2;
+			return;
+		case COMPAREV:
+			if (arg1 == SWITCHKEY)
+			{
+				state.bail = true;
+				return;
+			}
+			if (!IS_GENERIC_REG(arg1))
+			{
+				state.bail = true;
+				return;
+			}
+			state.operand_1 = state.d[arg1];
+			state.operand_2 = num(arg2);
+			state.operand_1_backing_reg = arg1;
+			state.operand_2_backing_reg = -1;
+			return;
+		case COMPAREV2:
+			if (arg2 == SWITCHKEY)
+			{
+				state.bail = true;
+				return;
+			}
+			if (!IS_GENERIC_REG(arg2))
+			{
+				state.bail = true;
+				return;
+			}
+			state.operand_1 = num(arg1);
+			state.operand_2 = state.d[arg2];
+			state.operand_1_backing_reg = -1;
+			state.operand_2_backing_reg = arg2;
+			return;
+	}
+
+	if (command_writes_comparison_result(command))
+	{
+		int cmp = command_to_cmp(command, arg2);
+		auto e = evaluate_binary_op(cmp, state.operand_1, state.operand_2);
+		simulate_set_value(ctx, state, arg1, e);
+		return;
+	}
+
+	if (!command_is_pure(command) && !command_is_goto(command))
+	{
+		state.side_effects = true;
+	}
+
+	bool command_handled = true;
+	switch (command)
+	{
+		case PUSHR:
+		{
+			auto value = IS_GENERIC_REG(arg1) ? state.d[arg1] : reg(arg1);
+			if (register_read_has_side_effects(arg1))
+				value = {ValueType::Unknown};
+			// Registers whose value depends on the value of other registers (like indexing into an array
+			// based on D0/D1) should be represented as unknown on the stack, because their dependant
+			// registers are assumed to be invalidated soon. Theoretically they could be tracked too, as they often
+			// aren't modified. Would need to invalidate the stack value on a write to any dependant register.
+			if (value.is_register() && has_register_dependency(value.data))
+				value = {ValueType::Unknown};
+			state.stack.push_back(value);
+			state.side_effects = true;
+			break;
+		}
+		case PUSHARGSR:
+		{
+			auto value = IS_GENERIC_REG(arg1) ? state.d[arg1] : reg(arg1);
+			if (register_read_has_side_effects(arg1))
+				value = {ValueType::Unknown};
+			if (value.is_register() && has_register_dependency(value.data))
+				value = {ValueType::Unknown};
+			for (int i = 0; i < arg2; i++)
+				state.stack.push_back(value);
+			state.side_effects = true;
+			break;
+		}
+		case PUSHV:
+		{
+			state.stack.push_back(num(arg1));
+			state.side_effects = true;
+			break;
+		}
+		case PUSHARGSV:
+		{
+			for (int i = 0; i < arg2; i++)
+				state.stack.push_back(num(arg1));
+			state.side_effects = true;
+			break;
+		}
+		case POP:
+		{
+			state.side_effects = true;
+			SimulationValue value;
+			if (!state.stack.empty())
+			{
+				value = state.stack.back();
+				state.stack.pop_back();
+				if (value == reg(arg1))
+					break;
+				if (value.type == ValueType::Unknown)
+					value = reg(arg1);
+			}
+			else
+			{
+				value = reg(arg1);
+			}
+			simulate_set_value(ctx, state, arg1, value);
+			break;
+		}
+		case POPARGS:
+		{
+			for (int i = 0; i < arg2; i++)
+			{
+				SimulationValue value;
+				if (!state.stack.empty())
+				{
+					value = state.stack.back();
+					state.stack.pop_back();
+					if (value == reg(arg1))
+						continue;
+					if (value.type == ValueType::Unknown)
+						value = reg(arg1);
+				}
+				else
+				{
+					value = reg(arg1);
+				}
+				simulate_set_value(ctx, state, arg1, value);
+			}
+			state.side_effects = true;
+			break;
+		}
+		case SETR:
+		{
+			auto value = IS_GENERIC_REG(arg2) ? state.d[arg2] : reg(arg2);
+			// A later read would not give the same value, so don't let it stand in for this one.
+			if (register_read_has_side_effects(arg2))
+				value = {ValueType::Unknown};
+			simulate_set_value(ctx, state, arg1, value);
+			break;
+		}
+		case SETV:
+		{
+			if (!IS_GENERIC_REG(arg1))
+			{
+				state.bail = true;
+				return;
+			}
+			simulate_set_value(ctx, state, arg1, num(arg2));
+			break;
+		}
+		case CASTBOOLF:
+		{
+			if (!IS_GENERIC_REG(arg1))
+			{
+				state.bail = true;
+				return;
+			}
+			auto value = evaluate_binary_op(CMP_NE, state.d[arg1], num(0));
+			simulate_set_value(ctx, state, arg1, value);
+			break;
+		}
+		case CASTBOOLI:
+		{
+			if (!IS_GENERIC_REG(arg1))
+			{
+				state.bail = true;
+				return;
+			}
+			auto value = evaluate_binary_op(CMP_NE | CMP_SETI, state.d[arg1], num(0));
+			simulate_set_value(ctx, state, arg1, value);
+			break;
+		}
+
+		case STRCMPR:
+		case STRICMPR:
+		{
+			// TODO: handle.
+			state.bail = true;
+			return;
+		}
+
+		// TODO: handle
+		// case STACKWRITEATRV:
+		// case STACKWRITEATVV_IF:
+		// case STACKWRITEATVV:
+
+		default:
+			command_handled = false;
+	}
+
+	for_every_register_side_effect(C(state.pc), [&]([[maybe_unused]] bool read, bool write, int reg, int argn){
+		if (!write)
+			return;
+
+		if (!command_handled || argn == -1)
+			simulate_set_value(ctx, state, reg, reg(reg));
+		if (!IS_GENERIC_REG(reg))
+			state.side_effects = true;
+	});
+
+	return;
+}
+
+void simulate_and_advance(OptContext& ctx, SimulationState& state)
+{
+	simulate(ctx, state);
+	if (state.pc != state.final_pc)
+		state.pc += 1;
+}
+
+static void simulate_block(OptContext& ctx, SimulationState& state)
+{
+	while (true)
+	{
+		simulate(ctx, state);
+		if (ctx.debug)
+		{
+			fmt::println("{}: {}", state.pc, zasm_op_to_string(C(state.pc), ctx.script->literals));
+			for (int i = 0; i < 8; i++)
+			{
+				if (!state.d[i].is_register())
+					fmt::println("\tD{} = {}", i, state.d[i].to_string());
+			}
+			if (state.side_effects) fmt::println("\tside_effects");
+			if (state.bail) fmt::println("\tbail");
+		}
+		if (state.pc == state.final_pc)
+			break;
+
+		state.pc += 1;
+	}
+}
+
+// Take the branch at state.pc, and set simulation values accordingly.
+static void simulate_infer_branch(OptContext& ctx, SimulationState& state)
+{
+	// Given we take the branch, infer what the other values must be.
+	infer_values_given_branch(ctx, state);
+	if (ctx.debug)
+		fmt::println("inferred D2: {}", state.d[2].to_string());
+	state.pc = C(state.pc).arg1;
+	state.block = ctx.cfg.block_id_from_start_pc(state.pc);
+	state.final_pc = ctx.cfg.get_block_final(state.block);
+}
+
+static bool simulate_block_advance(OptContext& ctx, SimulationState& state)
+{
+	if (!command_is_goto(C(state.pc).command))
+	{
+		if (E(state.block).size() == 0)
+			return false;
+
+		pc_t next_block = ctx.cfg.block_id_from_start_pc(state.pc + 1);
+		ASSERT(E(state.block).size() == 1);
+		ASSERT(E(state.block).at(0) == next_block);
+		state.pc += 1;
+		state.block = next_block;
+		state.final_pc = ctx.cfg.get_block_final(state.block);
+		return true;
+	}
+
+	if (C(state.pc).command == GOTO)
+	{
+		ASSERT(!ctx.structured_zasm->function_calls.contains(state.pc));
+		state.pc = C(state.pc).arg1;
+		pc_t next_block = ctx.cfg.block_id_from_start_pc(state.pc);
+		state.block = next_block;
+		state.final_pc = ctx.cfg.get_block_final(state.block);
+		return true;
+	}
+
+	ASSERT(one_of(C(state.pc-1).command, COMPAREV));
+
+	int command = C(state.pc).command;
+	ASSERT(command_is_goto(command));
+	int arg2 = C(state.pc).arg2;
+	int cmp = command_to_cmp(command, arg2);
+	auto val = evaluate_binary_op(cmp, state.operand_1, state.operand_2);
+
+	// Can we determine which branch to take? If so, continue.
+	if (!val.is_number())
+		return false;
+
+	if (val.data)
+		state.pc = C(state.pc).arg1;
+	else
+		state.pc += 1;
+
+	state.block = ctx.cfg.block_id_from_start_pc(state.pc);
+	state.final_pc = ctx.cfg.get_block_final(state.block);
+	return true;
+}
+
+static SimulationValue compile_value(const SimulationValue& value, std::vector<ffscript>& result)
+{
+	if (value.is_bool_cast())
+	{
+		result.emplace_back(CASTBOOLF, value.op1->data, 0);
+		return *value.op1;
+	}
+
+	ASSERT(value.type != ValueType::Expression);
+	return value;
+}
+
+// TODO: This is pretty jank. Feels too hardcoded.
+static bool compile_conditional(SimulationValue& expression, std::vector<ffscript>& result)
+{
+	ASSERT(expression.type == ValueType::Expression);
+
+	// Special case for comparison between registers that are first cast to boolean.
+	if (expression.op1->is_bool_cast() && expression.op2->is_bool_cast())
+	{
+		if (expression.op1->op1->is_register() && expression.op2->op1->is_register())
+		{
+			result.emplace_back(COMPARER, expression.op1->op1->data, expression.op2->op1->data);
+			expression.data |= CMP_BOOL;
+			return true;
+		}
+	}
+
+	auto lhs = compile_value(*expression.op1, result);
+	auto rhs = compile_value(*expression.op2, result);
+
+	int arg1 = lhs.data;
+	int arg2 = rhs.data;
+	if (lhs.is_register() && rhs.is_register())
+		result.emplace_back(COMPARER, arg1, arg2);
+	else if (lhs.is_register() && rhs.is_number())
+		result.emplace_back(COMPAREV, arg1, arg2);
+	else if (lhs.is_number() && rhs.is_register())
+	{
+		// This would emit a COMPAREV2, but evaluate_binary_op normalizes results to always place
+		// number operands on the left.
+		ASSERT(false);
+		return false;
+	}
+	else
+	{
+		ASSERT(false);
+		return false;
+	}
+
+	return true;
+}
+
+bool compile_conditional(std::vector<ffscript>& result, const ffscript& instr, const SimulationValue& op1, const SimulationValue& op2)
+{
+	int cmp = command_to_cmp(instr.command, instr.arg2);
+	auto val = evaluate_binary_op(cmp, op1, op2);
+
+	if (val.is_number())
+	{
+		if (command_is_goto(instr.command))
+		{
+			if (val.data)
+				result.emplace_back(GOTO, instr.arg1);
+		}
+		else
+		{
+			result.emplace_back(SETV, instr.arg1, val.data ? ((instr.arg2 & CMP_SETI) ? 10000 : 1) : 0);
+		}
+		return true;
+	}
+
+	if (!val.is_expression())
+		return false;
+
+	if (!compile_conditional(val, result))
+		return false;
+
+	if (command_is_goto(instr.command))
+		result.emplace_back(GOTOCMP, instr.arg1, val.data);
+	else
+		result.emplace_back(SETCMP, instr.arg1, val.data);
+
+	return true;
+}
+
+// Assigns a register to its final value directly, without intermediate assignments
+// or using the stack.
+// Ex:
+//    SETR            D3              LINKX
+//    TRACER          D3
+// ->
+//    TRACER LINKX
+//
+// Also works for pushing to stack and reading value later.
+//
+// However, do not propagate the register if read twice from a D-register, since there is
+// significant overhead in calling `get_register`.
+// Ex, do not optimize the following:
+//    SETR            D3              LINKY
+//    TRACER          D3
+//    TRACER          D3
+//
+// Also do not propagate the value if there is some write on the target register (ex: LINKX)
+// between setting to a D-register and using it.
+static bool optimize_propagate_values(OptContext& ctx)
+{
+	if (!should_run_experimental_passes())
+		return false;
+
+	add_context_cfg(ctx);
+	optimize_by_block(ctx, [&](pc_t block_index, pc_t start_pc, [[maybe_unused]] pc_t final_pc){
+		SimulationState state{};
+		state.set_block(ctx, block_index);
+
+		struct propagate_candidate
+		{
+			int32_t* arg;
+			int32_t new_arg;
+		};
+		std::vector<propagate_candidate> candidates;
+		bool reg_reads[8] = {};
+		for (int i = 0; i < 8; i++) reg_reads[i] = false;
+
+		auto flush = [&](int reg){
+			bool skip = false;
+			bool checked_skip = false;
+			candidates.erase(
+				std::remove_if(
+					candidates.begin(), candidates.end(),
+					[&](auto& c){
+						if (*c.arg != reg && reg != -1)
+							return false;
+
+						if (!checked_skip)
+						{
+							skip = bisect_tool_should_skip();
+							checked_skip = true;
+						}
+						if (!skip)
+							*c.arg = c.new_arg;
+						return true;
+					}),
+				candidates.end());
+		};
+
+		auto remove_candidates = [&](int reg){
+			candidates.erase(
+				std::remove_if(
+					candidates.begin(), candidates.end(),
+					[&](auto& c){ return *c.arg == reg;}),
+				candidates.end());
+		};
+
+		while (true)
+		{
+			for_every_register_side_effect(C(state.pc), [&](bool read, bool write, int reg, int argn){
+				if (read && !write)
+				{
+					if (!(reg >= D(0) && reg < D(INITIAL_D)))
+						return;
+
+					if (state.d[reg] == reg(reg))
+						return;
+
+					if (!state.d[reg].is_register())
+						return;
+
+					if (reg_reads[reg])
+					{
+						remove_candidates(reg);
+						return;
+					}
+
+					if (!has_register_dependency(state.d[reg].data))
+					{
+						if (argn == 0) candidates.emplace_back(propagate_candidate{&C(state.pc).arg1, state.d[reg].data});
+						if (argn == 1) candidates.emplace_back(propagate_candidate{&C(state.pc).arg2, state.d[reg].data});
+						if (argn == 2) candidates.emplace_back(propagate_candidate{&C(state.pc).arg3, state.d[reg].data});
+					}
+
+					reg_reads[reg] = true;
+					return;
+				}
+
+				if (write && reg >= D(0) && reg < D(INITIAL_D))
+				{
+					flush(reg);
+					reg_reads[reg] = false;
+				}
+			});
+			if (state.bail)
+				break;
+
+			if (C(state.pc).command == RETURNFUNC)
+			{
+				if (reg_reads[D(2)])
+					remove_candidates(D(2));
+				flush(-1);
+			}
+
+			simulate(ctx, state);
+			if (state.bail)
+				break;
+
+			int command = C(state.pc).command;
+			int arg1 = C(state.pc).arg1;
+
+			if (command == POP && arg1 >= D(0) && arg1 < D(INITIAL_D))
+			{
+				if (state.d[arg1].is_register() && state.d[arg1].data != arg1)
+				{
+					pc_t j = state.pc - 1;
+					bool found = false;
+					while (true)
+					{
+						if (one_of(C(j).command, PUSHR, PUSHV))
+						{
+							found = true;
+							break;
+						}
+
+						// If reads from stack, bail.
+						// TODO: is it worth keeping track of all commands that read stack? For now, use command_is_pure as standin...
+						// if (one_of(C(j).command, PRINTFVARG, SPRINTFVARG))
+						if (!command_is_pure(C(j).command))
+						{
+							break;
+						}
+
+						if (j == start_pc)
+							break;
+						j -= 1;
+					}
+					
+					if (found && !bisect_tool_should_skip())
+					{
+						C(state.pc) = {SETR, arg1, state.d[arg1].data};
+						remove(ctx, j);
+					}
+				}
+			}
+
+			if (command == CALLFUNC)
+			{
+				for (int i = 0; i < 8; i++) reg_reads[i] = false;
+				flush(-1);
+			}
+
+			if (state.pc == state.final_pc)
+				break;
+			state.pc += 1;
+		}
+
+		if (!state.bail)
+			flush(-1);
+	});
+
+	return true;
+}
+
+// 1. If following a branch is guaranteed to jump to some other block given the initial
+//    branch condition, rewrite the branch to jump directly to that end block. This can
+//    only be done when there are no side effects. This removes all spurious branches.
+// 2. Convert GOTOX to GOTOCMP
+static bool optimize_spurious_branches(OptContext& ctx)
+{
+	// I think this works well, but it's takes longer than the other passes and has less impact, so
+	// disable for now.
+	if (!should_run_experimental_passes())
+		return false;
+
+	add_context_cfg(ctx);
+	optimize_by_block(ctx, [&](pc_t block_index, pc_t start_pc, pc_t final_pc){
+		// Only consider blocks with a conditional branch.
+		// TODO: experiment with checking conditionless branches too.
+		const auto& edges = ctx.cfg.block_edges.at(block_index);
+		if (edges.size() != 2)
+			return;
+
+		int command = C(final_pc).command;
+		if (!command_is_goto(command))
+		{
+			// A switch dispatch with two distinct targets also has two edges.
+			ASSERT(one_of(command, GOTOTABLE, GOTORANGES));
+			return;
+		}
+
+		if (command == GOTO && ctx.structured_zasm->function_calls.contains(final_pc))
+		{
+			ASSERT(false);
+			return;
+		}
+
+		// If the first command is SETCMP, then some other block jumps to this
+		// and reuses the comparison state. As that will be undefined, quit early.
+		if (command_writes_comparison_result(C(start_pc).command))
+			return;
+
+		// COMPARER is left out because it doesn't seem to introduce any optimizations.
+		// STRCMPR/STRICMPR (the case compares of a string switch) compare string
+		// contents, which can't be simulated.
+		if (!final_pc || !one_of(C(final_pc - 1).command, COMPAREV, COMPAREV2))
+		{
+			ASSERT(final_pc && one_of(C(final_pc - 1).command, COMPARER, STRCMPR, STRICMPR));
+			return;
+		}
+
+		if (ctx.debug)
+			fmt::println("\n[spurious_branches] Block #{}\n", block_index);
+
+		SimulationState state{};
+		state.block = block_index;
+		state.pc = start_pc;
+		state.final_pc = final_pc;
+		pc_t goto_pc = C(final_pc).arg1;
+
+		// Simulate running the head block.
+		simulate_block(ctx, state);
+
+		if (state.bail)
+			return;
+
+		if (state.operand_1.type == ValueType::Unknown || state.operand_2.type == ValueType::Unknown)
+			return;
+		
+		// Don't care about side effects in the head block.
+		state.side_effects = false;
+		simulate_infer_branch(ctx, state);
+
+		while (true)
+		{
+			simulate_block(ctx, state);
+			if (state.bail)
+				return;
+			if (state.side_effects)
+				break;
+
+			bool is_conditionless = E(state.block).size() == 1;
+			if (!simulate_block_advance(ctx, state))
+				break;
+
+			// If just followed a branch, then save progress so far.
+			// It's certain that jumping to this instead of the
+			// original pc will not result in any observable difference.
+			// Note: This only commits the progress so far when making decisions,
+			//       ignoring fall-thrus or unconditional branches. Need better
+			//       side effect tracking to handle that. For example case that
+			//       could be improved, see "comparisons, random stuff (1)"
+			if (!is_conditionless)
+			{
+				goto_pc = state.pc;
+			}
+		}
+
+		// If this make the original target block unreachable, the final `unreachable_blocks` pass
+		// will remove it.
+		if (bisect_tool_should_skip())
+			return;
+		if (goto_pc != C(final_pc).arg1)
+			ctx.cfg_stale = true;
+		C(final_pc) = {GOTOCMP, (int)goto_pc, command_to_cmp(command, C(final_pc).arg2)};
+		if (ctx.debug)
+			fmt::println("rewrite {}: {}", final_pc, zasm_op_to_string(C(final_pc), ctx.script->literals));
+	});
+
+	return true;
+}
+
+static bool optimize_reduce_comparisons(OptContext& ctx)
+{
+	add_context_cfg(ctx);
+	add_context_liveness(ctx);
+
+	optimize_by_block(ctx, [&](pc_t block_index, pc_t start_pc, pc_t final_pc){
+		bool bail_comp_reduction = false;
+		for (int j = start_pc; j < final_pc; j++)
+		{
+			int command = C(j).command;
+			int final_command = C(final_pc).command;
+			if (!one_of(command, COMPARER, COMPAREV, COMPAREV2, CASTBOOLF, CASTBOOLI)) continue;
+			if (!command_is_goto(final_command)) continue;
+			// if (!command_is_goto(final_command) && !one_of(final_command, GOTOR, RETURN, RETURNFUNC)) continue;
+			if (final_command == GOTO) continue;
+
+			// TODO support more than just when final command is a GOTO. Ex:
+			/*
+				11472: COMPARER        D3              D2           
+				11473: SETLESS         D2                           
+				11474: COMPAREV        D2              0            
+				11475: SETTRUEI        D2                           
+				11476: PUSHR           D2                           
+			*/
+
+			bool writes_comparison_result_to_d2 = false;
+			pc_t k = j + 1;
+			for (; k < final_pc; k++)
+			{
+				int command = C(k).command;
+				if (!(command_uses_comparison_result(command) || one_of(command, NOP, COMPARER, COMPAREV, COMPAREV2, CASTBOOLF, CASTBOOLI)))
+				{
+					bail_comp_reduction = true;
+					break;
+				}
+
+				for_every_register_side_effect(C(k), [&]([[maybe_unused]] bool read, bool write, int arg, [[maybe_unused]] int argn){
+					if (arg == D(2) && write)
+					{
+						writes_comparison_result_to_d2 = true;
+					}
+				});
+			}
+
+			if (bail_comp_reduction)
+				break;
+
+			if (bisect_tool_should_skip())
+				return;
+
+			if (ctx.debug)
+				fmt::println("\n[reduce_comparisons] Block #{}\n", block_index);
+
+			std::vector<ffscript> expression_zasm;
+			SimulationState state{};
+			{
+				state.block = block_index;
+				state.pc = j;
+				state.final_pc = final_pc;
+				simulate_block(ctx, state);
+				if (state.bail || state.side_effects)
+					break;
+
+				if (!compile_conditional(expression_zasm, C(state.pc), state.operand_1, state.operand_2))
+					break;
+
+				// If not enough room to replace instructions in this block, bail.
+				if (expression_zasm.size() > final_pc - start_pc + 1)
+				{
+					// Should never happen.
+					ASSERT(false);
+					break;
+				}
+			}
+
+			// If the comparison operands are compared again after the branch, then reducing the comparison
+			// would break the code.
+			pc_t target_pc = C(final_pc).arg1;
+			{
+				bool target_block_reuses_comparison_operands = false;
+				pc_t target_block_id = ctx.cfg.block_id_from_start_pc(target_pc);
+				auto [s, e] = ctx.cfg.get_block_bounds(target_block_id);
+				for (pc_t i = s; i <= e; i++)
+				{
+					int command = C(i).command;
+					if (command_writes_comparison_result(command))
+					{
+						target_block_reuses_comparison_operands = true;
+						break;
+					}
+					if (one_of(command, COMPAREV, COMPAREV2, COMPARER))
+						break;
+				}
+				if (target_block_reuses_comparison_operands)
+					continue;
+			}
+
+			// Determine if D2 is reused after the branch. If so, and the original code
+			// sets the comparison result to D2, we need continue setting it (we are removing all but the GOTOCMP).
+
+			bool successor_uses_d2 = false;
+			if (writes_comparison_result_to_d2)
+				successor_uses_d2 = ctx.liveness_vars.at(block_index).out & (1 << D(2));
+
+			if (successor_uses_d2)
+			{
+				// The comparison result written to D2 must survive for the successors.
+				// It is re-materialized from D2's own expression with a SETCMP. That
+				// SETCMP overwrites D2, which the compare feeding it may read, so it
+				// must come right after that compare - which means it can only share
+				// the branch's compare when both compile to the very same instructions.
+				// When the branch folded to a constant, D2's compare is emitted on its
+				// own ahead of the (unconditional or absent) jump.
+				if (!state.d[2].is_expression())
+				{
+					// Folded to a constant (or otherwise not re-materializable) but
+					// live-out: reducing would leave the successors a stale D2.
+					break;
+				}
+
+				// TODO: wasm jit backend currently can only handle pairs of a COMPARE with a single SETX/GOTOX.
+				if (is_web())
+					break;
+
+				std::vector<ffscript> d2_zasm;
+				SimulationValue d2_expr = state.d[2];
+				if (!compile_conditional(d2_expr, d2_zasm))
+					break;
+				ffscript d2_set{SETCMP, D(2), d2_expr.data};
+
+				bool branch_is_constant = expression_zasm.empty() || expression_zasm.back().command == GOTO;
+				if (branch_is_constant)
+				{
+					d2_zasm.push_back(d2_set);
+					expression_zasm.insert(expression_zasm.begin(), d2_zasm.begin(), d2_zasm.end());
+				}
+				else
+				{
+					auto same = [](const ffscript& a, const ffscript& b) {
+						return a.command == b.command && a.arg1 == b.arg1 && a.arg2 == b.arg2 && a.arg3 == b.arg3;
+					};
+					bool same_compare = d2_zasm.size() + 1 == expression_zasm.size();
+					for (size_t i = 0; same_compare && i < d2_zasm.size(); i++)
+						same_compare = same(d2_zasm[i], expression_zasm[i]);
+					if (!same_compare)
+						break;
+
+					expression_zasm.insert(expression_zasm.end() - 1, d2_set);
+				}
+			}
+
+			if (expression_zasm.size() > final_pc - j + 1)
+			{
+				// Should never happen.
+				ASSERT(false);
+				break;
+			}
+
+			std::copy(expression_zasm.begin(), expression_zasm.end(), &C(j));
+			remove(ctx, j + expression_zasm.size(), final_pc);
+			ctx.cfg_stale = true;
+			if (ctx.debug)
+			{
+				fmt::println("rewrite {}: {} -> {} commands", j, final_pc - j + 1, expression_zasm.size());
+				for (int i = j; i <= final_pc; i++)
+					fmt::println("{}: {}", i, zasm_op_to_string(C(i), ctx.script->literals));
+			}
+
+			// TODO: Will need to be a loop when more than just final command being GOTO is handled.
+			break;
+		}
+	});
+
+	return true;
+}
+
+static bool optimize_unreachable_blocks(OptContext& ctx)
+{
+	// I think this works well, but it's takes longer than the other passes and has less impact, so
+	// disable for now.
+	if (!should_run_experimental_passes())
+		return false;
+
+	add_context_cfg(ctx);
+
+	std::set<pc_t> seen_ids = ctx.block_unreachable;
+	std::vector<pc_t> pending_ids = {0};
+	while (!pending_ids.empty())
+	{
+		pc_t id = pending_ids.back();
+		pending_ids.pop_back();
+		seen_ids.insert(id);
+
+		for (auto calls_id : ctx.cfg.block_edges.at(id))
+		{
+			if (!seen_ids.contains(calls_id))
+				pending_ids.push_back(calls_id);
+		}
+	}
+	for (pc_t i = 0; i < ctx.cfg.block_starts.size(); i++)
+	{
+		if (!seen_ids.contains((i)))
+		{
+			if (bisect_tool_should_skip())
+				continue;
+
+			auto [block_start, block_final] = ctx.cfg.get_block_bounds(i);
+			for (pc_t k = block_start; k <= block_final; k++)
+			{
+				// Avoid double counting already removed instructions.
+				if (C(k).command != NOP)
+				{
+					C(k).command = NOP;
+					ctx.saved += 1;
+				}
+			}
+
+			// Don't ever remove the end marker.
+			if (block_final == ctx.script->size - 1)
+			{
+				C(block_final) = {0xFFFF};
+				ctx.saved -= 1;
+			}
+
+			// Prevent needing to rebuild the CFG.
+			ctx.block_unreachable.insert(i);
+		}
+	}
+
+	return true;
+}
+
+static bool optimize_calling_mode(OptContext& ctx)
+{
+	if (ctx.structured_zasm->calling_mode == StructuredZasm::CALLING_MODE_CALLFUNC_RETURNFUNC)
+		return false;
+
+	int return_command =
+		ctx.structured_zasm->calling_mode == StructuredZasm::CALLING_MODE_GOTO_GOTOR ? GOTOR : RETURN;
+
+	std::vector<pc_t> store_stack_pcs;
+	for (pc_t i = 0; i < ctx.script->size; i++)
+	{
+		auto& instr = C(i);
+
+		if (instr.command == return_command)
+		{
+			if (ctx.structured_zasm->calling_mode == StructuredZasm::CALLING_MODE_GOTO_GOTOR)
+			{
+				ASSERT(C(i - 1).command == POP && C(i - 1).arg1 == instr.arg1);
+				remove(ctx, i - 1);
+			}
+			instr.command = RETURNFUNC;
+			continue;
+		}
+
+		if ((instr.command == PUSHR || instr.command == PEEK) && instr.arg1 == rSFRAME)
+		{
+			store_stack_pcs.push_back(i);
+			continue;
+		}
+
+		if (instr.command == SETR && instr.arg1 == rSFRAME && (instr.arg2 == SP || instr.arg2 == SP2))
+		{
+			store_stack_pcs.clear();
+			continue;
+		}
+
+		if (instr.command != GOTO || !ctx.structured_zasm->function_calls.contains(i))
+			continue;
+
+		ASSERT(one_of(C(i + 1).command, POP, PEEK) && C(i + 1).arg1 == rSFRAME);
+
+		pc_t store_stack_pc = store_stack_pcs.back();
+		store_stack_pcs.pop_back();
+
+		pc_t set_ret_addr = -1;
+		pc_t push_ret_addr = -1;
+
+		pc_t k = store_stack_pc + 1;
+		while (C(k).command == NOP)
+			k++;
+		if (C(k).command == SETV && C(k + 1).command == PUSHR)
+		{
+			set_ret_addr = k;
+			push_ret_addr = k + 1;
+		}
+		else if (C(k).command == PUSHV)
+		{
+			push_ret_addr = k;
+		}
+
+		instr.command = CALLFUNC;
+		if (push_ret_addr != -1)
+			remove(ctx, push_ret_addr);
+		if (set_ret_addr != -1)
+			remove(ctx, set_ret_addr);
+	}
+
+	return true;
+}
+
+static bool optimize_inline_functions(OptContext& ctx)
+{
+	if (ctx.script->size <= 1)
+		return false;
+
+	struct InlineFunctionData
+	{
+		const ZasmFunction& fn;
+		ffscript inline_instr;
+		int internal_reg_to_type[8]; // 0 - stack index, 1 - z-register/number
+		int internal_reg_to_value[8];
+		int num_args_popped;
+	};
+
+	std::map<pc_t, InlineFunctionData> functions_to_inline;
+	for (const auto& fn : ctx.structured_zasm->functions)
+	{
+		size_t length = fn.final_pc - fn.start_pc + 1;
+		if (length > 4)
+			continue;
+
+		InlineFunctionData data = {fn};
+		for (int i = 0; i < 8; i++) data.internal_reg_to_type[i] = -1;
+		for (int i = 0; i < 8; i++) data.internal_reg_to_value[i] = -1;
+
+		int stack = 0;
+		bool bail = false;
+		bool found_instr = false;
+		for (pc_t k = fn.start_pc; k <= fn.final_pc; k++)
+		{
+			int command = C(k).command;
+			int arg1 = C(k).arg1;
+			int arg2 = C(k).arg2;
+
+			if (one_of(command, NOP, RETURNFUNC))
+				continue;
+
+			if (command == POP)
+			{
+				if (found_instr)
+					continue;
+
+				int reg = arg1;
+				if (reg >= D(INITIAL_D))
+				{
+					bail = true;
+					break;
+				}
+
+				// TODO: support more than 1 parameter.
+				if (stack == 1)
+				{
+					bail = true;
+					break;
+				}
+
+				data.internal_reg_to_value[reg] = stack++;
+				data.internal_reg_to_type[reg] = 0;
+				data.num_args_popped = stack;
+				continue;
+			}
+
+			if (command == POPARGS)
+			{
+				bail = true;
+				break;
+			}
+
+			if (command == SETR)
+			{
+				if (found_instr)
+					continue;
+
+				int reg = arg1;
+				if (reg >= D(INITIAL_D))
+				{
+					bail = true;
+					break;
+				}
+
+				data.internal_reg_to_value[reg] = arg2;
+				data.internal_reg_to_type[reg] = 1;
+				continue;
+			}
+
+			if (command == LOAD)
+			{
+				if (found_instr)
+					continue;
+
+				int reg = arg1;
+				if (reg >= D(INITIAL_D))
+				{
+					bail = true;
+					break;
+				}
+
+				int stack_idx = arg2;
+				data.internal_reg_to_value[reg] = stack_idx;
+				data.internal_reg_to_type[reg] = 0;
+				continue;
+			}
+
+			if (found_instr)
+			{
+				bail = true;
+				break;
+			}
+
+			found_instr = true;
+			data.inline_instr = C(k);
+		}
+		if (bail)
+			continue;
+		if (!found_instr)
+			data.inline_instr.command = NOP;
+		if (command_is_goto(data.inline_instr.command))
+			continue;
+		// TODO: why does inlining a QUIT break things? It does for crucible_quest.zplay
+		if (data.inline_instr.command == QUIT)
+			continue;
+
+		functions_to_inline.emplace(fn.id, data);
+	}
+
+	std::vector<pc_t> store_stack_pcs;
+	for (pc_t i = 0; i < ctx.script->size - 1; i++)
+	{
+		auto& instr = C(i);
+
+		if (instr.command == PUSHR && instr.arg1 == rSFRAME)
+		{
+			store_stack_pcs.push_back(i);
+			continue;
+		}
+
+		if (instr.command == PUSHARGSR && instr.arg1 == rSFRAME)
+		{
+			for (int k = 0; k < instr.arg2; k++)
+				store_stack_pcs.push_back(i);
+			continue;
+		}
+
+		if (instr.command == POP && instr.arg1 == rSFRAME)
+		{
+			store_stack_pcs.pop_back();
+			continue;
+		}
+
+		if (instr.command != CALLFUNC)
+			continue;
+
+		pc_t fn_id = ctx.structured_zasm->start_pc_to_function.at(instr.arg1);
+		auto it = functions_to_inline.find(fn_id);
+		if (it == functions_to_inline.end())
+			continue;
+
+		auto& data = it->second;
+
+		if (i == 0)
+		{
+			// Unexpected.
+			ASSERT(false);
+			continue;
+		}
+
+		auto& prev_instr = C(i - 1);
+		if (!one_of(prev_instr.command, PUSHR, PUSHV, PUSHARGSR, PUSHARGSV, NOP))
+		{
+			// Class functions will "SETR CLASS_THISKEY" just before the call. Currently ignoring
+			// those.
+			continue;
+		}
+
+		if (bisect_tool_should_skip())
+		{
+			continue;
+		}
+
+		int stack_to_external_value[8];
+		for (int i = 0; i < 8; i++) stack_to_external_value[i] = -1;
+
+		// 0 - literal value, 1 - z-register/number
+		int stack_to_external_value_reg_type[8];
+		for (int i = 0; i < 8; i++) stack_to_external_value_reg_type[i] = -1;
+
+		stack_to_external_value[0] = prev_instr.arg1;
+		stack_to_external_value_reg_type[0] = one_of(prev_instr.command, PUSHR, PUSHARGSR) ? 1 : 0;
+
+		std::vector<ffscript> inlined_zasm;
+		ffscript inline_instr = data.inline_instr;
+
+		if (inline_instr.command == NOP)
+		{
+			// According to the calling convention, only D2 is preserved as the
+			// return value. Any side effects on other D-registers are ignored.
+			int reg = D(2);
+			if (data.internal_reg_to_type[reg] == 0)
+			{
+				int stack_index = data.internal_reg_to_value[reg];
+				if (stack_to_external_value_reg_type[stack_index] == 1)
+				{
+					if (reg != stack_to_external_value[stack_index])
+						inlined_zasm.emplace_back(SETR, reg, stack_to_external_value[stack_index]);
+				}
+				else
+					inlined_zasm.emplace_back(SETV, reg, stack_to_external_value[stack_index]);
+			}
+			else if (data.internal_reg_to_type[reg] == 1 && reg != data.internal_reg_to_value[reg])
+			{
+				inlined_zasm.emplace_back(SETR, reg, data.internal_reg_to_value[reg]);
+			}
+			else
+			{
+				// Must have been an empty function - no interesting instruction, and didn't set D2.
+			}
+		}
+		else
+		{
+			for_every_side_effect_all_args(inline_instr, [&](bool read, bool write, int& reg, [[maybe_unused]] int argn){
+				if (read || write)
+				{
+					if (data.internal_reg_to_type[reg] == 0)
+					{
+						int stack_index = data.internal_reg_to_value[reg];
+						if (stack_to_external_value_reg_type[stack_index] == 1)
+							reg = stack_to_external_value[stack_index];
+						else
+							inlined_zasm.emplace_back(SETV, reg, stack_to_external_value[stack_index]);
+					}
+					else if (read)
+					{
+						inlined_zasm.emplace_back(SETR, reg, data.internal_reg_to_value[reg]);
+					}
+				}
+			});
+			inlined_zasm.push_back(inline_instr);
+		}
+
+		pc_t store_stack_pc = store_stack_pcs.back();
+		bool must_keep_store_stack = false;
+		if (C(i + 1).command == PEEK)
+			must_keep_store_stack = true;
+
+		pc_t hole_start_pc = i;
+		if (prev_instr.command != PUSHARGSR && data.num_args_popped > 0)
+			hole_start_pc -= 1;
+
+		bool store_stack_part_of_hole =
+			(store_stack_pc == hole_start_pc - 1 || store_stack_pc == hole_start_pc) && C(store_stack_pc).command != PUSHARGSR && !must_keep_store_stack;
+
+		pc_t hole_final_pc = i;
+		bool next_is_pop_frame = (C(i + 1).command == POP && C(i + 1).arg1 == rSFRAME);
+
+		if (next_is_pop_frame && (store_stack_part_of_hole || C(store_stack_pc).command == PUSHARGSR))
+			hole_final_pc += 1;
+		else if (C(i + 1).command == NOP)
+			hole_final_pc += 1;
+
+		if (store_stack_part_of_hole)
+			hole_start_pc = store_stack_pc;
+
+		size_t hole_length = hole_final_pc - hole_start_pc + 1;
+		if (inlined_zasm.size() > hole_length)
+		{
+			store_stack_pcs.pop_back();
+			continue;
+		}
+
+		std::copy(inlined_zasm.begin(), inlined_zasm.end(), &C(hole_start_pc));
+		remove(ctx, hole_start_pc + inlined_zasm.size(), hole_final_pc);
+		if (ctx.debug)
+		{
+			fmt::println("rewrite {}: {} -> {} commands", hole_start_pc, hole_length, inlined_zasm.size());
+			for (int i = hole_start_pc; i <= hole_final_pc; i++)
+				fmt::println("{}: {}", i, zasm_op_to_string(C(i), ctx.script->literals));
+		}
+
+		if (hole_start_pc > 0 && C(hole_start_pc - 1).command == PEEK)
+			must_keep_store_stack = true;
+
+		if (!must_keep_store_stack)
+		{
+			if (store_stack_part_of_hole || C(store_stack_pc).command == PUSHARGSR)
+			{
+				store_stack_pcs.pop_back();
+				if (C(store_stack_pc).command == PUSHARGSR)
+				{
+					if (C(store_stack_pc).arg2 > 2)
+						C(store_stack_pc).arg2 -= 1;
+					else if (C(store_stack_pc).arg2 == 2)
+						C(store_stack_pc) = {PUSHR, rSFRAME};
+					else
+						remove(ctx, store_stack_pc);
+				}
+			}
+		}
+
+		if (command_is_wait(inline_instr.command))
+			ctx.cfg_stale = true;
+	}
+
+	return true;
+}
+
+static bool optimize_dead_code(OptContext& ctx)
+{
+	if (!should_run_experimental_passes())
+		return false;
+
+	add_context_cfg(ctx);
+	add_context_liveness(ctx);
+
+	optimize_by_block(ctx, [&](pc_t block_index, pc_t start_pc, pc_t final_pc){
+		// The block's live-out is for the last instruction that can run: the liveness analysis
+		// stops at a RETURNFUNC, or a GOTO out of this CFG (see build_liveness_graph). Nothing
+		// after one of those runs, and walking it would let its writes hide the live ones
+		// before it.
+		pc_t last_pc = final_pc;
+		for (pc_t i = start_pc; i <= final_pc; i++)
+		{
+			int command = C(i).command;
+			if (command == RETURNFUNC || (command == GOTO && !ctx.cfg.contains_block_start(C(i).arg1)))
+			{
+				last_pc = i;
+				break;
+			}
+		}
+
+		int live = ctx.liveness_vars.at(block_index).out;
+		pc_t i = last_pc;
+		while (true)
+		{
+			if (C(i).command == CALLFUNC)
+			{
+				// What a call reads and writes comes from its callee's summary.
+				live = zasm_live_before(C(i), live, *ctx.structured_zasm, *ctx.function_liveness, false);
+			}
+			else
+			{
+				for_every_side_effect_d_registers_only(C(i), [&](bool read, bool write, int reg){
+					if (write)
+					{
+						// Writing the stack frame register (D4) is observed by the script debugger,
+						// which takes it as the base of the current function's locals (see do_set).
+						if (!(live & (1 << reg)) && reg != rSFRAME)
+						{
+							// Don't remove writes that have other side effects (like modifying the stack,
+							// or reading a register that allocates).
+							if (command_is_pure(C(i).command) && !reads_register_with_side_effects(C(i)) && !bisect_tool_should_skip())
+								remove(ctx, i);
+						}
+						live &= ~(1 << reg);
+					}
+					if (read)
+						live |= 1 << reg;
+				});
+			}
+
+			if (i == start_pc)
+				break;
+			i--;
+		}
+	});
+
+	return true;
+}
+
+struct OptPass
+{
+	std::string name;
+	std::function<bool(OptContext&)> fn;
+	// Pass rewrites instructions in place to make them faster rather than removing
+	// them; report "improved N instances" instead of "saved N instr".
+	bool counts_instances = false;
+};
+
+static std::vector<OptPass> script_passes = {
+	// Convert to modern function calls before anything else, so all
+	// passes may assume that.
+	{"calling_mode", optimize_calling_mode},
+	{"goto_next_instruction", optimize_goto_next_instruction},
+	// Note: currently disabled for a few reasons:
+	// 	 - it isn't super effective, since only rather tiny functions can be inlined
+	//   - too many bugs related to preserving stack (I think fixed, but suggests this pass is too dangerious)
+	//   - breaks debugging capabilities for tiny functions (debug_data doesn't get updated to reflect inlined instructions)
+	// So for now, disable entirely.
+	// {"inline_functions", optimize_inline_functions},
+};
+
+static std::vector<OptPass> function_passes = {
+	{"unreachable_blocks", optimize_unreachable_blocks},
+	{"conseq_additive", optimize_conseq_additive},
+	{"load_store", optimize_load_store},
+	{"setv_pushr", optimize_setv_pushr},
+	{"setr_pushr", optimize_setr_pushr},
+	{"stack", optimize_stack},
+	{"spurious_branches", optimize_spurious_branches},
+	{"reduce_comparisons", optimize_reduce_comparisons},
+	{"propagate_values", optimize_propagate_values},
+	{"collapse_podarray", optimize_collapse_podarray_init},
+	{"strength_reduce", optimize_strength_reduce, true},
+	{"unreachable_blocks_2", optimize_unreachable_blocks},
+	{"dead_code", optimize_dead_code},
+};
+
+static bool is_minimal_mode()
+{
+	if (!zasm_optimize_is_enabled())
+	{
+		if (!jit_is_enabled())
+			return false;
+
+		// Old-style function calling (what optimize_calling_mode fixes) does not work well with
+		// jit-compiled scripts. The reason is that when a script is compiled while already running,
+		// in order to "upgrade" the script data from the interpreter to the compiled script, we
+		// need full knowledge of the function call stack. Old scripts stored the return pc on
+		// the stack, and used GOTOR to return, while new scripts use a separate return call stack.
+		// Initializing the compiled script's context requires the return call stack, so we must at
+		// least run that optimization pass.
+		return true;
+	}
+
+	return false;
+}
+
+static void run_pass(OptimizeResults& results, int i, OptContext& ctx, const OptPass& pass)
+{
+	auto start_time = std::chrono::steady_clock::now();
+
+	results.passes[i].counts_instances = pass.counts_instances;
+
+	if (is_minimal_mode())
+	{
+		if (pass.name != "calling_mode")
+		{
+			results.passes[i].skipped = true;
+			return;
+		}
+	}
+
+	ctx.saved = 0;
+	ctx.improved = 0;
+	results.passes[i].skipped = !pass.fn(ctx);
+
+	auto end_time = std::chrono::steady_clock::now();
+	results.passes[i].instructions_saved += ctx.saved;
+	results.passes[i].instances += ctx.improved;
+	results.passes[i].elapsed += std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+}
+
+static void optimize_function(OptimizeResults& results, StructuredZasm& structured_zasm, zasm_script* script, const ZasmFunction& fn, std::shared_ptr<const ZasmFunctionLivenessList> function_liveness)
+{
+	OptContext ctx = create_context_no_cfg(structured_zasm, script, fn, std::move(function_liveness));
+	for (int i = 0; i < function_passes.size(); i++)
+	{
+		run_pass(results, script_passes.size() + i, ctx, function_passes[i]);
+	}
+}
+
+static OptimizeResults create_opt_results()
+{
+	OptimizeResults results{};
+	for (const auto& p : script_passes)
+	{
+		results.passes.push_back({p.name, 0, 0, true, 0, p.counts_instances});
+	}
+	for (const auto& p : function_passes)
+	{
+		results.passes.push_back({p.name, 0, 0, true, 0, p.counts_instances});
+	}
+	return results;
+}
+
+OptimizeResults zasm_optimize_script(zasm_script* script)
+{
+	OptimizeResults results = create_opt_results();
+
+	size_t podarray_runs = 0;
+	for (const auto& op : script->zasm)
+	{
+		if (is_podarray_run_start(op))
+			podarray_runs++;
+	}
+	script->literals.reserve(script->literals.size() + podarray_runs);
+
+	auto start_time = std::chrono::steady_clock::now();
+	auto structured_zasm = zasm_construct_structured(script);
+
+	OptContext ctx = create_context_no_cfg(structured_zasm, script, structured_zasm.functions.front());
+	for (int i = 0; i < script_passes.size(); i++)
+	{
+		run_pass(results, i, ctx, script_passes[i]);
+	}
+
+	// Fix bugged reads of SDDDD.
+	// SDDDD reads D2, but when first introduced the compiler did not set D2. It still just happened to work,
+	// but only by blind luck (see https://www.purezc.net/forums/index.php?showtopic=78604#entry1076373).
+	// setv_pushr optimization 100% breaks these old scripts quests, since it doesn't bother to check
+	// if the register it elides is used beyond the PUSH (or in this case, within a function call).
+	// Let's find those bad POPs and fix them.
+	// TODO: skip this if qst is known to be from non-bugged version.
+	for (pc_t i = 4; i < script->size; i++)
+	{
+		if (!(script->zasm[i].command == SETR && script->zasm[i].arg1 == D(2) && script->zasm[i].arg2 == SDDDD))
+			continue;
+
+		// While this bug existed, some internal functions were made inline, which places the bad POP
+		// in a different position relative to the SETR.
+		bool is_func = structured_zasm.start_pc_to_function.contains(i - 4);
+		pc_t pop_pc = is_func ? i - 4 : i - 3;
+		if (!(script->zasm[pop_pc].command == POP && script->zasm[pop_pc].arg1 == D(6)))
+			continue;
+
+		script->zasm[pop_pc] = {POP, D(2)};
+	}
+
+	// The liveness within a function depends on the functions it calls and the functions calling
+	// it, so summarize every function once, before the function passes. Those passes only
+	// simplify code within a function: they don't make a function read a register on entry that
+	// it didn't, or stop writing one that a caller reads after calling it, so the summaries stay
+	// sound for the code they leave behind.
+	std::shared_ptr<const ZasmFunctionLivenessList> function_liveness;
+	if (!is_minimal_mode())
+		function_liveness = std::make_shared<const ZasmFunctionLivenessList>(analyze_function_liveness(script, structured_zasm));
+
+	if (should_run_optimizer_in_parallel() && ZScriptVersion::singleZasmChunk())
+	{
+		std::vector<OptimizeResults> function_results;
+		function_results.reserve(structured_zasm.functions.size());
+		for (const auto& _ : structured_zasm.functions)
+		{
+			function_results.push_back(create_opt_results());
+		}
+
+		// TODO: could use views::enumerate after upgrading to C++23
+		// https://stackoverflow.com/a/71891519/2788187
+		auto fn_iters = std::views::iota(structured_zasm.functions.begin(), structured_zasm.functions.end());
+		std::for_each(std::execution::par_unseq, fn_iters.begin(), fn_iters.end(), [&](auto it){
+			int i = it - structured_zasm.functions.begin();
+			auto& fn = *it;
+			optimize_function(function_results[i], structured_zasm, script, fn, function_liveness);
+		});
+
+		for (const auto& function_result : function_results)
+		{
+			results.elapsed += function_result.elapsed;
+			results.instructions_saved += function_result.instructions_saved;
+			for (int i = 0; i < results.passes.size(); i++)
+			{
+				if (function_result.passes[i].skipped)
+					continue;
+
+				results.passes[i].elapsed += function_result.passes[i].elapsed;
+				results.passes[i].instructions_saved += function_result.passes[i].instructions_saved;
+				results.passes[i].instances += function_result.passes[i].instances;
+				results.passes[i].skipped = false;
+			}
+		}
+	}
+	else
+	{
+		for (const auto& fn : structured_zasm.functions)
+		{
+			optimize_function(results, structured_zasm, script, fn, function_liveness);
+		}
+	}
+
+	// TODO: remove NOPs and update GOTOs.
+	auto end_time = std::chrono::steady_clock::now();
+	results.elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+
+	for (const auto& pass : results.passes)
+	{
+		results.instructions_saved += pass.instructions_saved;
+	}
+
+	script->optimized = true;
+
+	return results;
+}
+
+static OptimizeResults results;
+static std::chrono::steady_clock::time_point result_start_time;
+static bool results_finalized;
+
+static void init_optimizer_results()
+{
+	results = create_opt_results();
+	result_start_time = std::chrono::steady_clock::now();
+	results_finalized = false;
+}
+
+static void update_optimizer_results(int log_level, zasm_script* script, const OptimizeResults& r)
+{
+	static std::mutex mutex;
+	std::lock_guard<std::mutex> lock(mutex);
+
+	results.instructions_processed += script->size;
+	double pct = 100.0 * r.instructions_saved / script->size;
+	if (log_level >= 2)
+		zasm_optimize_trace("\t[{}] saved {} instr ({:.1f}%), took {} ms", script->name, r.instructions_saved, pct, r.elapsed / 1000);
+
+	for (int i = 0; i < results.passes.size(); i++)
+	{
+		if (r.passes[i].skipped)
+			continue;
+
+		results.passes[i].instructions_saved += r.passes[i].instructions_saved;
+		results.passes[i].instances += r.passes[i].instances;
+		results.passes[i].elapsed += r.passes[i].elapsed;
+		results.passes[i].skipped = false;
+	}
+	results.instructions_saved += r.instructions_saved;
+}
+
+static void finalize_optimizer_results(int log_level)
+{
+	auto end_time = std::chrono::steady_clock::now();
+	results.elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end_time - result_start_time).count();
+
+	if (log_level >= 1)
+	{
+		zasm_optimize_trace("Finished optimizing scripts:");
+
+		for (const auto& pass : results.passes)
+		{
+			if (pass.skipped)
+				continue;
+
+			if (pass.counts_instances)
+			{
+				zasm_optimize_trace("\t[{}] improved {} instances, took {} ms", pass.name, pass.instances, pass.elapsed / 1000);
+				continue;
+			}
+
+			double pct = 100.0 * pass.instructions_saved / results.instructions_processed;
+			zasm_optimize_trace("\t[{}] saved {} instr ({:.1f}%), took {} ms", pass.name, pass.instructions_saved, pct, pass.elapsed / 1000);
+		}
+
+		double pct = 100.0 * results.instructions_saved / results.instructions_processed;
+		zasm_optimize_trace("\t[{}] saved {} instr ({:.1f}%), took {} ms", "total", results.instructions_saved, pct, results.elapsed / 1000);
+	}
+}
+
+void zasm_optimize_sync()
+{
+	bool minimal_mode = is_minimal_mode();
+	if (!zasm_optimize_is_enabled() && !minimal_mode)
+		return;
+
+	init_optimizer_results();
+
+	int log_level = get_flag_int("-zasm-optimize-log").value_or(1);
+	if (log_level >= 1)
+	{
+		zasm_optimize_trace("Optimizing scripts...");
+		if (minimal_mode)
+			zasm_optimize_trace("zasm optimizer not directly enabled, but must run in minimal mode to support jit");
+	}
+
+	if (!minimal_mode)
+		zasm_init_meta_cache();
+
+	bool parallel = should_run_optimizer_in_parallel() && !ZScriptVersion::singleZasmChunk();
+	zasm_for_every_script(parallel, [&](auto script){
+		if (script->optimized || script->size <= 1)
+			return;
+
+		auto r = zasm_optimize_script(script);
+		update_optimizer_results(log_level, script, r);
+	});
+
+	if (results.instructions_processed == 0)
+	{
+		if (log_level >= 1)
+			zasm_optimize_trace("No scripts found.");
+		return;
+	}
+
+	finalize_optimizer_results(log_level);
+}

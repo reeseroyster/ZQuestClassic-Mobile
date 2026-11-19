@@ -1,0 +1,29 @@
+Function run_none-0
+    0: CALLFUNC        5                            [Block 0 -> ][Function #1]
+    1: CALLFUNC        14                           [Function #2]
+    2: NOP
+    3: NOP
+    4: QUIT
+
+
+Function Function #1
+    5: NOP                                          [Block 0 -> ]
+    6: NOP
+    7: LOAD            D2               3
+    8: PUSHR           D2
+    9: NOP
+   10: NOP
+   11: LOAD            D2               2
+   12: PUSHR           D2
+   13: RETURNFUNC
+
+
+Function Function #2
+   14: NOP                                          [Block 0 -> ]
+   15: PUSHV           0
+   16: SETR            D4               SP2
+   17: NOP
+   18: NOP
+   19: SETV            D2               0
+   20: STORE           D2               1
+   21: RETURNFUNC

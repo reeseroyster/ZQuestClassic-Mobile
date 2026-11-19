@@ -1,0 +1,3917 @@
+#include "base/general.h"
+#include "base/util.h"
+#include "base/zc_math.h"
+#include "core/combo.h"
+#include "core/handles.h"
+#include "core/qrs.h"
+#include "core/dmap.h"
+#include "core/zdefs.h"
+#include "ffc.h"
+#include "zc/replay.h"
+#include "zc/weapons.h"
+#include "zc/zc_ffc.h"
+#include "zc/zc_sys.h"
+#include "zc/zelda.h"
+#include "sprite.h"
+#include "zc/decorations.h"
+#include "zc/combos.h"
+#include "zc/maps.h"
+#include "items.h"
+#include "zc/ffscript.h"
+#include "zc/guys.h"
+#include "zc/hero.h"
+#include "zc/title.h"
+#include "core/mapscr.h"
+#include "core/misctypes.h"
+#include "iter.h"
+#include "zc/zscriptversion.h"
+#include "advanced_music.h"
+
+extern sprite_list items, decorations;
+
+// CUTSCENE STUFF
+
+void CutsceneState::clear()
+{
+	*this = CutsceneState();
+}
+bool CutsceneState::can_button(int q)
+{
+	if(!active) return true;
+	return allowed_btns & (1<<q);
+}
+bool CutsceneState::can_f6()
+{
+	return !(active && nof6);
+}
+void CutsceneState::error()
+{
+	if(errsfx)
+		sfx_no_repeat(errsfx);
+}
+CutsceneState active_cutscene;
+
+static void calc_large_combo_handles(const combined_handle_t& base_handle,
+	rect_t& hitbox, vector<combined_handle_t>& handles)
+{
+	hitbox = base_handle.get_rect(true);
+	if (!base_handle.is_rpos())
+	{
+		handles.push_back(base_handle);
+		return;
+	}
+	vector<combined_handle_t> queued_handles {base_handle};
+	vector<rpos_t> visited_rposes {rpos_t(base_handle.id())};
+	rpos_t lowest_rpos = rpos_t::None;
+	int lowest_x = 0, lowest_y = 0;
+	static int xoffs[4] = {0, 0, -16, 16};
+	static int yoffs[4] = {-16, 16, 0, 0};
+	while (queued_handles.size())
+	{
+		handles.push_back(queued_handles.front());
+		queued_handles.erase(queued_handles.begin());
+		auto const& handle = handles.back();
+		auto const& cmb = handle.combo();
+		hitbox.union_with(handle.get_rect(true));
+		auto [x,y] = handle.xy();
+		if (lowest_rpos == rpos_t::None || y < lowest_y || (y == lowest_y && x < lowest_x))
+		{
+			// Keep track of the top-left most (top-most, tiebroken by left-most)
+			// position, as that position is the one read for large combo settings.
+			// It must be sorted to the front of the vector.
+			lowest_y = y;
+			lowest_x = x;
+			lowest_rpos = rpos_t(handle.id());
+		}
+		if (cmb.large_combo_dirs)
+		{
+			for (int dir = 0; dir < 4; ++dir)
+			{
+				if (cmb.large_combo_dirs & (1 << dir))
+				{
+					rpos_handle_t new_handle = get_rpos_handle_for_world_xy(x + xoffs[dir], y + yoffs[dir], handle.get_layer());
+					if (util::contains(visited_rposes, new_handle.rpos))
+						continue;
+					auto& new_cmb = new_handle.combo();
+					int oppdir = oppositeDir[dir];
+					if (!(new_cmb.large_combo_dirs & (1 << oppdir)))
+						continue;
+					visited_rposes.push_back(new_handle.rpos);
+					queued_handles.push_back(new_handle);
+				}
+			}
+		}
+	}
+	for (auto it = handles.begin(); it != handles.end(); ++it)
+	{
+		if (rpos_t(it->id()) == lowest_rpos)
+		{
+			if (it == handles.begin())
+				break; // already at front of list
+			// Move 'lowest' handle to front of list, so caller knows which handle
+			// to use for lifting flags.
+			auto lowest_handle = *it;
+			handles.erase(it);
+			handles.insert(handles.begin(), lowest_handle);
+			break;
+		}
+	}
+}
+
+// TRIGGERS STUFF
+bool trig_each_combo_trigger(const combined_handle_t& comb_handle, std::function<bool(combo_trigger const&)> trig_cond,
+	int32_t special, weapon* w)
+{
+	auto cid = comb_handle.data();
+	auto& cmb = comb_handle.combo();
+	bool ret = false;
+	for(size_t idx = 0; idx < cmb.triggers.size(); ++idx)
+	{
+		auto& trig = cmb.triggers[idx];
+		if(trig_cond(trig))
+		{
+			ret = true;
+			if(do_trigger_combo(comb_handle, idx, special, w))
+				if(trig.trigger_flags.get(TRIGFLAG_CANCEL_TRIGGER))
+					break;
+			if(comb_handle.data() != cid) break;
+		}
+	}
+	return ret;
+}
+bool trig_each_combo_trigger(const combined_handle_t& comb_handle, std::function<bool(combo_trigger const&, size_t)> trig_cond,
+	int32_t special, weapon* w)
+{
+	auto cid = comb_handle.data();
+	auto& cmb = comb_handle.combo();
+	bool ret = false;
+	for(size_t idx = 0; idx < cmb.triggers.size(); ++idx)
+	{
+		auto& trig = cmb.triggers[idx];
+		if(trig_cond(trig, idx))
+		{
+			ret = true;
+			if(do_trigger_combo(comb_handle, idx, special, w))
+				if(trig.trigger_flags.get(TRIGFLAG_CANCEL_TRIGGER))
+					break;
+			if(comb_handle.data() != cid) break;
+		}
+	}
+	return ret;
+}
+
+bool alwaysCTypeEffects(int32_t type)
+{
+	switch(type)
+	{
+		case cCUSTOMBLOCK:
+			return true;
+	}
+	return false;
+}
+
+// TODO: remove unused params?
+static void do_generic_combo2(int32_t bx, [[maybe_unused]] int32_t by, int32_t cid, [[maybe_unused]] int32_t flag, [[maybe_unused]] int32_t flag2, int32_t ft, const rpos_handle_t& rpos_handle, [[maybe_unused]] bool single16)
+{
+	if ( combobuf[cid].type < cTRIGGERGENERIC && !(combobuf[cid].usrflags&cflag9 )  )  //Script combos need an 'Engine' flag
+	{ 
+		return;
+	}
+
+	mapscr* scr = rpos_handle.scr;
+	int pos = rpos_handle.pos;
+	auto [x, y] = rpos_handle.xy();
+
+	ft = vbound(ft, minSECRET_TYPE, maxSECRET_TYPE); //sanity guard to legal secret types. 44 to 127 are unused
+	if (true) // Probably needs a way to only be triggered once...
+	{
+		if ((combobuf[cid].usrflags&cflag1)) 
+		{
+			if (combobuf[cid].usrflags & cflag10)
+			{
+				switch (combobuf[cid].c_attributes[8].getTrunc())
+				{
+					case 0:
+					case 1:
+					default:
+						decorations.add(new dBushLeaves(x, y, dBUSHLEAVES, 0, 0));
+						break;
+					case 2:
+						decorations.add(new dFlowerClippings(x, y, dFLOWERCLIPPINGS, 0, 0));
+						break;
+					case 3:
+						decorations.add(new dGrassClippings(x, y, dGRASSCLIPPINGS, 0, 0));
+						break;
+				}
+			}
+			else decorations.add(new comboSprite(x, y, dCOMBOSPRITE, 0, combobuf[cid].c_attributes[8].getTrunc()));
+		}
+		
+		int32_t it = -1; 
+		int32_t thedropset = -1;
+		if ( (combobuf[cid].usrflags&cflag2) )
+		{
+			auto id = combobuf[cid].c_attributes[9].getTrunc();
+			if ( combobuf[cid].usrflags&cflag11 ) //specific item
+			{
+				it = id;
+			}
+			else
+			{
+				it = select_dropitem(id);
+				thedropset = id;
+			}
+		}
+		if( valid_item_id(it) )
+		{
+			item* itm = (new item(x, y,0, it, ipBIGRANGE + ipTIMER, 0));
+			itm->from_dropset = thedropset;
+			items.add(itm);
+		}
+		
+		//drop special room item
+		if ( (combobuf[cid].usrflags&cflag6) && !getmapflag(scr, mSPECIALITEM) && valid_item_id(scr->catchall))
+		{
+			items.add(new item(x, y, 0,
+				scr->catchall,ipONETIME2|ipBIGRANGE|((get_item_data(scr->catchall).type==itype_triforcepiece ||
+				(scr->flags3&fHOLDITEM)) ? ipHOLDUP : 0) | ((scr->flags8&fITEMSECRET) ? ipSECRETS : 0),0));
+		}
+		//screen secrets
+		if ( combobuf[cid].usrflags&cflag7 )
+		{
+			screen_combo_modify_preroutine(rpos_handle);
+			scr->data[pos] = scr->secretcombo[ft];
+			scr->cset[pos] = scr->secretcset[ft];
+			scr->sflag[pos] = scr->secretflag[ft];
+			// newflag = s->secretflag[ft];
+			screen_combo_modify_postroutine(rpos_handle);
+			if ( combobuf[cid].c_attributes[10].getTrunc() > 0 )
+				sfx(combobuf[cid].c_attributes[10].getTrunc(),pan(bx));
+		}
+		
+		//loop next combo
+		if((combobuf[cid].usrflags&cflag4))
+		{
+			do
+			{
+				if (rpos_handle.layer) 
+				{
+					screen_combo_modify_preroutine(rpos_handle);
+					
+					//undercombo or next?
+					if((combobuf[cid].usrflags&cflag12))
+					{
+						scr->data[pos] = scr->undercombo;
+						scr->cset[pos] = scr->undercset;
+						scr->sflag[pos] = 0;	
+					}
+					else
+						++scr->data[pos];
+					
+					screen_combo_modify_postroutine(rpos_handle);
+				}
+				else
+				{
+					screen_combo_modify_preroutine(rpos_handle);
+					//undercombo or next?
+					if((combobuf[cid].usrflags&cflag12))
+					{
+						scr->data[pos] = scr->undercombo;
+						scr->cset[pos] = scr->undercset;
+						scr->sflag[pos] = 0;	
+					}
+					else
+					{
+						scr->data[pos]=vbound(rpos_handle.data()+1,0,MAXCOMBOS);
+					}
+					screen_combo_modify_postroutine(rpos_handle);
+				}
+				
+				if((combobuf[cid].usrflags&cflag12)) break; //No continuous for undercombo
+				
+				if ( (combobuf[cid].usrflags&cflag5) ) cid = rpos_handle.data();
+			} while((combobuf[cid].usrflags&cflag5) && (combobuf[cid].type == cTRIGGERGENERIC) && (cid < (MAXCOMBOS-1)));
+			if ( (combobuf[cid].c_attributes[10].getTrunc()) > 0 )
+				sfx(combobuf[cid].c_attributes[10].getTrunc(),pan(bx));
+		}
+		if((combobuf[cid].usrflags&cflag14)) //drop enemy
+		{
+			addenemy(rpos_handle.screen,x,y,combobuf[cid].c_attributes[12],((combobuf[cid].usrflags&cflag13) ? 0 : -15));
+		}
+	}
+}
+
+void do_generic_combo_ffc2(const ffc_handle_t& ffc_handle, int32_t cid, int32_t ft)
+{
+	if ( combobuf[cid].type < cTRIGGERGENERIC && !(combobuf[cid].usrflags&cflag9 )  )  //Script combos need an 'Engine' flag
+	{ 
+		return;
+	} 
+	ft = vbound(ft, minSECRET_TYPE, maxSECRET_TYPE); //sanity guard to legal secret types. 44 to 127 are unused
+	ffcdata* ffc = ffc_handle.ffc;
+	mapscr* scr = ffc_handle.scr;
+	if (true) // Probably needs a way to only be triggered once...
+	{
+		if (combobuf[cid].usrflags&cflag1) 
+		{
+			if (combobuf[cid].usrflags & cflag10)
+			{
+				switch (combobuf[cid].c_attributes[8].getTrunc())
+				{
+					case 0:
+					case 1:
+					default:
+						decorations.add(new dBushLeaves(ffc->x, ffc->y, dBUSHLEAVES, 0, 0));
+						break;
+					case 2:
+						decorations.add(new dFlowerClippings(ffc->x, ffc->y, dFLOWERCLIPPINGS, 0, 0));
+						break;
+					case 3:
+						decorations.add(new dGrassClippings(ffc->x, ffc->y, dGRASSCLIPPINGS, 0, 0));
+						break;
+				}
+			}
+			else decorations.add(new comboSprite(ffc->x, ffc->y, dCOMBOSPRITE, 0, combobuf[cid].c_attributes[8].getTrunc()));
+		}
+		
+		int32_t it = -1; 
+		int32_t thedropset = -1;
+		if (combobuf[cid].usrflags&cflag2)
+		{
+			auto id = combobuf[cid].c_attributes[9].getTrunc();
+			if ( combobuf[cid].usrflags&cflag11 ) //specific item
+			{
+				it = id;
+			}
+			else
+			{
+				it = select_dropitem(id);
+				thedropset = id;
+			}
+		}
+		if( valid_item_id(it) )
+		{
+			item* itm = (new item(ffc->x, ffc->y,(zfix)0, it, ipBIGRANGE + ipTIMER, 0));
+			itm->from_dropset = thedropset;
+			items.add(itm);
+		}
+		
+		//drop special room item
+		if ( (combobuf[cid].usrflags&cflag6) && !getmapflag(scr, mSPECIALITEM) && valid_item_id(scr->catchall))
+		{
+			items.add(new item(ffc->x, ffc->y,(zfix)0,
+				scr->catchall,ipONETIME2|ipBIGRANGE|((get_item_data(scr->catchall).type==itype_triforcepiece ||
+				(scr->flags3&fHOLDITEM)) ? ipHOLDUP : 0) | ((scr->flags8&fITEMSECRET) ? ipSECRETS : 0),0));
+		}
+		//screen secrets
+		if ( combobuf[cid].usrflags&cflag7 )
+		{
+			screen_combo_modify_preroutine(ffc_handle);
+			ffc_handle.set_data(scr->secretcombo[ft]);
+			ffc->cset = scr->secretcset[ft];
+			// newflag = s->secretflag[ft];
+			screen_combo_modify_postroutine(ffc_handle);
+			if ( combobuf[cid].c_attributes[10].getTrunc() > 0 )
+				sfx(combobuf[cid].c_attributes[10].getTrunc(),pan(ffc->x));
+		}
+		
+		//loop next combo
+		if((combobuf[cid].usrflags&cflag4))
+		{
+			do
+			{
+				screen_combo_modify_preroutine(ffc_handle);
+				//undercombo or next?
+				if((combobuf[cid].usrflags&cflag12))
+				{
+					ffc_handle.set_data(scr->undercombo);
+					ffc->cset = scr->undercset;
+				}
+				else
+				{
+					ffc_handle.increment_data();
+				}
+				screen_combo_modify_postroutine(ffc_handle);
+				
+				if((combobuf[cid].usrflags&cflag12)) break; //No continuous for undercombo
+				if ( (combobuf[cid].usrflags&cflag5) ) cid = ffc_handle.data();
+				
+			} while((combobuf[cid].usrflags&cflag5) && (combobuf[cid].type == cTRIGGERGENERIC) && (cid < (MAXCOMBOS-1)));
+			if ( (combobuf[cid].c_attributes[10].getTrunc()) > 0 )
+				sfx(combobuf[cid].c_attributes[10].getTrunc(),pan(ffc->x));
+			
+			
+		}
+		if((combobuf[cid].usrflags&cflag14)) //drop enemy
+		{
+			addenemy(ffc_handle.screen,ffc->x,ffc->y,combobuf[cid].c_attributes[12],((combobuf[cid].usrflags&cflag13) ? 0 : -15));
+		}
+		
+	}
+}
+
+static bool validate_interpolation_mode(CameraEffectInterpolationMode mode)
+{
+	return mode >= CameraEffectInterpolationMode::First && mode <= CameraEffectInterpolationMode::Last;
+}
+static bool validate_causes_mode(CameraEffectCausesMode mode)
+{
+	return mode >= CameraEffectCausesMode::First && mode <= CameraEffectCausesMode::Last;
+}
+
+static void start_cutscene_camera_effect(const combined_handle_t& handle)
+{
+	auto& cmb = handle.combo();
+	const ComboView_CutsceneEffect_Camera cv{cmb};
+
+	zfix speed = cv.speed();
+	if (speed <= 0)
+	{
+		Z_error("Invalid speed (must be > 0), ignoring camera effect. Got: %s\n", speed.str_trim().c_str());
+		return;
+	}
+
+	// Define the start point as the center of the current clamped viewport.
+	int start_x = viewport.x + viewport.w / 2;
+	int start_y = viewport.y + viewport.h / 2;
+	
+	// Figure out where the target is
+	zfix target_x, target_y;
+	bool instant_revert = false;
+	
+	auto sub_type = cv.sub_type().getTrunc();
+	switch ((CameraEffectSubType)sub_type)
+	{
+		case CameraEffectSubType::RelativeToCombo:
+		{
+			auto [cx, cy] = handle.center_xy();
+			target_x = cx + cv.dest_x();
+			target_y = cy + cv.dest_y();
+			break;
+		}
+		case CameraEffectSubType::RelativeToHero:
+		{
+			// Technically not always the hero, but same goes for Return to Hero flag
+			sprite* spr = get_viewport_sprite();
+			target_x = (spr->x + spr->txsz*16/2) + cv.dest_x();
+			target_y = (spr->y + spr->tysz*16/2) + cv.dest_y();
+			break;
+		}
+		case CameraEffectSubType::RelativeToViewport:
+		{
+			target_x = start_x + cv.dest_x();
+			target_y = start_y + cv.dest_y();
+			break;
+		}
+		case CameraEffectSubType::Absolute:
+		{
+			target_x = cv.dest_x();
+			target_y = cv.dest_y();
+			break;
+		}
+		case CameraEffectSubType::ReturnToHero:
+		{
+			target_x = start_x;
+			target_y = start_y;
+			instant_revert = true;
+			break;
+		}
+		default:
+		{
+			Z_error("Invalid sub_type, ignoring camera effect. Got: %d\n", sub_type);
+			return;
+		}
+	}
+
+	// Simulate where the viewport will end up after clamping.
+	viewport_t final_viewport = viewport;
+	calculate_viewport(final_viewport, cur_dmap, cur_screen, world_w, world_h, target_x, target_y);
+
+	// Define the destination as the center of that clamped viewport.
+	zfix dest_x = final_viewport.x + final_viewport.w / 2;
+	zfix dest_y = final_viewport.y + final_viewport.h / 2;
+
+	zfix dx = dest_x - start_x;
+	zfix dy = dest_y - start_y;
+	zfix total_distance = sqrt(dx * dx + dy * dy);
+	int duration_in_frames = total_distance / speed;
+	if (duration_in_frames <= 0)
+		duration_in_frames = 1;
+
+	auto interpolation_mode = (CameraEffectInterpolationMode)cv.interpolation_mode().getTrunc();
+	if (!validate_interpolation_mode(interpolation_mode))
+	{
+		Z_error("Invalid interpolation mode, ignoring camera effect. Got: %d\n", (int)interpolation_mode);
+		return;
+	}
+	auto causes_mode = (CameraEffectCausesMode)cv.causes_mode().getTrunc();
+	if (!validate_causes_mode(causes_mode))
+	{
+		Z_error("Invalid causes mode, ignoring camera effect. Got: %d\n", (int)causes_mode);
+		return;
+	}
+
+	int idle_frames = cv.idle_time().getTrunc();
+	if (idle_frames < 0)
+	{
+		Z_error("Invalid idle frames, ignoring camera effect. Got: %d\n", idle_frames);
+		return;
+	}
+
+	bool freeze_game = cmb.usrflags & cflag1;
+	bool return_to_hero = instant_revert || (cmb.usrflags & cflag2);
+	
+	// swap causes_modes based on other parameters
+	// BeforeIdle with no idle time runs BeforeReturn
+	if (causes_mode == CameraEffectCausesMode::BeforeIdle && !idle_frames)
+		causes_mode = CameraEffectCausesMode::BeforeReturn;
+	// BeforeReturn with no return runs OnFinish
+	if (causes_mode == CameraEffectCausesMode::BeforeReturn && !return_to_hero)
+		causes_mode = CameraEffectCausesMode::OnFinish;
+
+	set_camera_effect({
+		.handle = handle,
+		.cid = handle.data(),
+		.speed = speed,
+		.start_x = start_x,
+		.start_y = start_y,
+		.dest_x = dest_x,
+		.dest_y = dest_y,
+		.duration_in_frames = duration_in_frames,
+		.interpolation_mode = interpolation_mode,
+		.idle_frames = idle_frames,
+		.return_to_hero = return_to_hero,
+		.freeze_game = freeze_game,
+		.causes_mode = causes_mode,
+		.state = {
+			.stage = CameraState::Stage::Running,
+			.x = start_x,
+			.y = start_y,
+		},
+	});
+}
+
+void do_cutscene_effect(const combined_handle_t& handle)
+{
+	auto& cmb = handle.combo();
+
+	switch(cmb.c_attributes[8].getTrunc())
+	{
+		case CUTEFF_PLAYER_WALK:
+			Hero.start_auto_walk(handle);
+			break;
+		case CUTEFF_CAMERA:
+			start_cutscene_camera_effect(handle);
+			break;
+	}
+}
+
+void do_cutscene_flags(newcombo const& cmb)
+{
+	if(cmb.type != cCUTSCENETRIG) return;
+	if(cmb.usrflags & cflag1) //Disable cutscene
+	{
+		active_cutscene.clear();
+		return;
+	}
+	active_cutscene.active = true;
+	active_cutscene.allowed_btns = cmb.c_attributes[0].getZLong();
+	active_cutscene.nof6 = (cmb.usrflags & cflag2)!=0;
+	active_cutscene.errsfx = cmb.c_attributes[8].getTrunc();
+}
+
+bool do_cswitch_combo(newcombo const& cmb, weapon* w)
+{
+	uint pair = cmb.c_attributes[8].getTrunc();
+	if (pair > 255) return false;
+	if(cmb.usrflags & cflag11) //global state
+	{
+		int32_t tmr = cmb.c_attributes[2].getTrunc();
+		bool oldstate = game->gswitch_timers.get(pair);
+		if(tmr > 0)
+		{
+			game->gswitch_timers[pair] = tmr;
+		}
+		else
+		{
+			if(game->gswitch_timers.get(pair))
+				game->gswitch_timers[pair] = 0;
+			else game->gswitch_timers[pair] = -1;
+		}
+		if(oldstate != (game->gswitch_timers.get(pair) != 0))
+		{
+			toggle_gswitches(pair, false);
+		}
+	}
+	else
+	{
+		if(pair > 31) return false;
+		game->lvlswitches[dlevel] ^= (1 << pair);
+		toggle_switches(1<<pair, false);
+	}
+	if(w && (cmb.usrflags&cflag1))
+		killgenwpn(w); //Kill weapon
+	if(cmb.c_attributes[9].getTrunc()) sfx(cmb.c_attributes[9].getTrunc());
+	return true;
+}
+
+static void trigger_cswitch_block(const combined_handle_t& handle)
+{
+	ffcdata* ffc = handle.is_ffc() ? handle.get_ffc().ffc : nullptr;
+	auto& cmb = handle.combo();
+	if (cmb.type != cCSWITCHBLOCK) return;
+
+	int32_t cmbofs = cmb.c_attributes[0].getTrunc();
+	int32_t csofs = cmb.c_attributes[1].getTrunc();
+	screen_combo_modify_preroutine(handle);
+	handle.modify_data(cmbofs);
+	handle.set_cset((handle.cset() + csofs) & 15);
+	screen_combo_modify_postroutine(handle);
+
+	int newcid = handle.data();
+	if(combobuf[newcid].animflags & AF_CYCLE)
+	{
+		combobuf[newcid].tile = combobuf[newcid].o_tile;
+		combobuf[newcid].cur_frame=0;
+		combobuf[newcid].aclk = 0;
+		combo_caches::drawing.refresh(newcid);
+	}
+	
+	auto rpos = ffc ? COMBOPOS_REGION_B(ffc->x+8, ffc->y+8) : rpos_t(handle.id());
+	auto skip_layer = ffc ? -1 : handle.get_rpos().layer;
+	for (int lyr = 0; lyr <= 6; lyr++)
+	{
+		if (rpos == rpos_t::None) break;
+		if(lyr == skip_layer) continue;
+		if(!(cmb.usrflags&(1<<lyr))) continue;
+
+		auto rpos_handle = get_rpos_handle(rpos, lyr);
+		if (!rpos_handle.scr->is_valid())
+			continue;
+		if(!rpos_handle.data()) //Don't increment empty space
+			continue;
+		screen_combo_modify_preroutine(rpos_handle);
+		rpos_handle.modify_data(cmbofs);
+		rpos_handle.set_cset((rpos_handle.cset() + csofs) & 15);
+		screen_combo_modify_postroutine(rpos_handle);
+		int newcid2 = rpos_handle.data();
+		if(combobuf[newcid2].animflags & AF_CYCLE)
+		{
+			combobuf[newcid2].tile = combobuf[newcid2].o_tile;
+			combobuf[newcid2].cur_frame=0;
+			combobuf[newcid2].aclk = 0;
+			combo_caches::drawing.refresh(newcid2);
+		}
+	}
+	if (cmb.usrflags&cflag11)
+	{
+		auto [bx, by] = handle.xy();
+		bx += 8;
+		by += 8;
+
+		for_every_ffc([&](const ffc_handle_t& ffc_handle) {
+			if (ffc_handle.ffc == ffc) return; // same ffc
+			if (ffcIsAt(ffc_handle, bx, by))
+			{
+				screen_combo_modify_preroutine(ffc_handle);
+				ffc_handle.modify_data(cmbofs);
+				ffc_handle.set_cset((ffc_handle.cset() + csofs) & 15);
+				screen_combo_modify_postroutine(ffc_handle);
+				int32_t newcid2 = ffc_handle.data();
+				if(combobuf[newcid2].animflags & AF_CYCLE)
+				{
+					combobuf[newcid2].tile = combobuf[newcid2].o_tile;
+					combobuf[newcid2].cur_frame=0;
+					combobuf[newcid2].aclk = 0;
+					combo_caches::drawing.refresh(newcid2);
+				}
+			}
+		});
+	}
+}
+
+void spawn_decoration_xy(newcombo const& cmb, zfix x, zfix y, zfix combo_x, zfix combo_y)
+{
+	int32_t decotype = (cmb.usrflags & cflag1) ? ((cmb.usrflags & cflag10) ? (cmb.c_attributes[8].getTrunc()) : (-1)) : (0);
+	if(decotype > 3) decotype = 0;
+	if(!decotype) decotype = (isBushType(cmb.type) ? 1 :
+		(isFlowersType(cmb.type) ? 2 :
+		(isGrassType(cmb.type) ? 3 :
+		((cmb.usrflags & cflag1) ? -1 : -2))));
+	switch(decotype)
+	{
+		case -2: break; //nothing
+		case -1:
+			decorations.add(new comboSprite(combo_x-8, combo_y-8, dCOMBOSPRITE, 0, cmb.c_attributes[8].getTrunc()));
+			break;
+		case 1: decorations.add(new dBushLeaves(x, y, dBUSHLEAVES, 0, 0)); break;
+		case 2: decorations.add(new dFlowerClippings(x, y, dFLOWERCLIPPINGS, 0, 0)); break;
+		case 3: decorations.add(new dGrassClippings(x, y, dGRASSCLIPPINGS, 0, 0)); break;
+	}
+}
+
+void spawn_decoration(newcombo const& cmb, const combined_handle_t& handle)
+{
+	auto [x, y] = handle.xy();
+	auto [cx, cy] = handle.center_xy();
+	if (replay_version_check(0, 47))
+	{
+		x = x.getInt();
+		y = y.getInt();
+		cx = cx.getInt();
+		cy = cy.getInt();
+	}
+	spawn_decoration_xy(cmb, x, y, cx, cy);
+}
+
+void trigger_cuttable(const combined_handle_t& handle)
+{
+	auto& cmb = handle.combo();
+	auto type = cmb.type;
+	if(!isCuttableType(type)) return;
+
+	mapscr* scr = handle.get_mapscr();
+	auto flag = handle.sflag();
+	auto flag2 = cmb.flag;
+	
+	auto [x, y] = handle.xy();
+	bool skipSecrets = isNextType(type) && !get_qr(qr_OLD_SLASHNEXT_SECRETS);
+	
+	bool done = false;
+	if(!skipSecrets)
+	{
+		done = true;
+		if((flag >= 16 && flag <= 31))
+		{
+			handle.set_data(scr->secretcombo[flag-16+4]);
+			handle.set_cset(scr->secretcset[flag-16+4]);
+			handle.set_sflag(scr->secretflag[flag-16+4]);
+		}
+		else if(flag == mfARMOS_SECRET)
+		{
+			handle.set_data(scr->secretcombo[sSTAIRS]);
+			handle.set_cset(scr->secretcset[sSTAIRS]);
+			handle.set_sflag(scr->secretflag[sSTAIRS]);
+			sfx(scr->secretsfx);
+		}
+		else if((flag>=mfSWORD && flag<=mfXSWORD) || flag==mfSTRIKE)
+		{
+			for(int32_t i=0; i <= 3; ++i)
+				trigger_secrets_if_flag(x,y,mfSWORD+i,true);
+			
+			trigger_secrets_if_flag(x,y,mfSTRIKE,true);
+		}
+		else if(flag2 >= 16 && flag2 <= 31)
+		{
+			// for some reason this used to use `scr->sflag[pos]` instead of `flag`?
+			handle.set_data(scr->secretcombo[flag-16+4]);
+			handle.set_cset(scr->secretcset[flag-16+4]);
+			handle.set_sflag(scr->secretflag[flag-16+4]);
+		}
+		else if(flag2 == mfARMOS_SECRET)
+		{
+			handle.set_data(scr->secretcombo[sSTAIRS]);
+			handle.set_cset(scr->secretcset[sSTAIRS]);
+			handle.set_sflag(scr->secretflag[sSTAIRS]);
+			sfx(scr->secretsfx);
+		}
+		else if((flag2>=mfSWORD && flag2<=mfXSWORD)|| flag2==mfSTRIKE)
+		{
+			for(int32_t i=0; i <= 3; i++)
+				trigger_secrets_if_flag(x,y,mfSWORD+i,true);
+			
+			trigger_secrets_if_flag(x,y,mfSTRIKE,true);
+		}
+		else done = false;
+	}
+	if(!done)
+	{
+		if(isCuttableNextType(type))
+		{
+			handle.increment_data();
+		}
+		else
+		{
+			handle.set_data(scr->undercombo);
+			handle.set_cset(scr->undercset);
+			handle.set_sflag(0);
+		}
+	}
+
+	if((flag==mfARMOS_ITEM||flag2==mfARMOS_ITEM) && (!getmapflag(scr, (handle.get_screen() < 128 && get_qr(qr_ITEMPICKUPSETSBELOW)) ? mITEM : mSPECIALITEM) || (scr->flags9&fBELOWRETURN)))
+	{
+		items.add(new item((zfix)x, (zfix)y,(zfix)0, scr->catchall, ipONETIME2 + ipBIGRANGE + ipHOLDUP | ((scr->flags8&fITEMSECRET) ? ipSECRETS : 0), 0));
+		sfx(scr->secretsfx);
+	}
+	else if(isCuttableItemType(type))
+	{
+		int32_t it = -1;
+		int32_t thedropset = -1;
+		if (cmb.usrflags&cflag2) //specific dropset or item
+		{
+			auto id = cmb.c_attributes[9].getTrunc();
+			if (cmb.usrflags&cflag11) 
+			{
+				it = id;
+			}
+			else
+			{
+				it = select_dropitem(id);
+				thedropset = id;
+			}
+		}
+		else
+		{
+			it = select_dropitem(12);
+			thedropset = 12;
+		}
+		
+		if(it!=-1)
+		{
+			item* itm = (new item((zfix)x, (zfix)y,(zfix)0, it, ipBIGRANGE + ipTIMER, 0));
+			itm->from_dropset = thedropset;
+			items.add(itm);
+		}
+	}
+	
+	if(get_qr(qr_MORESOUNDS))
+	{
+		if (cmb.usrflags&cflag3)
+		{
+			sfx(cmb.c_attributes[10].getTrunc(),pan(x));
+		}
+		else if (isBushType(type) || isFlowersType(type) || isGrassType(type))
+		{
+			sfx(QMisc.miscsfx[sfxBUSHGRASS],pan(x));
+		}
+	}
+	spawn_decoration(cmb, handle);
+}
+
+bool trigger_step(const combined_handle_t& handle)
+{
+	auto& cmb = handle.combo();	
+	if(!isStepType(cmb.type) || cmb.type == cSTEPCOPY) return false;
+	if(valid_item_id(cmb.c_attributes[9].getTrunc()) && !game->get_item(cmb.c_attributes[9].getTrunc()))
+		return false; //lacking required item
+	if((cmb.usrflags & cflag1) && !Hero.HasHeavyBoots())
+		return false;
+	if(cmb.c_attributes[8].getTrunc())
+		sfx(cmb.c_attributes[8].getTrunc(), pan(handle.xy().first));
+	switch(cmb.type)
+	{
+		case cSTEP:
+			handle.increment_data();
+			break;
+		case cSTEPSAME:
+		{
+			// Increment all combos of the same id as the triggered combo on the base screen.
+			// If the trigger is on a layer screen, that will be the only combo on that layer incremented.
+			int32_t id = handle.data();
+			every_combo_opts opts{};
+			opts.include_rposes_base_screen_only = true;
+			for_every_combo([&](const auto& handle) {
+				if (handle.data() == id)
+					handle.increment_data();
+			}, opts);
+
+			if (handle.is_ffc() || handle.get_rpos().layer > 0)
+				handle.increment_data();
+			break;
+		}
+		case cSTEPALL:
+		{
+			every_combo_opts opts{};
+			opts.include_rposes_base_screen_only = true;
+			for_every_combo([&](const auto& handle) {
+				if (isStepType(handle.ctype()))
+					handle.increment_data();
+			}, opts);
+
+			if (handle.is_ffc() || handle.get_rpos().layer > 0)
+				handle.increment_data();
+			break;
+		}
+	}
+	return true;
+}
+
+bool can_locked_combo(newcombo const& cmb) //cLOCKBLOCK or cLOCKEDCHEST specifically
+{
+	switch(cmb.type) //sanity check
+	{
+		case cLOCKBLOCK: case cLOCKEDCHEST:
+			break;
+		default: return false; //not a locked container?
+	}
+	int32_t requireditem = cmb.usrflags&cflag1 ? cmb.c_attributes[8].getTrunc() : 0;
+	int32_t itemonly = cmb.usrflags&cflag2;
+	int32_t thecounter = cmb.c_attributes[9].getTrunc();
+	int32_t ctr_amount = cmb.c_attributes[0].getTrunc();
+	if( requireditem && game->get_item(requireditem))
+	{
+		return true;
+	}
+	else if((cmb.usrflags&cflag1) && itemonly) return false; //Nothing but item works
+	else if ( (cmb.usrflags&cflag4) )
+	{
+		if ( game->get_counter(thecounter) >= ctr_amount )
+		{
+			return true;
+		}
+		else if (cmb.usrflags&cflag6) //eat counter even if insufficient, but don't unlock
+		{
+			return false;
+		}
+	}
+	else if (ctr_amount && canUseKey(ctr_amount) ) return true;
+	else if(!ctr_amount && !requireditem && !itemonly && canUseKey() ) return true;
+	return false;
+}
+
+bool try_locked_combo(newcombo const& cmb) //cLOCKBLOCK or cLOCKEDCHEST specifically
+{
+	switch(cmb.type) //sanity check
+	{
+		case cLOCKBLOCK: case cLOCKEDCHEST:
+			break;
+		default: return false; //not a locked container?
+	}
+	int32_t requireditem = cmb.usrflags&cflag1 ? cmb.c_attributes[8].getTrunc() : 0;
+	int32_t itemonly = cmb.usrflags&cflag2;
+	int32_t thecounter = cmb.c_attributes[9].getTrunc();
+	int32_t ctr_amount = cmb.c_attributes[0].getTrunc();
+	if( requireditem && game->get_item(requireditem))
+	{
+		if ((cmb.usrflags&cflag5)) 
+		{
+			takeitem(requireditem);
+		}
+		return true;
+	}
+	else if((cmb.usrflags&cflag1) && itemonly) return false; //Nothing but item works
+	else if ((cmb.usrflags&cflag4))
+	{
+		bool nodrain = (cmb.usrflags&cflag8);
+		bool thief = !nodrain && (cmb.usrflags&cflag6);
+		if ( game->get_counter(thecounter) >= ctr_amount )
+		{
+			//flag 6 only checks the required count; it doesn't drain it
+			if (!nodrain)
+				game->change_counter(-(ctr_amount), thecounter);
+			return true;
+		}
+		else if (thief) //eat counter even if insufficient, but don't unlock
+		{
+			game->change_counter(-(game->get_counter(thecounter)), thecounter);
+			return false;
+		}
+	}
+	else if (ctr_amount && usekey(ctr_amount) ) return true;
+	else if(!ctr_amount && !requireditem && !itemonly && usekey() ) return true;
+	return false;
+}
+
+bool play_combo_string(int str, optional<int> screen)
+{
+	if (!str)
+		return false;
+	if (!screen) screen = cur_screen;
+	mapscr* scr = get_scr(*screen);
+	switch(str)
+	{
+		case -1: //Special case: Use Screen String
+			str = scr->str;
+			break;
+		case -2: //Special case: Use Screen Catchall
+			str = scr->catchall;
+			break;
+		case -10: case -11: case -12: case -13: case -14: case -15: case -16: case -17: //Special case: Screen->D[]
+			int32_t di = (cur_dmap<<7) + *screen-(DMaps[cur_dmap].type==dmOVERW ? 0 : DMaps[cur_dmap].xoff);
+			str = game->screen_d.get(di).get(abs(str)-10) / 10000L;
+			break;
+	}
+	if(!str || unsigned(str) >= MAXMSGS)
+		return false;
+
+	msgstr::do_new(scr, str);
+	return true;
+}
+
+void trigger_string(combo_trigger const& trig, bool success, optional<int> screen)
+{
+	play_combo_string((success ? trig.trig_msgstr : trig.fail_msgstr)/10000L, screen);
+}
+
+void trigger_sign(newcombo const& cmb, optional<int> screen)
+{
+	play_combo_string(cmb.c_attributes[0].getTrunc(), screen);
+}
+
+bool trigger_warp(const combined_handle_t& handle)
+{
+	auto& cmb = handle.combo();
+	if(!isWarpType(cmb.type)) return false;
+
+	mapscr* scr = handle.base_scr();
+	mapscr* wscr = cur_screen >= 128 ? special_warp_return_scr : scr;
+	auto index = getWarpLetter(cmb.type);
+	if(index == 4) index = zc_oldrand()%4; //Random warp
+	auto wtype = wscr->tilewarptype[index];
+	auto stype = simplifyWarpType(cmb.type);
+	if(wtype==wtNOWARP && stype != cAWARPA)
+		return false;
+	auto wsfx = cmb.c_attributes[8].getTrunc();
+	auto tdm = wscr->tilewarpdmap[index];
+	auto tscr = wscr->tilewarpscr[index];
+	auto wrindex=(wscr->warpreturnc>>(index*2))&3;
+	int32_t ws = map_screen_index(DMaps[tdm].map, wscr->tilewarpscr[index] + DMaps[tdm].xoff);
+	mapscr* wscr2=&TheMaps[ws];
+	int wx = wscr2->warpreturnx[wrindex];
+	int wy = wscr2->warpreturny[wrindex];
+	auto weff = warpEffectNONE;
+	if (stype == cAWARPA) //these use sidewarps
+	{
+		wtype = wscr->sidewarptype[index];
+		if (wtype == wtNOWARP)
+			return false;
+		tdm = wscr->sidewarpdmap[index];
+		tscr = wscr->sidewarpscr[index];
+		ws = map_screen_index(DMaps[tdm].map, wscr->sidewarpscr[index] + DMaps[tdm].xoff);
+		wscr2 = &TheMaps[ws];
+		wx = wscr2->warpreturnx[wrindex];
+		wy = wscr2->warpreturny[wrindex];
+	}
+	if (stype == cPIT || (stype == cAWARPA && (scr->flags5 & fDIRECTAWARP)) || (stype == cSWARPA && (scr->flags5 & fDIRECTSWARP)))
+	{
+		wx = Hero.getX().getInt();
+		wy = Hero.getY().getInt();
+
+		int rx, ry;
+		region_t dest_region;
+		calculate_region(DMaps[tdm].map, tscr, dest_region, rx, ry);
+		tscr = dest_region.origin_screen;
+	}
+	switch(wtype)
+	{
+		case wtIWARPZAP:
+			wtype = wtIWARP;
+			weff = warpEffectZap;
+			break;
+		case wtIWARPBLK:
+			wtype = wtIWARP;
+			weff = warpEffectInstant;
+			break;
+		case wtIWARPOPEN:
+			wtype = wtIWARP;
+			weff = warpEffectOpen;
+			break;
+		case wtIWARPWAVE:
+			wtype = wtIWARP;
+			weff = warpEffectWave;
+			break;
+	}
+	
+	auto wflag = 0;
+	if(scr->flags3&fIWARP_SPRITE_CARRYOVER) wflag |= warpFlagDONTCLEARSPRITES;
+	//Queue the warp for the next frame, as doing anything else breaks terribly
+	FFCore.queueWarp(wtype, tdm, tscr, wx, wy, weff, wsfx, wflag, -1);
+	return true;
+}
+
+bool trigger_chest(const combined_handle_t& handle)
+{
+	mapscr* base_scr = handle.base_scr();
+	int screen = handle.get_screen();
+
+	auto& cmb = handle.combo();
+	uint flag = 1 << cmb.c_attributes[13].getTrunc();
+	switch(cmb.type)
+	{
+		case cLOCKEDCHEST: //Special flags!
+			if(!try_locked_combo(cmb))
+			{
+				play_combo_string(cmb.c_attributes[3].getTrunc());
+				return false;
+			}
+			if(cmb.usrflags&cflag16)
+			{
+				setxmapflag(screen, flag);
+				
+				remove_xstatecombos(create_screen_handles(base_scr), flag);
+				break;
+			}
+			setmapflag(base_scr, mLOCKEDCHEST);
+			break;
+			
+		case cCHEST:
+			if(cmb.usrflags&cflag16)
+			{
+				setxmapflag(screen, flag);
+				remove_xstatecombos(create_screen_handles(base_scr), flag);
+				break;
+			}
+			setmapflag(base_scr, mCHEST);
+			break;
+			
+		case cBOSSCHEST:
+			if(!(game->lvlitems.get(dlevel)&(1 << li_boss_key)))
+			{
+				play_combo_string(cmb.c_attributes[3].getTrunc());
+				return false;
+			}
+			run_first_script_of_type(itype_bosskey);
+			
+			if(cmb.usrflags&cflag16)
+			{
+				setxmapflag(screen, flag);
+				remove_xstatecombos(create_screen_handles(base_scr), flag);
+				break;
+			}
+			setmapflag(base_scr, mBOSSCHEST);
+			break;
+	}
+	
+	sfx(cmb.c_attributes[11].getTrunc()); //opening sfx
+	
+	bool itemflag = false;
+	if (handle.is_ffc())
+	{
+		itemflag = cmb.flag == mfARMOS_ITEM;
+	}
+	else if(handle.is_rpos())
+	{
+		auto rpos = handle.get_rpos().rpos;
+		for (int i = get_qr(qr_OLD_CHEST_COLLISION) ? 2 : 6; i >= 0; --i)
+		{
+			auto tmp_handle = get_rpos_handle(rpos, i);
+			if (tmp_handle.sflag() == mfARMOS_ITEM || tmp_handle.cflag() == mfARMOS_ITEM)
+			{
+				itemflag = true;
+				break;
+			}
+		}
+	}
+	bool itemstate = false;
+	int32_t ipflag = 0;
+	if(cmb.usrflags & cflag7)
+	{
+		itemstate = getmapflag(screen, (screen < 128 && get_qr(qr_ITEMPICKUPSETSBELOW)) ? mITEM : mSPECIALITEM);
+		ipflag = (screen < 128 && get_qr(qr_ITEMPICKUPSETSBELOW)) ? ipONETIME : ipONETIME2;
+	}
+	if(itemflag && !itemstate)
+	{
+		int32_t pflags = ipflag | ipBIGRANGE | ipHOLDUP | ((base_scr->flags8&fITEMSECRET) ? ipSECRETS : 0);
+		int32_t itid = cmb.c_attributes[18].getTrunc();
+		switch(itid)
+		{
+			case -10: case -11: case -12: case -13:
+			case -14: case -15: case -16: case -17:
+			{
+				int32_t di = ((cur_dmap)<<7) + screen-(DMaps[cur_dmap].type==dmOVERW ? 0 : DMaps[cur_dmap].xoff);
+				itid = game->screen_d.get(di).get(abs(itid)-10) / 10000L;
+				break;
+			}
+			case -1:
+				itid = base_scr->catchall;
+				break;
+		}
+		if(invalid_item_id(itid)) itid = 0;
+		item* itm = new item(Hero.getX(), Hero.getY(), 0, itid, pflags, 0);
+		itm->set_forcegrab(true);
+		items.add(itm);
+	}
+	return true;
+}
+
+bool trigger_lockblock(const combined_handle_t& handle)
+{
+	mapscr* base_scr = handle.base_scr();
+	int screen = handle.get_screen();
+	
+	auto& cmb = handle.combo();
+	uint flag = 1 << cmb.c_attributes[13].getTrunc();
+	switch(cmb.type)
+	{
+		case cLOCKBLOCK: //Special flags!
+			if(!try_locked_combo(cmb))
+			{
+				play_combo_string(cmb.c_attributes[3].getTrunc());
+				return false;
+			}
+			if(cmb.usrflags&cflag16)
+			{
+				setxmapflag(screen, flag);
+				remove_xstatecombos(create_screen_handles(base_scr), flag, false);
+				break;
+			}
+			setmapflag(base_scr, mLOCKBLOCK);
+			remove_lockblocks(create_screen_handles(base_scr));
+			break;
+			
+		case cBOSSLOCKBLOCK:
+		{
+			if (!(game->lvlitems.get(dlevel) & (1 << li_boss_key)))
+			{
+				play_combo_string(cmb.c_attributes[3].getTrunc());
+				return false;
+			}
+			run_first_script_of_type(itype_bosskey);
+			
+			if(cmb.usrflags&cflag16)
+			{
+				setxmapflag(screen, flag);
+				remove_xstatecombos(create_screen_handles(base_scr), flag, false);
+				break;
+			}
+			setmapflag(base_scr, mBOSSLOCKBLOCK);
+			remove_bosslockblocks(create_screen_handles(base_scr));
+			break;
+		}
+		default: return false;
+	}
+	
+	if(cmb.c_attributes[11].getTrunc())
+		sfx(cmb.c_attributes[11].getTrunc()); //opening sfx
+	return true;
+}
+
+bool trigger_armos_grave(const combined_handle_t& handle, int32_t trigdir)
+{
+	auto layer = handle.get_layer(); // ffc = 7
+	if (layer > 0 && layer != 7 && !get_qr(qr_ARMOS_GRAVE_ON_LAYERS))
+		return false;
+	auto& counters = activation_counters[layer];
+
+	if (counters[handle.id()]) return false;
+	int32_t gc = 0;
+	for (int32_t i = 0; i < guys.Count(); ++i)
+	{
+		if (((enemy*)guys.spr(i))->mainguy)
+		{
+			++gc;
+		}
+	}
+	if (gc > 10) return false; // Fail if >10 enemies on screen?
+
+	auto& cmb = handle.combo();
+	int32_t eclk = -14;
+	int32_t id2 = 0;
+	auto [tx, ty] = handle.xy();
+	bool nextcmb = false;
+	switch (cmb.type)
+	{
+		case cARMOS:
+		{
+			if (cmb.usrflags & cflag1) //custom ID
+			{
+				int32_t r = (cmb.usrflags & cflag2) ? zc_oldrand() % 2 : 0;
+				id2 = cmb.c_attributes[8 + r].getTrunc();
+			}
+			else //default ID
+			{
+				for (int32_t i = 0; i < eMAXGUYS; i++)
+				{
+					if (guysbuf[i].flags & guy_armos)
+					{
+						id2 = i;
+
+						// This is mostly for backwards-compatability
+						if (guysbuf[i].type == eeWALK && guysbuf[i].attributes[8] == e9tARMOS)
+						{
+							eclk = 0;
+						}
+
+						break;
+					}
+				}
+			}
+
+			// Large Combo (early return)
+			if (cmb.usrflags & cflag4)
+			{
+				rect_t hitbox;
+				vector<combined_handle_t> handles;
+				
+				calc_large_combo_handles(handle, hitbox, handles);
+				for (auto const& handle : handles)
+					counters[handle.id()] = 61;
+				
+				if (addenemy(handle.get_screen(), hitbox.l, hitbox.t, id2, eclk))
+				{
+					enemy* en = ((enemy*)guys.spr(guys.Count() - 1));
+					en->did_armos = false;
+					en->fading = fade_flicker;
+					en->activated_handles = handles;
+					en->flags |= guy_armos;
+					en->x = hitbox.l + ((hitbox.width() - en->hit_width) / 2) - en->hxofs;
+					en->y = hitbox.t + ((hitbox.height() - en->hit_height) / 2) - en->hyofs;
+				}
+				return true;
+			}
+			if (!handle.is_rpos())
+				break;
+			// Large Enemy (early return)
+			if (cmb.usrflags & cflag3)
+			{
+				counters[handle.id()] = 61;
+				//! To-do Adjust for larger enemies, but we need it to be directional. 
+				int32_t ypos = 0; int32_t xpos = 0;
+				int32_t chy = 0; int32_t chx = 0;
+				//nmew idea = check while the upper-left corner combo is armos
+				///move up one and check if it is armos, check the next, and stop as soon as that is not armos
+				///then do the same going left
+
+				int32_t searching = 1;
+				int32_t armosxsz = 1;
+				int32_t armosysz = 1;
+				switch (guysbuf[id2].type)
+				{
+					case eeGHOMA:
+						armosxsz = 3;
+						break;
+					case eeAQUA: //jesus christ I'm not considering the logistics of manhandlas and gleeoks
+					case eeDIG:
+						armosxsz = 2;
+						armosysz = 2;
+						break;
+					default:
+						break;
+				}
+				if ((guysbuf[id2].SIZEflags & OVERRIDE_TILE_HEIGHT) != 0) armosxsz = guysbuf[id2].txsz;
+				if ((guysbuf[id2].SIZEflags & OVERRIDE_TILE_WIDTH) != 0) armosysz = guysbuf[id2].tysz;
+
+				if (armosxsz > 1 || armosysz > 1)
+				{
+					switch (trigdir)
+					{
+						case -1: //triggered not by touch
+							[[fallthrough]];
+						case up: //touched armos from below
+						{
+							while (searching == 1) //find the top edge of an armos block
+							{
+								chy -= 16;
+								if (ty + chy < 0) break; //don't go out of bounds
+
+								if (get_rpos_handle_for_world_xy(tx, ty + chy, layer).ctype() == cARMOS)
+								{
+									ypos -= 16;
+								}
+								else searching = 2;
+							}
+							while (searching == 2) //find the left edge of an armos block
+							{
+								chx -= 16;
+								if (tx + chx < 0) break; //don't go out of bounds
+
+								if (get_rpos_handle_for_world_xy(tx + chx, ty, layer).ctype() == cARMOS)
+								{
+									xpos -= 16;
+								}
+								else searching = 3;
+							}
+
+							break;
+						}
+						case down: //touched armos from above
+						{
+							while (searching == 1) //find the left edge of an armos block
+							{
+								chx -= 16;
+								if (tx + chx < 0) break; //don't go out of bounds
+
+								if (get_rpos_handle_for_world_xy(tx + chx, ty, layer).ctype() == cARMOS)
+								{
+									xpos -= 16;
+								}
+								else searching = 3;
+							}
+						}
+						[[fallthrough]];
+						case left: //touched right edge of armos
+						{
+							while (searching == 1) //find the top edge of an armos block
+							{
+								chy -= 16;
+								if (ty + chy < 0) break; //don't go out of bounds
+
+								if (get_rpos_handle_for_world_xy(tx, ty + chy, layer).ctype() == cARMOS)
+								{
+									ypos -= 16;
+								}
+								else searching = 2;
+							}
+							while (searching == 2) //find the left edge of an armos block
+							{
+								chx -= 16;
+								if (tx + chx < 0) break; //don't go out of bounds
+
+								if (get_rpos_handle_for_world_xy(tx + chx, ty, layer).ctype() == cARMOS)
+								{
+									xpos -= 16;
+								}
+								else searching = 3;
+							}
+							break;
+						}
+
+						case right: //touched left edge of armos
+						{
+							while (searching == 1) //find the top edge of an armos block
+							{
+								chy -= 16;
+								if (ty + chy < 0) break; //don't go out of bounds
+
+								if (get_rpos_handle_for_world_xy(tx, ty + chy, layer).ctype() == cARMOS)
+								{
+									ypos -= 16;
+								}
+								else searching = 2;
+							}
+							break;
+						}
+
+
+					}
+				}
+
+				int32_t xpos2 = tx + xpos;
+				int32_t ypos2 = ty + ypos;
+				vector<combined_handle_t> handles;
+				for (int32_t n = 0; n < armosysz; n++)
+				{
+					for (int32_t m = 0; m < armosxsz; m++)
+					{
+						rpos_t rpos = COMBOPOS_REGION_B(xpos2 + m * 16, ypos2 + n * 16);
+						if (rpos != rpos_t::None)
+						{
+							counters[int(rpos)] = 61;
+							handles.push_back(get_rpos_handle(rpos, layer));
+						}
+					}
+				}
+				if (guysbuf[id2].type == eeGHOMA)
+				{
+					if (COMBOTYPE(tx + chx + 1, ty) == cARMOS) xpos += 16;
+				}
+				if (addenemy(handle.get_screen(), tx + xpos, ty + 1 + ypos, id2, 0))
+				{
+					enemy* en = ((enemy*)guys.spr(guys.Count() - 1));
+					en->did_armos = false;
+					en->fading = fade_flicker;
+					en->activated_handles = handles;
+					en->flags |= guy_armos;
+				}
+				return true;
+			}
+			break;
+		}
+		case cBSGRAVE:
+			nextcmb = true;
+			[[fallthrough]];
+		case cGRAVE:
+		{
+			if (cmb.usrflags & cflag1) //Custom ID
+			{
+				int32_t r = (cmb.usrflags & cflag2) ? zc_oldrand() % 2 : 0;
+				id2 = cmb.c_attributes[8 + r].getTrunc();
+			}
+			else //Default ID
+			{
+				for (int32_t i = 0; i < eMAXGUYS; i++)
+				{
+					if (guysbuf[i].flags & guy_ghini)
+					{
+						id2 = i;
+						eclk = 0; // This is mostly for backwards-compatability
+						break;
+					}
+				}
+			}
+			
+			// Large Combo (early return)
+			if (cmb.usrflags & cflag4)
+			{
+				rect_t hitbox;
+				vector<combined_handle_t> handles;
+				
+				calc_large_combo_handles(handle, hitbox, handles);
+				for (auto const& handle : handles)
+				{
+					counters[handle.id()] = 61;
+					if (nextcmb)
+						handle.increment_data();
+				}
+				
+				if (addenemy(handle.get_screen(), hitbox.l, hitbox.t, id2, eclk))
+				{
+					enemy* en = ((enemy*)guys.spr(guys.Count() - 1));
+					en->fading = fade_flicker;
+					en->activated_handles = handles;
+					en->x = hitbox.l + ((hitbox.width() - en->hit_width) / 2) - en->hxofs;
+					en->y = hitbox.t + ((hitbox.height() - en->hit_height) / 2) - en->hyofs;
+				}
+				return true;
+			}
+			
+			if (nextcmb)
+				handle.increment_data();
+			break;
+		}
+		default: return false;
+	}
+	counters[handle.id()] = 61;
+	if (!addenemy(handle.get_screen(), tx, ty + 3, id2, eclk))
+		return false;
+	enemy* e = (enemy*)guys.spr(guys.Count() - 1);
+	e->did_armos = false;
+	e->activated_handles.push_back(handle);
+	if (cmb.type == cARMOS)
+		e->flags |= guy_armos;
+	return true;
+}
+
+bool trigger_damage_combo(const combined_handle_t& handle, int type, int ptrval, int32_t hdir, bool force_solid)
+{
+	return trigger_damage_combo(handle.base_scr(), handle.data(), type, ptrval, hdir, force_solid);
+}
+
+bool trigger_damage_combo(mapscr* scr, int32_t cid, int type, int ptrval, int32_t hdir, bool force_solid)
+{
+	if(hdir > 3) hdir = -1;
+	newcombo const& cmb = combobuf[cid];
+
+	if(Hero.hclk || Hero.superman || Hero.fallclk)
+		return false; //immune
+	int32_t dmg = 0;
+	if(cmb.usrflags & cflag1) //custom
+		dmg = -cmb.c_attributes[0].getTrunc();
+	else dmg = combo_class_buf[cmb.type].modify_hp_amount;
+	
+	bool global_defring = get_item_data(current_item_id(itype_ring)).flags & item_flag1;
+	bool global_perilring = get_item_data(current_item_id(itype_perilring)).flags & item_flag1;
+
+	bool current_ring = (scr->flags6&fTOGGLERINGDAMAGE) != 0;
+	if(current_ring)
+	{
+		global_defring = !global_defring;
+		global_perilring = !global_perilring;
+	}
+	
+	int32_t itemid = current_item_id(itype_boots);
+	auto const& itm = get_item_data(itemid);
+	
+	bool bootsnosolid = itm.flags & item_flag1;
+	bool ignoreBoots = itm.flags & item_flag3;
+	if(dmg < 0)
+	{
+		if(itemid < 0 || ignoreBoots || (scr->flags5&fDAMAGEWITHBOOTS)
+			|| ((4 << itm.power) < abs(dmg))
+			|| ((force_solid||(cmb.walk&0xF)) && bootsnosolid)
+			|| !(checkbunny(itemid) && checkmagiccost(itemid)))
+		{
+			std::vector<int32_t> &ev = FFCore.eventData;
+			ev.clear();
+			ev.push_back(-dmg*10000);
+			ev.push_back(hdir*10000);
+			ev.push_back(0);
+			ev.push_back(Hero.active_invincibility_spell(false) ? 10000 : 0);
+			ev.push_back(48*10000);
+			ev.push_back(ZSD_COMBODATA*10000);
+			ev.push_back(cid);
+			ev.push_back(type*10000);
+			ev.push_back(ptrval);
+			ev.push_back(Hero.active_invincibility_spell(true) ? 10000 : 0);
+			
+			throwGenScriptEvent(GENSCR_EVENT_HERO_HIT_1);
+			int32_t dmg = ev[0]/10000;
+			bool nullhit = ev[2] != 0;
+			
+			if(nullhit) {ev.clear(); return false;}
+			
+			//Args: 'damage (post-ring)','hitdir','nullifyhit','type:npc','npc uid'
+			ev[0] = Hero.ringpower(dmg, !global_perilring, !global_defring)*10000;
+			
+			throwGenScriptEvent(GENSCR_EVENT_HERO_HIT_2);
+			dmg = ev[0]/10000;
+			hdir = ev[1]/10000;
+			nullhit = ev[2] != 0;
+			bool divineprot = ev[3] != 0;
+			bool divprot_kb = ev[9] != 0;
+			int32_t iframes = ev[4] / 10000;
+			ev.clear();
+			if(nullhit) return false;
+			
+			if(!divineprot)
+			{
+				game->set_life(zc_max(game->get_life()-dmg,0));
+			}
+			if (!divprot_kb)
+				Hero.doHit(hdir, iframes); //set hit action, iframes, etc
+			return true;
+		}
+		else paymagiccost(itemid); //boots succeeded
+	}
+	return false;
+}
+
+static void trigger_stepfx_add_weapon_and_load_gfx(sprite_list& list, const newcombo& cmb, weapon* wpn)
+{
+	if (!list.add(wpn))
+		return;
+
+	if (cmb.c_attributes[11].getTrunc() > 0)
+		wpn->LOADGFX(cmb.c_attributes[11].getTrunc());
+	
+	if(cmb.usrflags & cflag10)
+		wpn->load_weap_data(cmb.misc_weap_data.get());
+}
+
+bool trigger_stepfx(const combined_handle_t& handle, bool stepped)
+{
+	auto [tx, ty] = handle.xy();
+
+	auto& cmb = handle.combo();
+
+	uint thesfx = cmb.c_attributes[8].getTrunc();
+	sfx_no_repeat(thesfx,pan(tx));
+
+	if ( cmb.usrflags&cflag1) //landmine
+	{
+		uint wpn = cmb.c_attributes[9].getTrunc();
+		uint wpdir = cmb.c_attributes[10].getTrunc();
+		if ( wpdir > r_down )
+			wpdir = zc_oldrand()&3;
+		int32_t damg = cmb.c_attributes[0].getTrunc();
+		if(damg < 1) damg = 4;
+		int parentitem = cmb.c_attributes[12].getTrunc();
+		if (!parentitem || invalid_item_id(parentitem))
+			parentitem = -1;
+		auto wlvl = parentitem > -1 ? itemsbuf.get(parentitem).level : 0;
+		switch(wpn)
+		{
+			//eweapons
+			case ewFireball:
+			case ewArrow:
+			case ewBrang:
+			case ewSword:
+			case ewRock:
+			case ewMagic:
+			case ewBomb:
+			case ewSBomb:
+			case ewLitBomb:
+			case ewLitSBomb:
+			case ewFireTrail:
+			case ewFlame:
+			case ewWind:
+			case ewFlame2:
+			case ewFlame2Trail:
+			case ewIce:
+			case ewFireball2:
+				trigger_stepfx_add_weapon_and_load_gfx(Ewpns, cmb, new weapon((zfix)tx,(zfix)ty,(zfix)0,wpn,0,damg,wpdir, -1,-1,false));
+				break;
+			
+			case wBeam:
+			case wBrang:
+			case wBomb:
+			case wSBomb:
+			case wLitBomb:
+			case wLitSBomb:
+			case wArrow:
+			
+			case wWhistle:
+			case wBait:
+			case wMagic:
+			case wWind:
+			case wRefMagic:
+			case wRefFireball:
+			case wRefRock:
+			case wRefBeam:
+			case wIce:
+			case wFlame: 
+			case wSound: // -Z: sound + defence split == digdogger, sound + one hit kill == pols voice -Z
+			//case wThrown: 
+			//case wPot: //Thrown pot or rock -Z
+			//case wLit: //Lightning or Electric -Z
+			//case wBombos: 
+			//case wEther: 
+			//case wQuake:// -Z
+			//case wSword180: 
+			//case wSwordLA:
+			case wFire:
+			case wRefArrow:
+			case wRefFire:
+			case wRefFire2:
+				trigger_stepfx_add_weapon_and_load_gfx(Lwpns, cmb, new weapon((zfix)tx,(zfix)ty,(zfix)0,wpn,wlvl,damg,wpdir,parentitem,Hero.getUID(),false,0,1,0));
+				break;
+				
+			case wScript1:
+			case wScript2: 
+			case wScript3:
+			case wScript4:
+			case wScript5:
+			case wScript6:
+			case wScript7:
+			case wScript8:
+			case wScript9:
+			case wScript10:
+				if (cmb.usrflags&cflag2) //wscript lwpn
+				{
+					if (cmb.usrflags&cflag4) //direct damage from custom/script lweapons
+					{
+						if(stepped)
+						{
+							Hero.hitdir = -1;
+							if (Hero.action != rafting && Hero.action != freeze && Hero.action!=sideswimfreeze && !Hero.hclk)
+							{
+								int32_t dmgamt = damg;
+								game->set_life(game->get_life()- Hero.ringpower(dmgamt));
+								Hero.doHit(-1);
+							}
+						}
+					}
+					else
+					{
+						trigger_stepfx_add_weapon_and_load_gfx(Lwpns, cmb, new weapon((zfix)tx,(zfix)ty,(zfix)0,wpn,wlvl,damg,wpdir,parentitem, Hero.getUID(),false,0,1,0));
+					}
+					break;
+				}
+				else //wscript ewpn
+				{
+					trigger_stepfx_add_weapon_and_load_gfx(Ewpns, cmb, new weapon((zfix)tx,(zfix)ty,(zfix)0,wpn,0,damg,wpdir, -1,-1,false));
+					break;
+				}
+				
+			case wSSparkle:
+			case wFSparkle:
+				if (cmb.usrflags&cflag4) //direct damage from custom/script lweapons
+				{
+					if(stepped)
+					{
+						Hero.hitdir = -1;
+						if (Hero.action != rafting && Hero.action != freeze && Hero.action != sideswimfreeze && !Hero.hclk)
+						{
+							Hero.doHit(-1);
+							int32_t dmgamt = damg;
+							
+							game->set_life(game->get_life()- Hero.ringpower(dmgamt));
+						}
+					}
+				}
+				else
+				{
+					trigger_stepfx_add_weapon_and_load_gfx(Lwpns, cmb, new weapon((zfix)tx,(zfix)ty,(zfix)0,wpn,wlvl,damg,wpdir,parentitem, Hero.getUID(),false,0,1,0));
+				}
+				break;
+			
+			default: //enemy bomb
+				trigger_stepfx_add_weapon_and_load_gfx(Ewpns, cmb, new weapon((zfix)tx,(zfix)ty,(zfix)0,ewLitBomb,0,damg,up, -1,-1,false));
+				break;
+			
+			//x,y,z, wpn, 0, dmisc4, dir,-1,getUID(),false);
+		}
+		if (!(cmb.usrflags&cflag3) ) //Don't Advance
+		{
+			handle.increment_data();
+		}
+	}
+	return true;
+}
+
+bool trigger_switchhookblock(const combined_handle_t& handle)
+{
+	if(Hero.switchhookclk) return false;
+	
+	if (handle.is_ffc())
+	{
+		switching_object = handle.get_ffc().ffc;
+		switching_object->switch_hooked = true;
+		hooked_comborpos = rpos_t::None;
+		hooked_layerbits = 0;
+		Hero.doSwitchHook(game->get_switchhookstyle());
+	}
+	else
+	{
+		switching_object = NULL;
+		hooked_comborpos = rpos_t(handle.id());
+		hooked_layerbits = 0;
+		Hero.doSwitchHook(game->get_switchhookstyle());
+		if(!hooked_layerbits) //failed
+		{
+			Hero.reset_hookshot();
+			return false;
+		}
+	}
+	return true;
+}
+
+static weapon* fire_shooter_wpn(newcombo const& cmb, zfix& wx, zfix& wy, bool angular, double radians, int32_t dir)
+{
+	uint weapid = cmb.c_attributes[9].getTrunc();
+	if(!weapid) return nullptr;
+	uint weapspr = cmb.c_attributes[10].getTrunc();
+	int damage = cmb.c_attributes[18].getTrunc();
+	zfix steprate = cmb.c_attributes[2]/100;
+	if(damage < 0) damage = 0;
+	bool lw = weapid < wEnemyWeapons;
+	if(weapid >= wScript1 && weapid <= wScript10)
+		lw = (cmb.usrflags&cflag5)!=0;
+	bool autorot = (cmb.usrflags&cflag6);
+	bool boss = cmb.usrflags&cflag8;
+	
+	auto wdir = autorot ? right : dir;
+	weapon* wpn = nullptr;
+	if(lw)
+	{
+		int pitem = cmb.c_attributes[14].getTrunc();
+		if (!pitem || invalid_item_id(pitem))
+			pitem = -1;
+		int plvl = pitem > -1 ? itemsbuf.get(pitem).level : 0;
+		
+		wpn = new weapon((zfix)wx,(zfix)wy,(zfix)0,weapid,plvl,damage,wdir,pitem, Hero.getUID(),false,0,1,0,0,weapspr,autorot);
+		if (!Lwpns.add(wpn)) return nullptr;
+	}
+	else
+	{
+		wpn = new weapon((zfix)wx,(zfix)wy,(zfix)0,weapid,0,damage,wdir, -1,-1,false,0,0,0,0,weapspr,autorot);
+		if (!Ewpns.add(wpn)) return nullptr;
+	}
+
+	wpn->angular = angular;
+	wpn->angle = radians;
+	if(angular) dir = AngleToDir(radians);
+	wpn->dir = dir;
+	wpn->step = steprate;
+	wpn->xofs = 0;
+	wpn->yofs = (get_qr(qr_OLD_DRAWOFFSET)?playing_field_offset:original_playing_field_offset);
+	if(autorot)
+	{
+		if(angular)
+			wpn->rotation = RadiansToDegrees(wpn->angle);
+		else wpn->rotation = DirToDegrees(wpn->dir);
+		wpn->rotation = WrapDegrees(wpn->rotation);
+		wpn->autorotate = true;
+	}
+	if(weapid == ewFireball || weapid == ewFireball2)
+	{
+		SETFLAG(wpn->level, 1, boss);
+	}
+	wpn->unblockable = cmb.c_attributes[12].getTrunc() & WPNUNB_ALL;
+	
+	wpn->scrconfig.script = cmb.c_attributes[13].getTrunc();
+	if (cmb.usrflags & cflag10)
+		wpn->load_weap_data(cmb.misc_weap_data.get());
+	
+	if(!((lw ? lwpnmap : ewpnmap)[wpn->scrconfig.script-1].hasScriptData())) // validate script
+		wpn->scrconfig.clear();
+
+	return wpn;
+}
+
+bool trigger_shooter(newcombo const& cmb, zfix wx, zfix wy)
+{
+	if(cmb.type != cSHOOTER) return false;
+	if(!cmb.c_attributes[9].getTrunc()) return false; //no weapon
+	if(wx >= world_w || wx < -15 || wy >= world_h || wy < -15) return false;
+
+	bool proxstop = cmb.usrflags&cflag4;
+	bool invprox = cmb.usrflags&cflag9;
+	zfix proxlim = cmb.c_attributes[1];
+
+	auto dst = dist(wx,wy,Hero.getX(),Hero.getY());
+	if(proxstop && (invprox ? (dst > proxlim) : (dst <= proxlim)))
+		return false;
+
+	bool angular = cmb.usrflags&cflag1;
+	double radians = 0;
+	int32_t dir = -1;
+	zfix zdegrees = cmb.c_attributes[0];
+	if(angular)
+	{
+		if(zdegrees >= 0 && zdegrees <= 360_zf)
+		{
+			radians = WrapAngle(DegreesToRadians(double(zdegrees)));
+			dir = AngleToDir(radians);
+		}
+		else
+		{
+			double at_player = zc::math::ArcTan2(double(Hero.getY()-wy),double(Hero.getX()-wx));
+			at_player = WrapAngle(at_player);
+			switch(zdegrees.getTrunc())
+			{
+				case -1: //4-dir at player
+				{
+					angular = false;
+					dir = AngleToDir4Rad(at_player);
+					break;
+				}
+				case -2: //8-dir at player
+				{
+					angular = false;
+					dir = AngleToDir(at_player);
+					break;
+				}
+				case -3: //angular at player
+				{
+					radians = at_player;
+					dir = AngleToDir(at_player);
+					break;
+				}
+				default: dir = AngleToDir(0);
+			}
+		}
+	}
+	else dir = vbound(zdegrees.getTrunc(), -1, 15);
+
+	if (replay_get_version() == 51 && replay_get_meta_str("qst") == "terror_of_necromancy_demo6.qst")
+	{
+		viewport_t freeze_rect = viewport;
+		freeze_rect.w += 48*2;
+		freeze_rect.h += 48*2;
+		freeze_rect.x -= 48;
+		freeze_rect.y -= 48;
+		if (!freeze_rect.contains_point(wx, wy)) return false;
+	}
+	// Before firing, check if the spawned weapon data would be suspended or despawned.
+	else if (is_in_scrolling_region())
+	{
+		uint weapid = cmb.c_attributes[9].getTrunc();
+		bool lw = weapid < wEnemyWeapons;
+		if (weapid >= wScript1 && weapid <= wScript10)
+			lw = (cmb.usrflags & cflag5) != 0;
+		int pitem = lw ? cmb.c_attributes[14].getTrunc() : -1;
+		if (lw && (!pitem || invalid_item_id(pitem))) pitem = -1;
+
+		if (const weapon_data* wpn_data = (cmb.usrflags & cflag10) ? &(cmb.misc_weap_data.get()) : get_weapon_data_for_id(weapid, pitem, -1, lw))
+		{
+			if (wpn_data->viewport_suspend_range > 0 || wpn_data->viewport_despawn_range > 0)
+			{
+				auto [trect, hrect] = calculate_weapon_size(*wpn_data, weapid, dir, lw).to_rects(wx.getInt(), wy.getInt());
+				rect_t view_rect(viewport);
+
+				if (wpn_data->viewport_suspend_range > 0)
+				{
+					rect_t suspend_rect = view_rect.expanded(wpn_data->viewport_suspend_range);
+					if (!suspend_rect.intersects_with(trect) && !suspend_rect.intersects_with(hrect))
+						return false;
+				}
+
+				if (wpn_data->viewport_despawn_range > 0)
+				{
+					rect_t despawn_rect = view_rect.expanded(wpn_data->viewport_despawn_range);
+					if (!despawn_rect.intersects_with(trect) && !despawn_rect.intersects_with(hrect))
+						return false;
+				}
+			}
+		}
+	}
+	
+	uint shotsfx = cmb.c_attributes[8].getTrunc();
+	auto shotcount = zc_max(1,cmb.c_attributes[11].getTrunc());
+	if((cmb.usrflags&cflag7) && shotcount > 1) //multishot
+	{
+		if(!angular)
+		{
+			angular = true;
+			radians = WrapAngle(DirToRadians(dir));
+		}
+		double spreadangle = WrapAngle(DegreesToRadians(double(cmb.c_attributes[3])));
+		double startangle = 0;
+		if(shotcount&1) //odd
+		{
+			startangle = radians - (spreadangle * floor(shotcount/2));
+		}
+		else
+		{
+			startangle = radians - (spreadangle * ((shotcount/2.0)-0.5));
+		}
+		for(auto q = 0; q < shotcount; ++q)
+		{
+			double angle = WrapAngle(startangle + (q*spreadangle));
+			fire_shooter_wpn(cmb, wx, wy, angular, angle, dir);
+		}
+	}
+	else fire_shooter_wpn(cmb, wx, wy, angular, radians, dir);
+	if(shotsfx)
+		sfx(shotsfx);
+	return true;
+}
+bool trigger_shooter(const combined_handle_t& handle)
+{
+	auto [x, y] = handle.xy();
+	return trigger_shooter(handle.combo(), x, y);
+}
+
+void trigger_save(newcombo const& cmb, mapscr* scr)
+{
+	if(cmb.type != cSAVE && cmb.type != cSAVE2) return;
+	auto save_type = cmb.type == cSAVE2 ? 1 : 0;
+	if(cmb.usrflags & cflag1) //restore hp
+	{
+		zfix perc = cmb.c_attributes[8] / 100_zf;
+		word life = word(int(perc * game->get_maxlife()));
+		if(cmb.c_attributes[8] >= 100)
+			life = game->get_maxlife();
+		if(game->get_life() < life)
+			game->set_life(life);
+	}
+	if(cmb.usrflags & cflag2) //restore magic
+	{
+		zfix perc = cmb.c_attributes[9] / 100_zf;
+		word magic = word(int(perc * game->get_maxmagic()));
+		if(cmb.c_attributes[9] >= 100)
+			magic = game->get_maxmagic();
+		if(game->get_magic() < magic)
+			game->set_magic(magic);
+	}
+	uint save_menu = cmb.c_attributes[10].getTrunc() - 1;
+	bool continue_point = (scr->flags4&fSAVEROOM) != 0;
+	if (save_menu >= NUM_SAVE_MENUS || !QMisc.save_menus[save_menu].is_valid())
+		save_game(continue_point, save_type);
+	else
+		QMisc.save_menus[save_menu].run(nullopt, continue_point);
+}
+
+static byte copycat_id = 0;
+static bool _copycat_trig_cond(combo_trigger const& trig)
+{
+	return trig.trigcopycat == copycat_id && !trig.trigger_flags.get(TRIGFLAG_NO_COPYCAT_CAUSE);
+}
+static bool do_copycat_trigger(const combined_handle_t& comb_handle)
+{
+	if(!copycat_id) return false;
+	
+	return trig_each_combo_trigger(comb_handle, _copycat_trig_cond);
+}
+
+static int copycat_skip_lyr = -1, copycat_skip_ffc = -1;
+static rpos_t copycat_skip_rpos = rpos_t::None;
+
+void trig_copycat(byte copyid)
+{
+	if(copycat_id)
+		return;
+	copycat_id = copyid;
+
+	for_every_rpos([&](const rpos_handle_t& cc_rpos_handle) {
+		if (cc_rpos_handle.layer == copycat_skip_lyr && cc_rpos_handle.rpos == copycat_skip_rpos)
+			return;
+		do_copycat_trigger(cc_rpos_handle);
+	});
+
+	if (!get_qr(qr_OLD_FFC_FUNCTIONALITY))
+	{
+		for_every_ffc([&](const ffc_handle_t& ffc_handle) {
+			if (ffc_handle.i != copycat_skip_ffc)
+				do_copycat_trigger(ffc_handle);
+		});
+	}
+	copycat_id = 0;
+}
+
+static void trig_copycat(int cid, const combined_handle_t& handle, byte trigcopyid)
+{
+	if(copycat_id)
+		return;
+	if (handle.is_ffc())
+	{
+		auto& ffc_handle = handle.get_ffc();
+		if (!get_qr(qr_BROKEN_COPYCAT_SELF_TRIGGER) || ffc_handle.data() == cid) // Skip self
+			copycat_skip_ffc = ffc_handle.i;
+		trig_copycat(trigcopyid);
+		copycat_skip_ffc = -1;
+	}
+	else
+	{
+		auto& rpos_handle = handle.get_rpos();
+		if (!get_qr(qr_BROKEN_COPYCAT_SELF_TRIGGER) || rpos_handle.data() == cid) // Skip self
+		{
+			copycat_skip_lyr = rpos_handle.layer;
+			copycat_skip_rpos = rpos_handle.rpos;
+		}
+		trig_copycat(trigcopyid);
+		copycat_skip_lyr = -1;
+		copycat_skip_rpos = rpos_t::None;
+	}
+}
+
+static map<std::pair<int,rpos_t>, vector<byte>> large_copycat_ids;
+
+static bool handle_large_combo_copycat(const combined_handle_t& handle, combo_trigger const& trig, weapon* w)
+{
+	if (!handle.is_rpos())
+		return false;
+	if (trig.trigger_flags.get(TRIGFLAG_TRIGGER_LARGE_COMBO_COPYCAT))
+	{
+		byte id = trig.large_combo_copycat;
+		rect_t hitbox;
+		vector<combined_handle_t> handles;
+		calc_large_combo_handles(handle, hitbox, handles);
+		if (handles.empty())
+			return false;
+		auto& main_handle = handles[0];
+		const std::pair<int,rpos_t> identifier = {main_handle.get_layer(), rpos_t(main_handle.id())};
+		
+		if (util::contains(large_copycat_ids[identifier], id))
+			return false; // prevent unwanted recursion
+		large_copycat_ids[identifier].push_back(id);
+		for (auto const& large_handle : handles)
+		{
+			trig_each_combo_trigger(large_handle, [&, id](combo_trigger const& trig)
+				{
+					return trig.large_combo_copycat == id && trig.trigger_flags.get(TRIGFLAG_TRIGGERED_BY_LARGE_COMBO_COPYCAT);
+				}, 0, w);
+		}
+		util::remove_if_exists(large_copycat_ids[identifier], id);
+		return true;
+	}
+	return false;
+}
+
+void do_ex_trigger(const combined_handle_t& handle, size_t idx)
+{
+	int32_t cid = handle.data();
+	int32_t ocs = handle.cset();
+	auto& cmb = handle.combo();
+	if (cmb.triggers.size() <= idx) return;
+	auto& trig = cmb.triggers[idx];
+	bool is_active_screen = is_in_current_region(handle.base_scr());
+	
+	if (is_active_screen)
+		handle_large_combo_copycat(handle, trig, nullptr);
+	if (trig.trigcschange || trig.trigger_flags.get(TRIGFLAG_CSET_CHANGE_ABSOLUTE))
+	{
+		if (trig.trigger_flags.get(TRIGFLAG_CSET_CHANGE_ABSOLUTE))
+			handle.set_cset(trig.trigcschange & 0xF);
+		else handle.set_cset((ocs + trig.trigcschange) & 0xF);
+	}
+	if (trig.trigchange || trig.trigger_flags.get(TRIGFLAG_CMB_CHANGE_ABSOLUTE))
+	{
+		if (is_active_screen)
+			screen_combo_modify_preroutine(handle);
+		if (trig.trigger_flags.get(TRIGFLAG_CMB_CHANGE_ABSOLUTE))
+			handle.set_data(BOUND_COMBO(trig.trigchange));
+		else handle.set_data(BOUND_COMBO(cid + trig.trigchange));
+		if (is_active_screen)
+			screen_combo_modify_postroutine(handle);
+	}
+	
+	if (trig.trigger_flags.get(TRIGFLAG_RESETANIM))
+	{
+		auto& rcmb = combobuf[handle.data()];
+		rcmb.tile = rcmb.o_tile;
+		rcmb.cur_frame = 0;
+		rcmb.aclk = 0;
+		combo_caches::drawing.refresh(handle.data());
+	}
+
+	if (is_active_screen && trig.trigcopycat) //has a copycat set
+		trig_copycat(cid, handle, trig.trigcopycat);
+}
+
+bool force_ex_trigger(const combined_handle_t& handle, size_t idx, int8_t xstate)
+{
+	auto& cmb = handle.combo();
+	if (cmb.triggers.size() <= idx) return false;
+	auto& trig = cmb.triggers[idx];
+	if (trig.trigger_flags.get(TRIGFLAG_UNSETEXSTATE))
+		return false;
+	if (trig.exstate > -1 && (xstate < 0 || xstate == trig.exstate))
+	{
+		if (xstate >= 0 || getxmapflag(handle.get_screen(), 1 << trig.exstate))
+		{
+			do_ex_trigger(handle, idx);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool force_ex_trigger_any(const combined_handle_t& handle, int8_t xstate)
+{
+	auto cid = handle.data();
+	auto& cmb = handle.combo();
+	bool ret = false;
+	for (size_t idx = 0; idx < cmb.triggers.size(); ++idx)
+	{
+		if (force_ex_trigger(handle, idx, xstate))
+		{
+			ret = true;
+			if (handle.data() != cid) break;
+		}
+	}
+	return ret;
+}
+
+bool force_ex_door_trigger(const combined_handle_t& handle, size_t idx, int dir, uint ind)
+{
+	if (dir > 3 || ind > 7) return false;
+
+	auto& cmb = handle.combo();
+	if (cmb.triggers.size() <= idx) return false;
+	auto& trig = cmb.triggers[idx];
+	if (trig.trigger_flags.get(TRIGFLAG_UNSETEXDOOR))
+		return false;
+	if (trig.exdoor_dir > -1 && (dir < 0 || (dir == trig.exdoor_dir && ind == trig.exdoor_ind)))
+	{
+		if (dir >= 0 || getxdoor(handle.get_screen(), trig.exdoor_dir, trig.exdoor_ind))
+		{
+			do_ex_trigger(handle, idx);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool force_ex_door_trigger_any(const combined_handle_t& handle, int dir, uint ind)
+{
+	if (dir > 3 || ind > 7) return false;
+
+	auto cid = handle.data();
+	auto& cmb = handle.combo();
+	bool ret = false;
+	for (size_t idx = 0; idx < cmb.triggers.size(); ++idx)
+	{
+		if (force_ex_door_trigger(handle, idx, dir, ind))
+		{
+			ret = true;
+			if (handle.data() != cid) break;
+		}
+	}
+	return ret;
+}
+
+bool force_combopos_trigger(const combined_handle_t& handle, size_t idx, int mi)
+{
+	auto& cmb = handle.combo();
+	if (cmb.triggers.size() <= idx) return false;
+	auto& trig = cmb.triggers[idx];
+	if (!trig.trigger_flags.get(TRIGFLAG_COMBOPOSSTATE_CAUSE))
+		return false;
+	
+	auto& pos_states = handle.is_ffc() ? game->ffcpos_states : game->pos_states;
+	if (mi < 0)
+		mi = mapind(handle.base_scr());
+	auto posstate = pos_states.get(mi).get(handle.local_id());
+	if (posstate & (1 << trig.combopos_state))
+	{
+		do_ex_trigger(handle, idx);
+		return true;
+	}
+	return false;
+}
+
+bool force_combopos_trigger_any(const combined_handle_t& handle, int mi)
+{
+	auto cid = handle.data();
+	bool ret = false;
+	std::vector<int> visited_cids;
+	visited_cids.push_back(cid);
+	bool recheck = false;
+	do
+	{
+		auto& cmb = combobuf[cid];
+		recheck = false;
+		for (size_t idx = 0; idx < cmb.triggers.size(); ++idx)
+		{
+			if (force_combopos_trigger(handle, idx, mi))
+			{
+				ret = true;
+				if (handle.data() != cid)
+				{
+					cid = handle.data();
+					// Prevent infinite oscillation: if this cid was already visited, stop.
+					if (util::contains(visited_cids, cid))
+						break;
+					
+					visited_cids.push_back(cid);
+					recheck = true;
+					break;
+				}
+			}
+		}
+	}
+	while (recheck);
+	return ret;
+}
+
+static bool triggering_generic_secrets = false;
+static bool triggering_generic_switchstate = false;
+
+void do_weapon_fx(weapon* w, combo_trigger const& trig)
+{
+	if(!w) return;
+	if(trig.trigger_flags.get(TRIGFLAG_KILLWPN))
+		killgenwpn(w);
+	weapon_flags wflags = WFLAG_NONE;
+	if(trig.trigger_flags.get(TRIGFLAG_IGNITE_ANYFIRE))
+		wflags |= WFLAG_BURN_ANYFIRE;
+	if(trig.trigger_flags.get(TRIGFLAG_IGNITE_STRONGFIRE))
+		wflags |= WFLAG_BURN_STRONGFIRE;
+	if(trig.trigger_flags.get(TRIGFLAG_IGNITE_MAGICFIRE))
+		wflags |= WFLAG_BURN_MAGICFIRE;
+	if(trig.trigger_flags.get(TRIGFLAG_IGNITE_DIVINEFIRE))
+		wflags |= WFLAG_BURN_DIVINEFIRE;
+	bool ignite_state = !trig.trigger_flags.get(TRIGFLAG_UNIGNITE_WEAPONS);
+	SETFLAG(w->misc_wflags, wflags, ignite_state);
+}
+
+int32_t get_cmb_trigctrcost(combo_trigger const& trig)
+{
+	int32_t ctrcost = trig.trigctramnt;
+	if(!ctrcost) return ctrcost;
+	if(trig.trigger_flags.get(TRIGFLAG_COUNTERDISCOUNT))
+	{
+		auto wmedal_id = current_item_id(itype_wealthmedal);
+		if(valid_item_id(wmedal_id))
+		{
+			itemdata const& wmedal = itemsbuf.get(wmedal_id);
+			if(wmedal.flags & item_flag1)
+				ctrcost = (ctrcost * wmedal.misc1) / 100;
+			else
+				ctrcost += wmedal.misc1; // will be negative for discount
+			if(trig.trigctramnt > 0 && ctrcost < 0)
+				ctrcost = 1; // matching the behavior on room types
+		}
+	}
+	return ctrcost;
+}
+
+// Return true if the condition passes.
+static bool check_dark_trigger_conditional(bool is_active_screen, mapscr* scr, bool expect_lit)
+{
+	if (get_qr(qr_INVERTED_DARK_COMBO_TRIGGERS)) expect_lit = !expect_lit;
+	bool lit = is_active_screen ? get_lights(scr) : !(scr->flags&fDARK);
+	return expect_lit == lit;
+}
+
+static bool handle_trigger_conditionals(combined_handle_t const& comb_handle, size_t idx, bool& hasitem, bool side_effects = true)
+{
+	auto& cmb = comb_handle.combo();
+	if(cmb.triggers.size() <= idx) return false;
+
+	auto& trig = cmb.triggers[idx];
+	if (trig.trigger_flags.get(g_is_map_view  ? TRIGFLAG_MAPVIEW_NEVER : TRIGFLAG_MAPVIEW_ONLY)) return false;
+	auto [combo_x, combo_y] = comb_handle.xy();
+	auto [center_x, center_y] = comb_handle.center_xy();
+	zfix hero_x = Hero.getX(), hero_y = Hero.getY();
+	if (FFCore.ScrollingData[SCROLLDATA_DIR] > -1) // properly handle scrolling positions
+	{
+		hero_x = FFCore.ScrollingData[SCROLLDATA_NEW_HERO_X];
+		hero_y = FFCore.ScrollingData[SCROLLDATA_NEW_HERO_Y];
+	}
+	if (replay_version_check(0, 47))
+	{
+		combo_x = combo_x.getInt();
+		combo_y = combo_y.getInt();
+		center_x = center_x.getInt();
+		center_y = center_y.getInt();
+	}
+	mapscr* scr = comb_handle.base_scr();
+	
+	bool is_active_screen = is_in_current_region(scr);
+
+	// viewport range
+	{
+		bool on_screen = trig.trigger_flags.get(TRIGFLAG_VIEWPORT_REQ_ONSCREEN);
+		bool off_screen = trig.trigger_flags.get(TRIGFLAG_VIEWPORT_REQ_OFFSCREEN);
+		if (on_screen && off_screen)
+			return false;
+		if (on_screen || off_screen)
+		{
+			rect_t rect = rect_t(viewport);
+			rect.expand(trig.viewport_cond_range);
+			bool inside = rect.intersects_with(comb_handle.get_rect(false));
+			if (on_screen != inside)
+				return false;
+		}
+	}
+
+	if(trig.triggeritem) //Item requirement
+	{
+		hasitem = game->get_item(trig.triggeritem) && !item_disabled(trig.triggeritem)
+			&& checkbunny(trig.triggeritem);
+		if(trig.trigger_flags.get(TRIGFLAG_INVERTITEM))
+		{
+			if(hasitem) return false;
+		}
+		else if(!hasitem) return false;
+	}
+	if(trig.trigprox) //Proximity requirement
+	{
+		zfix hx = hero_x + 8;
+		zfix hy = hero_y + ((trig.trigger_flags.get(TRIGFLAG_PROX_USE_SOL_HITBOX) && !Hero.bigHitbox) ? 12 : 8);
+		dword d;
+		if (trig.trigger_flags.get(TRIGFLAG_PROX_USE_SQUARE))
+		{
+			int hd = abs(hx - center_x).getInt();
+			int vd = abs(hy - center_y).getInt();
+			d = zc_max(hd, vd);
+		}
+		else
+			d = dist(hx, hy, center_x, center_y).getInt();
+		if(trig.trigger_flags.get(TRIGFLAG_INVERTPROX)) //trigger outside the radius
+		{
+			if(d < trig.trigprox || !is_active_screen) //inside, cancel
+				return false;
+		}
+		else //trigger inside the radius
+		{
+			if(d >= trig.trigprox && is_active_screen) //outside, cancel
+				return false;
+		}
+	}
+	
+	if(trig.trigger_flags.any({TRIGFLAG_REQ_X_LE,TRIGFLAG_REQ_X_GE,
+		TRIGFLAG_REQ_Y_LE,TRIGFLAG_REQ_Y_GE,
+		TRIGFLAG_REQ_JUMP_LE,TRIGFLAG_REQ_JUMP_GE}))
+	{
+		auto targ_x = trig.req_player_x;
+		auto targ_y = trig.req_player_y;
+		
+		if(trig.trigger_flags.get(TRIGFLAG_REQ_X_REL))
+			targ_x += center_x - 8;
+		if(trig.trigger_flags.get(TRIGFLAG_REQ_Y_REL))
+			targ_y += center_y - 8;
+		
+		if(trig.trigger_flags.get(TRIGFLAG_REQ_X_LE))
+		{
+			if(hero_x > targ_x)
+				return false;
+		}
+		if(trig.trigger_flags.get(TRIGFLAG_REQ_X_GE))
+		{
+			if(hero_x < targ_x)
+				return false;
+		}
+		
+		if(trig.trigger_flags.get(TRIGFLAG_REQ_Y_LE))
+		{
+			if(hero_y > targ_y)
+				return false;
+		}
+		if(trig.trigger_flags.get(TRIGFLAG_REQ_Y_GE))
+		{
+			if(hero_y < targ_y)
+				return false;
+		}
+		
+		if(trig.trigger_flags.get(TRIGFLAG_REQ_JUMP_LE))
+		{
+			if(Hero.getJump() > trig.req_player_jump)
+				return false;
+		}
+		if(trig.trigger_flags.get(TRIGFLAG_REQ_JUMP_GE))
+		{
+			if(Hero.getJump() < trig.req_player_jump)
+				return false;
+		}
+	}
+	
+	if(trig.trigger_flags.get(TRIGFLAG_INVERT_PLAYER_Z))
+	{
+		if(Hero.z >= trig.req_player_z)
+			return false;
+	}
+	else
+	{
+		if(Hero.z < trig.req_player_z)
+			return false;
+	}
+	
+	if(trig.req_player_dir && !(trig.req_player_dir & (1 << Hero.dir)))
+		return false;
+	
+	if(trig.trigger_flags.get(TRIGFLAG_PLAYER_STANDING))
+		if(!Hero.isStanding(true))
+			return false;
+	if(trig.trigger_flags.get(TRIGFLAG_PLAYER_NOTSTANDING))
+		if(Hero.isStanding(true))
+			return false;
+	if(trig.trigger_flags.get(TRIGFLAG_COND_DARK))
+		if(!check_dark_trigger_conditional(is_active_screen, scr, false))
+			return false;
+	if(trig.trigger_flags.get(TRIGFLAG_COND_NODARK))
+		if(!check_dark_trigger_conditional(is_active_screen, scr, true))
+			return false;
+
+	mapscr* state_scr = scr;
+	if (trig.trigstatemap > 0)
+	{
+		if (trig.trigstatemap > map_count)
+		{
+			Z_error("Combo trigger expected map '%d', but map count is '%d'\n", trig.trigstatemap, map_count);
+			return false;
+		}
+		state_scr = &TheMaps[(trig.trigstatemap-1) * MAPSCRS + trig.trigstatescreen];
+	}
+	if (!(trig.req_screen_state.empty() && trig.unreq_screen_state.empty()))
+		for (int q = 0; q < mMAXIND; ++q)
+		{
+			if (trig.req_screen_state.get(q) && !getmapflag(state_scr, 1 << q))
+				return false;
+			if (trig.unreq_screen_state.get(q) && getmapflag(state_scr, 1 << q))
+				return false;
+		}
+	if (!(trig.req_screen_ex_state.empty() && trig.unreq_screen_ex_state.empty()))
+		for (int q = 0; q < 32; ++q)
+		{
+			if(trig.req_screen_ex_state.get(q) && !getxmapflag(state_scr, 1 << q))
+				return false;
+			if(trig.unreq_screen_ex_state.get(q) && getxmapflag(state_scr, 1 << q))
+				return false;
+		}
+	for (int dir = 0; dir < 4; ++dir)
+	{
+		if (!(trig.req_screen_ex_door[dir].empty() && trig.unreq_screen_ex_door[dir].empty()))
+			for (int q = 0; q < 8; ++q)
+			{
+				if (trig.req_screen_ex_door[dir].get(q) && !getxdoor(state_scr, dir, q))
+					return false;
+				if (trig.unreq_screen_ex_door[dir].get(q) && getxdoor(state_scr, dir, q))
+					return false;
+			}
+	}
+	
+	{
+		bool req = trig.trigger_flags.get(TRIGFLAG_COMBOPOSSTATE_REQ);
+		bool unreq = trig.trigger_flags.get(TRIGFLAG_COMBOPOSSTATE_UNREQ);
+		if (req && unreq)
+			return false;
+		if (req || unreq)
+		{
+			auto& pos_states = comb_handle.is_ffc() ? game->ffcpos_states : game->pos_states;
+			auto mi = mapind(scr);
+			byte posstate = pos_states.get(mi).get(comb_handle.local_id());
+			if (req != bool(posstate & (1 << trig.combopos_state)))
+				return false;
+		}
+	}
+
+	if (is_active_screen || trig.trigdmlevel > -1)
+	{
+		auto dmap_level = trig.trigdmlevel > -1 ? trig.trigdmlevel : dlevel;
+		if(trig.trigger_flags.get(TRIGFLAG_LITEM_COND))
+			if((trig.trig_levelitems & game->lvlitems.get(dmap_level)) != trig.trig_levelitems)
+				return false;
+		if(trig.trigger_flags.get(TRIGFLAG_LITEM_REVCOND))
+			if((trig.trig_levelitems & game->lvlitems.get(dmap_level)) == trig.trig_levelitems)
+				return false;
+		if((trig.req_level_state & game->lvlswitches.get(dmap_level)) != trig.req_level_state)
+			return false; // missing at least 1 required state
+		if(trig.unreq_level_state & game->lvlswitches.get(dmap_level))
+			return false; // has at least 1 un-required state
+		for(int q = 0; q < 256; ++q)
+		{
+			if(trig.req_global_state.get(q) && !game->gswitch_timers.get(q))
+				return false;
+			if(trig.unreq_global_state.get(q) && game->gswitch_timers.get(q))
+				return false;
+		}
+	}
+	
+	if (trig.chance_numerator < trig.chance_denominator || !trig.chance_numerator)
+	{
+		if (trig.chance_numerator <= 0 || trig.chance_denominator <= 0)
+			return false; // sanity check / account for '0 in N'
+		if (zc_rand(trig.chance_denominator - 1) >= trig.chance_numerator)
+			return false; // random roll failed (1 in 5 -> pick(0 <= n < 5) < 1 -> fail on >=)
+	}
+
+	// Everything checking for 'side_effects' should be below here
+	if(zfix ctrcost = get_cmb_trigctrcost(trig))
+	{
+		bool inf_ctr = false;
+		bool perc_ctr = trig.trigger_flags.get(TRIGFLAG_COUNTER_PERCENT);
+		bool partial = trig.trigger_flags.get(TRIGFLAG_COUNTER_PARTIAL_CONSUME);
+		zfix ctrval = get_ssc_ctr(trig.trigctr, &inf_ctr);
+		zfix ctrmax = get_ssc_ctrmax(trig.trigctr);
+		if(perc_ctr)
+			ctrcost = (ctrcost / 100) * ctrmax;
+		
+		if(side_effects && is_active_screen && trig.trigger_flags.get(TRIGFLAG_CTRNONLYTRIG) && trig.trigger_flags.get(TRIGFLAG_COUNTEREAT))
+		{
+			if (!inf_ctr && (partial || ctrval >= ctrcost))
+				modify_ssc_ctr(trig.trigctr, -ctrcost, trig.trigger_flags.get(TRIGFLAG_COUNTER_GRADUAL));
+		}
+		if(trig.trigger_flags.get(TRIGFLAG_COUNTERGE))
+		{
+			if(ctrval < ctrcost && !inf_ctr)
+				return false;
+		}
+		if(trig.trigger_flags.get(TRIGFLAG_COUNTERLT))
+		{
+			if(ctrval >= ctrcost || inf_ctr)
+				return false;
+		}
+	}
+
+	return true;
+}
+
+static void handle_trigger_results(const combined_handle_t& handle, combo_trigger const& trig, size_t idx,
+	bool& hasitem, bool& used_bit, int32_t special, cpos_info& timer, int32_t cid, int32_t ocs, weapon* w)
+{
+	mapscr* scr = handle.base_scr();
+	bool is_active_screen = is_in_current_region(scr);
+	auto [combo_x, combo_y] = handle.xy();
+	auto [center_x, center_y] = handle.center_xy();
+	if (replay_version_check(0, 47))
+	{
+		combo_x = combo_x.getInt();
+		combo_y = combo_y.getInt();
+		center_x = center_x.getInt();
+		center_y = center_y.getInt();
+	}
+	int screen = scr->screen;
+	if (is_active_screen)
+	{
+		if (trig.trigger_flags.get(TRIGFLAG_TOGGLEDARK))
+		{
+			toggle_lights(pal_litOVERRIDE);
+		}
+		if (trig.trigger_flags.get(TRIGFLAG_SECRETS))
+		{
+			used_bit = true;
+			if (!(special & ctrigSECRETS) && !triggering_generic_secrets)
+			{
+				triggering_generic_secrets = true;
+				trigger_secrets_for_screen(TriggerSource::GenericCombo, scr, false);
+				triggering_generic_secrets = false;
+				if (scr->secretsfx)
+					sfx(scr->secretsfx);
+			}
+			if (canPermSecret(cur_dmap, screen) && !(scr->flags5 & fTEMPSECRETS) && !getmapflag(screen, mSECRET))
+				setmapflag(scr, mSECRET);
+		}
+
+		if (trig.trigger_flags.get(TRIGFLAG_LEVELSTATE))
+		{
+			used_bit = true;
+			if (!(special & ctrigSWITCHSTATE) && !triggering_generic_switchstate)
+			{
+				triggering_generic_switchstate = true;
+				game->lvlswitches[dlevel] ^= 1 << trig.trig_lstate;
+				toggle_switches(1 << trig.trig_lstate, false);
+				triggering_generic_switchstate = false;
+			}
+		}
+		if (trig.trigger_flags.get(TRIGFLAG_GLOBALSTATE))
+		{
+			used_bit = true;
+			if (!(special & ctrigSWITCHSTATE) && !triggering_generic_switchstate)
+			{
+				int tmr = trig.trig_statetime, pair = trig.trig_gstate;
+				bool oldstate = game->gswitch_timers.get(pair) != 0;
+				if (tmr > 0)
+				{
+					game->gswitch_timers[pair] = tmr;
+				}
+				else
+				{
+					if (game->gswitch_timers.get(pair))
+						game->gswitch_timers[pair] = 0;
+					else game->gswitch_timers[pair] = -1;
+				}
+				if (oldstate != (game->gswitch_timers.get(pair) != 0))
+				{
+					triggering_generic_switchstate = true;
+					toggle_gswitches(pair, false);
+					triggering_generic_switchstate = false;
+				}
+			}
+		}
+
+		if (trig.trigsfx)
+		{
+			if (trig.trigger_flags.get(TRIGFLAG_SFX_KILL))
+				stop_sfx(trig.trigsfx);
+			else
+			{
+				int pan_val = trig.sfx_pan < 0 ? pan(combo_x) : trig.sfx_pan;
+				sfx_ex(trig.trigsfx, pan_val, trig.trigger_flags.get(TRIGFLAG_SFX_LOOP),
+					!trig.trigger_flags.get(TRIGFLAG_SFX_NO_RESTART), trig.sfx_volume, trig.sfx_frequency);
+			}
+		}
+
+		if (trig.trigger_flags.get(TRIGFLAG_KILLENEMIES))
+			kill_em_all();
+		if (trig.trigger_flags.get(TRIGFLAG_CLEARENEMIES))
+			guys.clear(true);
+		if (trig.trigger_flags.get(TRIGFLAG_CLEARLWEAPONS))
+			Lwpns.clear(true);
+		if (trig.trigger_flags.get(TRIGFLAG_CLEAREWEAPONS))
+			Ewpns.clear(true);
+
+		if (trig.triggeritem && hasitem && trig.trigger_flags.get(TRIGFLAG_CONSUMEITEM))
+		{
+			takeitem(trig.triggeritem);
+		}
+		if (!trig.trigger_flags.get(TRIGFLAG_CTRNONLYTRIG) && trig.trigger_flags.get(TRIGFLAG_COUNTEREAT))
+		{
+			if (zfix ctrcost = get_cmb_trigctrcost(trig))
+			{
+				bool inf_ctr = false;
+				bool perc_ctr = trig.trigger_flags.get(TRIGFLAG_COUNTER_PERCENT);
+				bool partial = trig.trigger_flags.get(TRIGFLAG_COUNTER_PARTIAL_CONSUME);
+				zfix ctrval = get_ssc_ctr(trig.trigctr, &inf_ctr);
+				zfix ctrmax = get_ssc_ctrmax(trig.trigctr);
+				if (perc_ctr)
+					ctrcost = (ctrcost / 100) * ctrmax;
+				if (!inf_ctr && (partial || ctrval >= ctrcost))
+					modify_ssc_ctr(trig.trigctr, -ctrcost, trig.trigger_flags.get(TRIGFLAG_COUNTER_GRADUAL));
+			}
+		}
+		bool trigexstate = true;
+		if (trig.spawnenemy)
+		{
+			enemy* enm = nullptr;
+			bool enm_ex = trig.trigger_flags.get(TRIGFLAG_EXSTENEMY);
+			word numcreated = addenemy(screen, combo_x, combo_y, trig.spawnenemy, -10);
+			if (numcreated)
+			{
+				word index = guys.Count() - numcreated;
+				enm = (enemy*)guys.spr(index);
+			}
+			if (enm_ex)
+			{
+				trigexstate = false;
+				if (enm)
+				{
+					enm->deathexstate = trig.exstate;
+				}
+			}
+		}
+		if (trig.spawnitem)
+		{
+			bool itm_ex = trig.trigger_flags.get(TRIGFLAG_EXSTITEM);
+			bool specitem = trig.trigger_flags.get(TRIGFLAG_SPCITEM);
+			if (specitem && getmapflag(screen, mSPECIALITEM))
+			{
+				//already collected
+				if (itm_ex) trigexstate = true;
+			}
+			else
+			{
+				const int32_t allowed_pflags = ipHOLDUP | ipTIMER | ipSECRETS | ipCANGRAB;
+				int32_t pflags = trig.spawnip & allowed_pflags;
+				SETFLAG(pflags, ipONETIME2, specitem);
+				int32_t item_id = trig.spawnitem;
+				if (item_id < 0)
+				{
+					item_id = select_dropitem(-item_id);
+				}
+				item* itm = nullptr;
+				if (valid_item_id(item_id))
+				{
+					itm = new item(combo_x, combo_y, 0, item_id, pflags, 0);
+					items.add(itm);
+				}
+				if (itm_ex)
+				{
+					trigexstate = false;
+					if (itm) itm->pickupexstate = trig.exstate;
+				}
+				if (trig.trigger_flags.get(TRIGFLAG_AUTOGRABITEM))
+				{
+					if (itm) itm->set_forcegrab(true);
+				}
+			}
+		}
+
+		//Level Item stuff
+		{
+			auto dmap_level = trig.trigdmlevel > -1 ? trig.trigdmlevel : dlevel;
+			bool _set = trig.trigger_flags.get(TRIGFLAG_LITEM_SET),
+				_unset = trig.trigger_flags.get(TRIGFLAG_LITEM_UNSET);
+			if (_set && _unset) //toggle
+				game->lvlitems[dmap_level] ^= trig.trig_levelitems;
+			else if (_set)
+				game->lvlitems[dmap_level] |= trig.trig_levelitems;
+			else if (_unset)
+				game->lvlitems[dmap_level] &= ~trig.trig_levelitems;
+		}
+
+		//Graphical stuff
+		{
+			if (trig.trigger_flags.get(TRIGFLAG_TINT_CLEAR))
+				doClearTint();
+			if (trig.trigtint[0] || trig.trigtint[1] || trig.trigtint[2])
+				doTint(trig.trigtint[0], trig.trigtint[1], trig.trigtint[2]);
+			if (trig.triglvlpalette > -1)
+				loadlvlpal(trig.triglvlpalette);
+			else if (trig.triglvlpalette == -2)
+				loadlvlpal(scr->color);
+			if (trig.trigbosspalette > -1)
+				loadpalset(csBOSS, pSprite(trig.trigbosspalette));
+			if (trig.trigquaketime > -1)
+				quakeclk = trig.trigquaketime;
+			if (trig.trigwavytime > -1)
+				wavy = trig.trigwavytime;
+		}
+
+		//Status Effects
+		{
+			if (trig.trig_swjinxtime > -2)
+				Hero.setSwordClk(trig.trig_swjinxtime);
+			if (trig.trig_itmjinxtime > -2)
+				Hero.setItemClk(trig.trig_itmjinxtime);
+			if (trig.trig_shieldjinxtime > -2)
+				Hero.setShieldClk(trig.trig_shieldjinxtime);
+			if (trig.trig_stuntime > -2)
+				Hero.setStunClock(trig.trig_stuntime);
+			if (trig.trig_bunnytime == -1)
+				Hero.setBunnyClock(-2); // '-1' is normally used for the dmap bunny effect
+			else if (trig.trig_bunnytime > -2)
+				Hero.setBunnyClock(trig.trig_bunnytime);
+		}
+		
+		if (trig.play_music > -2)
+		{
+			if (trig.play_music == -1)
+				playLevelMusic();
+			else if (unsigned(trig.play_music - 1) < quest_music.size())
+				quest_music[trig.play_music - 1].play();
+			else
+				music_stop();
+		}
+		if (trig.set_music_refresh > -1)
+		{
+			FFCore.music_update_cond = trig.set_music_refresh;
+			FFCore.music_update_flags |= MUSIC_UPDATE_FLAG_REVERT;
+		}
+
+		if (trig.exstate > -1)
+		{
+			if (trig.trigger_flags.get(TRIGFLAG_UNSETEXSTATE))
+				unsetxmapflag(screen, 1 << trig.exstate);
+			else if (trigexstate)
+				setxmapflag(screen, 1 << trig.exstate);
+		}
+		if (trig.exdoor_dir > -1)
+		{
+			if (trig.trigger_flags.get(TRIGFLAG_UNSETEXDOOR))
+				set_xdoorstate(screen, trig.exdoor_dir, trig.exdoor_ind, false);
+			else
+				set_xdoorstate(screen, trig.exdoor_dir, trig.exdoor_ind);
+		}
+		{
+			bool do_set = trig.trigger_flags.get(TRIGFLAG_COMBOPOSSTATE_SET);
+			bool do_unset = trig.trigger_flags.get(TRIGFLAG_COMBOPOSSTATE_UNSET);
+			if (do_set || do_unset)
+			{
+				auto& pos_states = handle.is_ffc() ? game->ffcpos_states : game->pos_states;
+				auto mi = mapind(scr);
+				byte& pos_state = pos_states[mi][handle.local_id()];
+				byte flag = 1 << trig.combopos_state;
+				if (do_set && do_unset)
+					pos_state ^= flag;
+				else
+					SETFLAG(pos_state, flag, do_set);
+			}
+		}
+
+		if (trig.trigger_flags.get(TRIGFLAG_REVERT_GRAVITY))
+		{
+			auto* canonical_screen = get_canonical_scr(scr->map, scr->screen);
+			CPYFLAG(scr->flags10, fSCREEN_GRAVITY, canonical_screen->flags10);
+			scr->screen_gravity = canonical_screen->screen_gravity;
+			scr->screen_terminal_v = canonical_screen->screen_terminal_v;
+		}
+		else if (trig.trigger_flags.get(TRIGFLAG_SET_GRAVITY))
+		{
+			scr->flags10 |= fSCREEN_GRAVITY;
+			scr->screen_gravity = trig.trig_gravity;
+			scr->screen_terminal_v = trig.trig_terminal_v;
+		}
+		
+		if (trig.trigger_flags.get(TRIGFLAG_RESPAWN_HERE))
+			Hero.force_respawn_point(handle);
+		if (trig.trigger_flags.get(TRIGFLAG_RESET_RESPAWN))
+			Hero.forced_respawn_point = false;
+		
+		if (handle_large_combo_copycat(handle, trig, w))
+			used_bit = true;
+	}
+	
+	if (trig.trigcschange || trig.trigger_flags.get(TRIGFLAG_CSET_CHANGE_ABSOLUTE))
+	{
+		used_bit = true;
+		if (trig.trigger_flags.get(TRIGFLAG_CSET_CHANGE_ABSOLUTE))
+			handle.set_cset(trig.trigcschange & 0xF);
+		else handle.set_cset((ocs + trig.trigcschange) & 0xF);
+	}
+	if (trig.trigchange || trig.trigger_flags.get(TRIGFLAG_CMB_CHANGE_ABSOLUTE))
+	{
+		used_bit = true;
+		if (is_active_screen)
+			screen_combo_modify_preroutine(handle);
+		if (trig.trigger_flags.get(TRIGFLAG_CMB_CHANGE_ABSOLUTE))
+			handle.set_data(BOUND_COMBO(trig.trigchange));
+		else handle.set_data(BOUND_COMBO(cid + trig.trigchange));
+		if (is_active_screen)
+			screen_combo_modify_postroutine(handle);
+	}
+
+	if (is_active_screen)
+	{
+		if (trig.trigger_flags.get(TRIGFLAG_RESETANIM))
+		{
+			newcombo& rcmb = combobuf[handle.data()];
+			rcmb.tile = rcmb.o_tile;
+			rcmb.cur_frame = 0;
+			rcmb.aclk = 0;
+			combo_caches::drawing.refresh(handle.data());
+		}
+
+		if (trig.trigcopycat) //has a copycat set
+		{
+			used_bit = true;
+			trig_copycat(cid, handle, trig.trigcopycat);
+		}
+
+		if (handle.is_ffc() && (handle.get_ffc().ffc->flags & ffc_changer))
+			timer.updateData(-1);
+		else timer.updateData(handle.data());
+
+		if (trig.trigcooldown)
+			timer.trig_data[idx].cooldown = trig.trigcooldown;
+
+		if (trig.player_bounce)
+			Hero.setJump(trig.player_bounce);
+
+		if (trig.trigger_flags.get(TRIGFLAG_SETPLAYER_X_ABS))
+			Hero.setXfix(trig.dest_player_x);
+		else if (trig.trigger_flags.get(TRIGFLAG_SETPLAYER_X_REL_CMB))
+			Hero.setXfix(trig.dest_player_x + center_x - 8);
+		else if (trig.dest_player_x)
+			Hero.setXfix(Hero.getX() + trig.dest_player_x);
+
+		if (trig.trigger_flags.get(TRIGFLAG_SETPLAYER_Y_ABS))
+			Hero.setYfix(trig.dest_player_y);
+		else if (trig.trigger_flags.get(TRIGFLAG_SETPLAYER_Y_REL_CMB))
+			Hero.setYfix(trig.dest_player_y + center_y - 8);
+		else if (trig.dest_player_y)
+			Hero.setYfix(Hero.getY() + trig.dest_player_y);
+
+		if (trig.trigger_flags.get(TRIGFLAG_SETPLAYER_Z_ABS))
+			Hero.setZfix(trig.dest_player_z);
+		else if (trig.dest_player_z)
+			Hero.setZfix(Hero.getZ() + trig.dest_player_z);
+
+		if (trig.dest_player_dir > -1)
+			Hero.setDir(trig.dest_player_dir);
+
+		if (trig.force_ice_combo > -1)
+			Hero.script_ice_combo = trig.force_ice_combo;
+		if (trig.trigger_flags.any({ TRIGFLAG_FORCE_ICE_VX,TRIGFLAG_FORCE_ICE_VY }))
+		{
+			optional<zfix> vx, vy;
+			if (trig.trigger_flags.get(TRIGFLAG_FORCE_ICE_VX))
+				vx = trig.force_ice_vx;
+			if (trig.trigger_flags.get(TRIGFLAG_FORCE_ICE_VY))
+				vy = trig.force_ice_vy;
+			Hero.force_ice_velocity(vx, vy);
+		}
+	}
+}
+
+
+// Tried to use a set<combined_handle_t, size_t>, but it kept returning true for `.contains()` if the set was non-empty regardless the input.
+// Instead, we use a struct that minimally uniquely identifies a trigger.
+struct active_trigger_data
+{
+	bool is_rpos;
+	size_t id;
+	int layer; // only used by rpos_handle_t
+	size_t idx;
+	
+	active_trigger_data(combined_handle_t const& handle, size_t idx)
+		: idx(idx)
+	{
+		id = handle.id();
+		if (handle.is_rpos())
+		{
+			is_rpos = true;
+			layer = handle.get_rpos().layer;
+		}
+		else
+		{
+			is_rpos = false;
+			layer = -1;
+		}
+	}
+
+	bool operator<(active_trigger_data const& other) const
+	{
+		if (is_rpos != other.is_rpos)
+			return is_rpos; // rpos_handle_t < ffc_handle_t
+
+		if (layer != other.layer)
+			return layer < other.layer;
+
+		if (id != other.id)
+			return id < other.id;
+
+		return idx < other.idx;
+	}
+	bool operator==(active_trigger_data const& other) const = default;
+};
+static std::set<active_trigger_data> active_triggers;
+
+static bool _do_trigger_combo(const combined_handle_t& handle, size_t idx, int32_t special, weapon* w)
+{
+	if (handle.is_ffc() && get_qr(qr_OLD_FFC_FUNCTIONALITY)) return false;
+	auto& cmb = handle.combo();
+	if(cmb.triggers.size() <= idx) return false;
+	auto& trig = cmb.triggers[idx];
+	
+	ffc_handle_t const* ffc_handle = nullptr;
+	rpos_handle_t const* rpos_handle = nullptr;
+	if (handle.is_ffc())
+	{
+		ffc_handle = &handle.get_ffc();
+	}
+	else rpos_handle = &handle.get_rpos();
+	
+	if (ffc_handle && (ffc_handle->ffc->flags & ffc_changer))
+		return false; //Changers can't trigger!
+	
+	int32_t cid = handle.data();
+	int32_t ocs = handle.cset();
+	auto [combo_x, combo_y] = handle.xy();
+
+	mapscr* base_scr = handle.base_scr();
+	bool hasitem = false;
+	if(w && trig.trigger_flags.get(TRIGFLAG_SEPARATEWEAPON))
+	{
+		do_weapon_fx(w,trig);
+		return true;
+	}
+	
+	int32_t flag = handle.sflag();
+	int32_t flag2 = cmb.flag;
+	
+	bool check_bit = false;
+	bool used_bit = false;
+	
+	bool force_ex_ret = false;
+	for(size_t idx = 0; idx < cmb.triggers.size(); ++idx)
+	{
+		auto& ex_trig = cmb.triggers[idx];
+		if(ex_trig.exstate > -1 && !ex_trig.trigger_flags.get(TRIGFLAG_UNSETEXSTATE))
+		{
+			if (force_ex_trigger(handle, idx))
+			{
+				force_ex_ret = true;
+				if(handle.data() != cid) break;
+			}
+		}
+		if(ex_trig.exdoor_dir > -1 && !ex_trig.trigger_flags.get(TRIGFLAG_UNSETEXDOOR))
+		{
+			if(force_ex_door_trigger(handle, idx))
+			{
+				force_ex_ret = true;
+				if(handle.data() != cid) break;
+			}
+		}
+		if (ex_trig.trigger_flags.get(TRIGFLAG_COMBOPOSSTATE_CAUSE))
+		{
+			if (force_combopos_trigger(handle, idx))
+			{
+				force_ex_ret = true;
+				if(handle.data() != cid) break;
+			}
+		}
+	}
+	if(force_ex_ret)
+		return true;
+	
+	if(!handle_trigger_conditionals(handle, idx, hasitem))
+	{
+		trigger_string(trig, false, handle.get_screen());
+		return false;
+	}
+	
+	if (w)
+	{
+		if (ffc_handle)
+			check_bit = w->ffcs_checked.contains(ffc_handle->ffc);
+		else if(rpos_handle)
+			check_bit = w->rposes_checked.contains({rpos_handle->layer, rpos_handle->rpos});
+	}
+	
+	static cpos_info null_info;
+	bool is_active_screen = is_in_current_region(base_scr);
+	cpos_info& timer = is_active_screen ? handle.info() : null_info;
+
+	bool dorun = !timer.trig_data.get(idx).cooldown;
+	if(dorun)
+	{
+		if (is_active_screen && (trig.trigger_flags.get(TRIGFLAG_CMBTYPEFX) || alwaysCTypeEffects(cmb.type)))
+		{
+			switch(cmb.type)
+			{
+				case cSCRIPT1: case cSCRIPT2: case cSCRIPT3: case cSCRIPT4: case cSCRIPT5:
+				case cSCRIPT6: case cSCRIPT7: case cSCRIPT8: case cSCRIPT9: case cSCRIPT10:
+				case cTRIGGERGENERIC:
+					if (ffc_handle)
+					{
+						if(w)
+							do_generic_combo_ffc(w, *ffc_handle, cid, flag2);
+						else do_generic_combo_ffc2(*ffc_handle, cid, flag2);
+					}
+					else
+					{
+						if(w)
+							do_generic_combo(*rpos_handle, w, (w->useweapon > 0) ? w->useweapon : w->id, cid, flag, flag2, cmb.c_attributes[11].getTrunc(), false);
+						else do_generic_combo2(combo_x, combo_y, cid, flag, flag2, cmb.c_attributes[11].getTrunc(), *rpos_handle, false);
+					}
+					break;
+				case cCUSTOMBLOCK:
+					if(!w) break;
+					killgenwpn(w);
+					if(cmb.c_attributes[8].getTrunc())
+						sfx(cmb.c_attributes[8].getTrunc());
+					break;
+			}
+			if(!check_bit)
+			{
+				used_bit = true;
+				switch(cmb.type)
+				{
+					case cCUTSCENEEFFECT:
+						do_cutscene_effect(handle);
+						break;
+					case cCUTSCENETRIG:
+						do_cutscene_flags(cmb);
+						break;
+					case cCSWITCH:
+						do_cswitch_combo(cmb, w);
+						break;
+					
+					case cCSWITCHBLOCK:
+						trigger_cswitch_block(handle);
+						break;
+					
+					case cSIGNPOST:
+						if(!(special & ctrigIGNORE_SIGN))
+							trigger_sign(cmb, handle.get_screen());
+						break;
+					
+					case cSLASH: case cSLASHITEM: case cBUSH: case cFLOWERS: case cTALLGRASS:
+					case cTALLGRASSNEXT:case cSLASHNEXT: case cSLASHNEXTITEM: case cBUSHNEXT:
+					case cSLASHTOUCHY: case cSLASHITEMTOUCHY: case cBUSHTOUCHY: case cFLOWERSTOUCHY:
+					case cTALLGRASSTOUCHY: case cSLASHNEXTTOUCHY: case cSLASHNEXTITEMTOUCHY:
+					case cBUSHNEXTTOUCHY:
+						trigger_cuttable(handle);
+						break;
+						
+					case cSTEP: case cSTEPSAME: case cSTEPALL:
+						if(!trigger_step(handle))
+							return false;
+						break;
+					
+					case cSTAIR: case cSTAIRB: case cSTAIRC: case cSTAIRD: case cSTAIRR:
+					case cSWIMWARP: case cSWIMWARPB: case cSWIMWARPC: case cSWIMWARPD:
+					case cDIVEWARP: case cDIVEWARPB: case cDIVEWARPC: case cDIVEWARPD:
+					case cPIT: case cPITB: case cPITC: case cPITD: case cPITR:
+					case cAWARPA: case cAWARPB: case cAWARPC: case cAWARPD: case cAWARPR:
+					case cSWARPA: case cSWARPB: case cSWARPC: case cSWARPD: case cSWARPR:
+						trigger_warp(handle);
+						break;
+					
+					case cCHEST: case cLOCKEDCHEST: case cBOSSCHEST:
+						if(!trigger_chest(handle))
+							return false;
+						break;
+					case cLOCKBLOCK: case cBOSSLOCKBLOCK:
+						if(!trigger_lockblock(handle))
+							return false;
+						break;
+					
+					case cARMOS: case cBSGRAVE: case cGRAVE:
+						if(!trigger_armos_grave(handle))
+							return false;
+						break;
+					
+					case cDAMAGE1: case cDAMAGE2: case cDAMAGE3: case cDAMAGE4:
+					case cDAMAGE5: case cDAMAGE6: case cDAMAGE7:
+						if (ffc_handle)
+							trigger_damage_combo(handle, ZSD_FFC, ffc_handle->ffc_id);
+						else if (rpos_handle)
+							trigger_damage_combo(handle, ZSD_COMBOPOS, int(rpos_handle->rpos)*10000);
+						break;
+					
+					case cSTEPSFX:
+						trigger_stepfx(handle);
+						break;
+					
+					case cSWITCHHOOK:
+						if(!trigger_switchhookblock(handle))
+							return false;
+						break;
+					
+					case cSHOOTER:
+						if(!trigger_shooter(handle))
+							return false;
+						break;
+					case cSAVE: case cSAVE2:
+						trigger_save(cmb, base_scr);
+						break;
+					case cSPINTILE1:
+						awaken_spinning_tile(handle, false);
+						break;
+					default:
+						used_bit = false;
+				}
+			}
+		}
+		
+		if(!check_bit)
+			handle_trigger_results(handle, trig, idx, hasitem, used_bit, special, timer, cid, ocs, w);
+		
+		if (w && used_bit)
+		{
+			if(ffc_handle)
+				w->ffcs_checked.insert(ffc_handle->ffc);
+			else if(rpos_handle)
+				w->rposes_checked.insert({rpos_handle->layer, rpos_handle->rpos});
+		}
+	}
+	
+	if(w)
+		do_weapon_fx(w,trig);
+	
+	if (is_active_screen && dorun && !check_bit)
+	{
+		if(trig.trig_genscr)
+			FFCore.runGenericFrozenEngine(trig.trig_genscr);
+		trigger_string(trig, true, handle.get_screen());
+	}
+	return true;
+}
+// Triggers a combo at a given position (including ffcs)
+bool do_trigger_combo(const combined_handle_t& handle, size_t idx, int32_t special, weapon* w)
+{
+	if (get_qr(qr_BROKEN_SELF_TRIGGERING_TRIGGERS))
+		return _do_trigger_combo(handle, idx, special, w);
+	
+	// Don't let a trigger trigger itself via it's own effects
+	active_trigger_data data(handle, idx);
+	if (active_triggers.contains(data)) return false;
+	active_triggers.emplace(data);
+	auto ret = _do_trigger_combo(handle, idx, special, w);
+	active_triggers.erase(data);
+	return ret;
+}
+
+static bool _ctype_causes_trig_cond(combo_trigger const& trig)
+{
+	return trig.trigger_flags.get(TRIGFLAG_CMBTYPECAUSES);
+}
+bool do_trigger_ctype_causes(const combined_handle_t& comb_handle)
+{
+	return trig_each_combo_trigger(comb_handle, _ctype_causes_trig_cond);
+}
+
+bool check_trig_conditions(const combined_handle_t& comb_handle, size_t idx)
+{
+	bool hasitem = false;
+	return handle_trigger_conditionals(comb_handle, idx, hasitem, false);
+}
+
+static void set_lift_undercombo(combined_handle_t const& handle)
+{
+	auto& cmb = handle.combo();
+	handle.set_data(cmb.liftundercmb);
+	if(!(cmb.liftflags & LF_NOUCSET))
+		handle.set_cset(cmb.liftundercs);
+	handle.set_sflag(0);
+}
+bool do_lift_combo(const combined_handle_t& base_handle, int32_t gloveid)
+{
+	if (invalid_item_id(gloveid)) return false;
+	if(!Hero.can_lift(gloveid)) return false;
+	if(Hero.lift_wpn) return false;
+	rect_t hitbox;
+	vector<combined_handle_t> handles;
+	bool large_liftable = base_handle.combo().liftflags & LF_LARGE_LIFTABLE;
+	if (large_liftable)
+	{
+		calc_large_combo_handles(base_handle, hitbox, handles);
+	}
+	else
+	{
+		handles.push_back(base_handle);
+		hitbox = base_handle.get_rect(true);
+	}
+	
+	if (handles.empty()) return false;
+	auto const& handle = handles[0];
+	auto& cmb = handle.combo();
+	if(!(cmb.liftflags & LF_LIFTABLE)) return false;
+	
+	itemdata const& glove = itemsbuf.get(gloveid);
+	if(cmb.liftlvl > glove.level) return false;
+
+	zfix center_x = hitbox.left() + hitbox.width() / 2_zf;
+	zfix center_y = hitbox.top() + hitbox.height() / 2_zf;
+
+	//Able to lift, run effects
+	if(cmb.liftsfx) sfx(cmb.liftsfx,pan(center_x));
+	else if(glove.usesound) sfx(glove.usesound,pan(center_x));
+	
+	int32_t dropitem = -1, dropset = -1;
+	bool hasitem = cmb.liftitm>0;
+	auto pflags = ipBIGRANGE | ((cmb.liftflags&LF_SPECIALITEM) ? ipONETIME2 : ipTIMER);
+	if(hasitem)
+	{
+		if(cmb.liftflags & LF_DROPSET)
+			dropset = cmb.liftitm;
+		else dropitem = cmb.liftitm;
+	}
+	
+	if(hasitem && (cmb.liftflags&LF_SPECIALITEM) && getmapflag(handle.get_screen(), mSPECIALITEM))
+	{
+		hasitem = false;
+		dropitem = dropset = -1;
+	}
+	
+	if(hasitem && (cmb.liftflags & LF_DROPONLIFT))
+	{
+		if(dropset > -1) dropitem = select_dropitem(dropset);
+		if(dropitem > -1)
+		{
+			item* itm = (new item(center_x - 8, center_y - 8,(zfix)0, dropitem, pflags, 0));
+			itm->from_dropset = dropset;
+			items.add(itm);
+		}
+	}
+	
+	weapon* w = nullptr;
+	word prntid = cmb.lift_parent_item;
+	int wlvl = 0, wtype = wThrown;
+	if (prntid && valid_item_id(prntid))
+	{
+		itemdata const& prntitm = itemsbuf.get(prntid);
+		switch(prntitm.type)
+		{
+			case itype_bomb:
+				wtype = wLitBomb;
+				wlvl = prntitm.level;
+				break;
+			case itype_sbomb:
+				wtype = wLitSBomb;
+				wlvl = prntitm.level;
+				break;
+			default:
+				prntid = gloveid;
+				break;
+		}
+	}
+	else prntid = gloveid;
+	w = new weapon(hitbox.left(), hitbox.top(), 0, wtype, wlvl, cmb.liftdmg*game->get_hero_dmgmult(),
+		oppositeDir[NORMAL_DIR(HeroDir())], prntid, Hero.getUID(), false, 0, 1);
+	if (large_liftable)
+	{
+		w->txsz = (w->hit_width = hitbox.width()) / 16;
+		w->tysz = (w->hit_height = hitbox.height()) / 16;
+	}
+	if (w->txsz > 1 || w->tysz > 1)
+		w->extend = 3;
+	if(hasitem && !(cmb.liftflags & LF_DROPONLIFT))
+	{
+		w->death_spawnitem = dropitem;
+		w->death_spawndropset = dropset;
+		w->death_item_pflags = pflags;
+	}
+	int32_t cid = handle.data();
+	int32_t cset = handle.cset();
+	switch(cmb.liftgfx)
+	{
+		case 0: //This combo
+		{
+			w->LOADGFX_CMB(cid,cset);
+			break;
+		}
+		case 1: //Other combo
+		{
+			auto lcs = (cmb.liftflags & LF_NOWPNCMBCSET) ? cset : cmb.liftcs;
+			w->LOADGFX_CMB(cmb.liftcmb,lcs);
+			break;
+		}
+		case 2: //Sprite Data
+		{
+			w->LOADGFX(cmb.liftsprite);
+			break;
+		}
+	}
+	
+	w->death_sprite = cmb.liftbreaksprite;
+	w->death_sfx = cmb.liftbreaksfx;
+	
+	w->load_weap_data(cmb.lift_weap_data.get());
+	
+	Hero.lift(w, cmb.lifttime, cmb.lifthei);
+	
+	if (!large_liftable)
+		set_lift_undercombo(handle);
+	else for (auto const& tmp_handle : handles)
+	{
+		auto& tmp_cmb = tmp_handle.combo();
+		if (tmp_cmb.liftflags & LF_LARGE_LIFTABLE)
+			set_lift_undercombo(tmp_handle);
+	}
+	return true;
+}
+
+static void handle_shooter(newcombo const& cmb, cpos_info& timer, zfix wx, zfix wy)
+{
+	int32_t lowrate = zc_max(0,cmb.c_attributes[16].getTrunc());
+	int32_t highrate = zc_max(0,cmb.c_attributes[17].getTrunc());
+	bool splitrate = cmb.usrflags&cflag2;
+	bool instashot = cmb.usrflags&cflag3;
+	if(splitrate)
+	{
+		if(lowrate > highrate) return;
+		if(lowrate == highrate) splitrate = false;
+	}
+	if(!splitrate)
+	{
+		if(!lowrate) return;
+	}
+	
+	if(timer.type_clk > 1)
+	{
+		if(--timer.type_clk == 1)
+		{
+			if(!instashot) trigger_shooter(cmb, wx, wy);
+		}
+	}
+	else
+	{
+		auto rate = (splitrate ? zc_rand(highrate,lowrate) : lowrate);
+		timer.type_clk = zc_max(1,rate);
+		if(instashot || timer.type_clk == 1) trigger_shooter(cmb, wx, wy);
+	}
+}
+
+static void handle_shooter(newcombo const& cmb, cpos_info& timer, rpos_t rpos)
+{
+	auto [x, y] = COMBOXY_REGION(rpos);
+	handle_shooter(cmb, timer, x, y);
+}
+
+static void trigger_crumble(newcombo const& cmb, cpos_info& timer, word& cid)
+{
+	++cid;
+	timer.updateData(cid);
+	//Continue crumbling through the change
+	newcombo const& ncmb = combobuf[cid];
+	if(ncmb.type == cCRUMBLE && (cmb.usrflags&cflag1)
+		&& (ncmb.c_attributes[8].getTrunc() == CMBTY_CRUMBLE_INEVITABLE))
+		timer.crumbling = true;
+}
+
+static bool handle_crumble(newcombo const& cmb, cpos_info& timer, word& cid, zfix x, zfix y, zfix w, zfix h)
+{
+	bool breaking = false;
+	auto ty = cmb.c_attributes[8].getTrunc();
+	if(ty == CMBTY_CRUMBLE_INEVITABLE)
+		if(timer.crumbling)
+			breaking = true;
+	if(!breaking)
+	{
+		auto sens_offset = cmb.c_attributes[9];
+		if(Hero.sideview_mode())
+		{
+			if((Hero.getY()+16-y).getAbs() < 0.5_zf
+				&& (!sens_offset || sens_offset*2 < w))
+			{
+				if(sens_offset)
+				{
+					x += sens_offset;
+					w -= sens_offset*2;
+				}
+				breaking = Hero.collide(x,0,w,world_h);
+			}
+		}
+		else if(!sens_offset || (sens_offset*2 < w && sens_offset*2 < h))
+		{
+			if(sens_offset)
+			{
+				x += sens_offset;
+				y += sens_offset;
+				w -= sens_offset*2;
+				h -= sens_offset*2;
+			}
+			breaking = Hero.collide(x,y,w,h);
+		}
+	}
+	if(breaking)
+	{
+		// Crumble
+		if(cmb.c_attributes[16] < 1)
+		{
+			trigger_crumble(cmb, timer, cid);
+			return true;
+		}
+		if(timer.type_clk)
+		{
+			if(!--timer.type_clk)
+			{
+				trigger_crumble(cmb, timer, cid);
+				return true;
+			}
+		}
+		else timer.type_clk = cmb.c_attributes[16].getTrunc();
+	}
+	else if(ty == CMBTY_CRUMBLE_RESET && timer.crumbling)
+	{
+		timer.type_clk = 0;
+		if(int diff = cmb.c_attributes[17].getTrunc())
+		{
+			cid += diff;
+			timer.updateData(cid);
+		}
+	}
+	timer.crumbling = breaking;
+	return false;
+}
+
+void trig_trigger_groups()
+{
+	auto& combo_cache = combo_caches::trigger_group;
+
+	bool include_ffcs = true;
+	std::vector<int> visited_cids;
+	for_every_combo([&](const auto& handle) {
+		// changers don't contribute
+		if constexpr (requires { handle.ffc; })
+		{
+			if (handle.ffc->flags & ffc_changer)
+				return;
+		}
+
+		int cid = handle.data();
+
+		bool recheck = false;
+		visited_cids.clear();
+		visited_cids.push_back(cid);
+		do
+		{
+			if (!combo_cache.minis[cid].tgroup)
+				break;
+			auto& cmb = combobuf[cid];
+			recheck = false;
+			for(size_t idx = 0; idx < cmb.triggers.size(); ++idx)
+			{
+				auto& trig = cmb.triggers[idx];
+				bool ok = false;
+				if(trig.trigger_flags.get(TRIGFLAG_TGROUP_LESS))
+					ok = cpos_trig_group_count(trig.trig_group) < trig.trig_group_val;
+				if(!ok && trig.trigger_flags.get(TRIGFLAG_TGROUP_GREATER))
+					ok = cpos_trig_group_count(trig.trig_group) > trig.trig_group_val;
+				if(!ok) continue;
+
+				bool earlyret = false;
+				if(do_trigger_combo(handle, idx))
+					if(trig.trigger_flags.get(TRIGFLAG_CANCEL_TRIGGER))
+						earlyret = true;
+				int cid2 = handle.data();
+				cpos_info& timer = handle.info();
+
+				if constexpr (requires { handle.ffc; })
+				{
+					if (handle.ffc->flags & ffc_changer)
+						timer.updateData(-1);
+					else timer.updateData(cid2);
+				}
+				else timer.updateData(cid2);
+
+				if(earlyret) break;
+				if (cid != cid2)
+				{
+					// Prevent infinite oscillation: if this cid was already visited, stop.
+					if (util::contains(visited_cids, cid2))
+						break;
+					visited_cids.push_back(cid2);
+					cid = cid2;
+					recheck = true;
+					break;
+				}
+			}
+		}
+		while(recheck);
+	}, include_ffcs);
+}
+
+//COMBOTYPE POS STUFF
+
+void handle_cpos_type(byte combo_type, cpos_info& timer, const rpos_handle_t& rpos_handle)
+{
+	switch(combo_type)
+	{
+		case cSHOOTER:
+			handle_shooter(rpos_handle.combo(), timer, rpos_handle.rpos);
+			break;
+		case cCRUMBLE:
+		{
+			word cid = rpos_handle.data();
+			auto [x, y] = rpos_handle.xy();
+			handle_crumble(rpos_handle.combo(), timer, cid, x, y, 16, 16);
+			rpos_handle.set_data(cid);
+			break;
+		}
+	}
+}
+
+//CPOS STUFF
+static int cpos_spotlight_count = 0;
+static int trig_groups[256];
+static std::vector<cpos_info> combo_posinfos;
+static std::map<word, word> combo_loop_sfx;
+static std::set<word> queue_stop_loop_sfx;
+static std::set<word> queue_start_loop_sfx;
+
+cpos_info& cpos_get(const combined_handle_t& handle)
+{
+	if (handle.is_ffc())
+		return handle.get_ffc().ffc->info;
+	int index = handle.get_layer() * region_num_rpos + handle.id();
+	return combo_posinfos[index];
+}
+int cpos_trig_group_count(int ind)
+{
+	return unsigned(ind)<256 ? trig_groups[ind] : 0;
+}
+int cpos_exists_spotlight()
+{
+	return cpos_spotlight_count;
+}
+
+static void cpos_reset_cache()
+{
+	cpos_spotlight_count = 0;
+	memset(trig_groups, 0, sizeof(trig_groups));
+	
+	queue_start_loop_sfx.clear();
+	for (auto [sfx_id, count] : combo_loop_sfx)
+	{
+		// queue currently looping sfx to stop
+		// don't stop immediately, as they may be started again
+		// before the next cpos_update(), in which case they should
+		// not cut-out / start over.
+		if (count)
+			queue_stop_loop_sfx.insert(sfx_id);
+	}
+	combo_loop_sfx.clear();
+}
+static void cpos_update_cache(newcombo const& cmb, int add)
+{
+	if(cmb.type == cSPOTLIGHT)
+		cpos_spotlight_count += add;
+	
+	for(size_t idx = 0; idx < cmb.triggers.size(); ++idx)
+	{
+		auto& trig = cmb.triggers[idx];
+		if(trig.trigger_flags.get(TRIGFLAG_TGROUP_CONTRIB))
+			trig_groups[trig.trig_group] += add;
+	}
+	
+	// handle tracking looping sfx
+	if (auto sfx_id = cmb.sfx_loop)
+	{
+		auto count = combo_loop_sfx[sfx_id];
+		// keep count of how many combos are looping the same sfx
+		combo_loop_sfx[sfx_id] = count + add;
+		if (count && !(count+add))
+		{
+			// If the sfx was being looped and now isn't anymore,
+			// queue it to stop. Don't stop it immediately, incase
+			// another combo appears that loops it before the next
+			// cpos_update() call.
+			queue_stop_loop_sfx.insert(sfx_id);
+			queue_start_loop_sfx.erase(sfx_id);
+		}
+		else if (!count && (count+add))
+		{
+			// If the sfx wasn't being looped by any combos, but
+			// now is, queue it to start- and if it was queued to stop,
+			// undo that.
+			queue_stop_loop_sfx.erase(sfx_id);
+			queue_start_loop_sfx.insert(sfx_id);
+		}
+	}
+}
+void cpos_update_cache(int32_t oldid, int32_t newid)
+{
+	if(oldid == newid) return;
+	if(unsigned(oldid) < MAXCOMBOS)
+		cpos_update_cache(combobuf[oldid],-1);
+	if(unsigned(newid) < MAXCOMBOS)
+		cpos_update_cache(combobuf[newid],1);
+}
+
+void cpos_clear_all()
+{
+	//Clearing these here just as a sanity check... -Em
+	copycat_skip_lyr = -1;
+	copycat_skip_rpos = rpos_t::None;
+	copycat_skip_ffc = -1;
+	//
+	combo_posinfos.resize(region_num_rpos * 7);
+	for (int i = 0; i < region_num_rpos * 7; i++)
+		combo_posinfos[i].clear();
+	
+	cpos_reset_cache();
+}
+void cpos_force_update() //updates without side-effects
+{
+	for_every_rpos([&](const rpos_handle_t& rpos_handle) {
+		rpos_handle.info().updateData(rpos_handle.data());
+	});
+
+	for_every_ffc([&](const ffc_handle_t& ffc_handle) {
+		if (ffc_handle.ffc->flags & ffc_changer)
+			ffc_handle.ffc->info.updateData(-1);
+		else ffc_handle.ffc->info.updateData(ffc_handle.data());
+	});
+}
+
+void cpos_update() //updates with side-effects
+{
+	auto& combo_cache = combo_caches::cpos_update;
+	bool freeze_combo_cpos = replay_version_check(58) && (freeze_general || freeze_message || freeze_holdup);
+	bool freeze_ffc_cpos = replay_version_check(58) && (freeze_ffc || freeze_message || freeze_holdup);
+
+	if (!freeze_combo_cpos)
+		for_every_rpos([&](const rpos_handle_t& rpos_handle) {
+			cpos_info& timer = rpos_handle.info();
+			int cid = rpos_handle.data();
+
+			// Even though `updateData` already does this check, avoiding a function call
+			// has been observed to be a performance boost.
+			if (cid != timer.data)
+				timer.updateData(cid);
+
+			if(!timer.appeared)
+			{
+				auto& cmb = combobuf[cid];
+				auto [x, y] = rpos_handle.xy();
+				timer.appeared = true;
+				if(cmb.sfx_appear)
+					sfx(cmb.sfx_appear);
+				if(cmb.spr_appear)
+					decorations.add(new comboSprite(x, y, dCOMBOSPRITE, 0, cmb.spr_appear));
+				if(timer.sfx_onchange) //last combo's sfx_disappear
+					sfx(timer.sfx_onchange);
+				if(timer.spr_onchange) //last combo's spr_disappear
+					decorations.add(new comboSprite(x, y, dCOMBOSPRITE, 0, timer.spr_onchange));
+				timer.sfx_onchange = 0;
+				timer.spr_onchange = 0;
+			}
+
+			auto& mini_cmb = combo_cache.minis[cid];
+			bool do_trigger_timer = mini_cmb.trigtimer;
+			newcombo const* cmb = nullptr;
+			if(do_trigger_timer)
+				cmb = &combobuf[cid];
+			size_t max_trig = zc_max(cmb ? cmb->triggers.size() : 0, timer.trig_data.capacity());
+			for(size_t idx = 0; idx < max_trig; ++idx)
+			{
+				if(do_trigger_timer && idx < cmb->triggers.size())
+				{
+					auto& trig = cmb->triggers[idx];
+					if (trig.trigtimer)
+					{
+						cpos_trig_info& trig_info = timer.trig_data[idx];
+						if(++trig_info.clk >= trig.trigtimer)
+						{
+							trig_info.clk = 0;
+							if(do_trigger_combo(rpos_handle, idx))
+								if(trig.trigger_flags.get(TRIGFLAG_CANCEL_TRIGGER))
+									break;
+							timer.updateData(rpos_handle.data());
+							if(rpos_handle.data() != cid)
+								do_trigger_timer = false; // 'break', but only out of the trigtimer part of the loop
+						}
+					}
+				}
+				if (idx < timer.trig_data.capacity())
+				{
+					cpos_trig_info& trig_info = timer.trig_data[idx];
+					if (trig_info.cooldown) --trig_info.cooldown;
+				}
+			}
+			handle_cpos_type(mini_cmb.type,timer,rpos_handle);
+		});
+
+	if (!freeze_ffc_cpos)
+		for_every_ffc([&](const ffc_handle_t& ffc_handle) {
+			if (ffc_handle.ffc->flags & ffc_changer)
+				return; //changers don't contribute
+
+			ffcdata& f = *ffc_handle.ffc;
+			cpos_info& timer = f.info;
+			if (f.flags & ffc_changer)
+			{
+				//changers don't contribute
+				timer.updateData(-1);
+				return;
+			}
+			int cid = f.data;
+			// Even though `updateData` already does this check, avoiding a function call
+			// has been observed to be a performance boost.
+			if (cid != timer.data)
+				timer.updateData(cid);
+			zfix wx = f.x + (f.txsz-1)*8;
+			zfix wy = f.y + (f.tysz-1)*8;
+			
+			if(!timer.appeared)
+			{
+				auto& cmb = combobuf[cid];
+				zfix wx = ffc_handle.ffc->x;
+				zfix wy = ffc_handle.ffc->y;
+				wx += (ffc_handle.scr->ffTileWidth(ffc_handle.i)-1)*8;
+				wy += (ffc_handle.scr->ffTileHeight(ffc_handle.i)-1)*8;
+				timer.appeared = true;
+				if(cmb.sfx_appear)
+					sfx(cmb.sfx_appear);
+				if(cmb.spr_appear)
+					decorations.add(new comboSprite(wx, wy, dCOMBOSPRITE, 0, cmb.spr_appear));
+				if(timer.sfx_onchange) //last combo's sfx_disappear
+					sfx(timer.sfx_onchange);
+				if(timer.spr_onchange) //last combo's spr_disappear
+					decorations.add(new comboSprite(wx, wy, dCOMBOSPRITE, 0, timer.spr_onchange));
+				timer.sfx_onchange = 0;
+				timer.spr_onchange = 0;
+			}
+
+			auto& mini_cmb = combo_cache.minis[cid];
+			bool do_trigger_timer = mini_cmb.trigtimer;
+			newcombo const* cmb;
+			if(do_trigger_timer)
+				cmb = &combobuf[cid];
+			
+			for(size_t idx = 0; idx < MAX_COMBO_TRIGGERS; ++idx)
+			{
+				if (do_trigger_timer && idx < cmb->triggers.size())
+				{
+					auto& trig = cmb->triggers[idx];
+					if (trig.trigtimer)
+					{
+						cpos_trig_info& trig_info = timer.trig_data[idx];
+						if (++trig_info.clk >= trig.trigtimer)
+						{
+							trig_info.clk = 0;
+							if(do_trigger_combo(ffc_handle, idx))
+								if(trig.trigger_flags.get(TRIGFLAG_CANCEL_TRIGGER))
+									break;
+							timer.updateData(f.data);
+							if (f.data != cid)
+								do_trigger_timer = false; // 'break', but only out of the trigtimer part of the loop
+						}
+					}
+				}
+				if (idx < timer.trig_data.capacity())
+				{
+					cpos_trig_info& trig_info = timer.trig_data[idx];
+					if (trig_info.cooldown) --trig_info.cooldown;
+				}
+			}
+			if(mini_cmb.type == cSHOOTER)
+				handle_shooter(combobuf[cid], timer, wx, wy);
+		});
+
+	trig_trigger_groups();
+	
+	for (auto sfx_id : queue_stop_loop_sfx)
+		stop_sfx(sfx_id);
+	queue_stop_loop_sfx.clear();
+	for (auto sfx_id : queue_start_loop_sfx)
+		cont_sfx(sfx_id);
+	queue_start_loop_sfx.clear();
+}
+
+namespace combo_caches
+{
+	combo_cache<minicombo_type> type;
+	combo_cache<minicombo_flag> flag;
+	combo_cache<minicombo_cpos_update> cpos_update;
+	combo_cache<minicombo_trigger_group> trigger_group;
+	combo_cache<minicombo_can_cycle> can_cycle;
+	combo_cache<minicombo_shutter> shutter;
+	combo_cache<minicombo_gswitch> gswitch;
+	combo_cache<minicombo_script> script;
+	combo_cache<minicombo_drawing> drawing;
+	combo_cache<minicombo_lens> lens;
+	combo_cache<minicombo_spotlight> spotlight;
+}
+
+void combos_init_game_vars()
+{
+	large_copycat_ids.clear();
+}

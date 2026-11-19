@@ -1,0 +1,1298 @@
+#ifndef ZC_SCRIPTING_ARRAYS_H_
+#define ZC_SCRIPTING_ARRAYS_H_
+
+// See arrays.cpp for how to define scripting arrays.
+
+#include "components/zasm/defines.h"
+#include "core/combo.h"
+#include "base/general.h"
+#include "core/qrs.h"
+#include "../../ffc.h"
+#include "new_subscr.h"
+#include "zc/hero.h"
+#include "zc/scripting/common.h"
+#include "zc/scripting/types/bottledata.h"
+#include "zc/scripting/types/genericdata.h"
+#include "zc/scripting/types/savemenu.h"
+#include "zc/scripting/types/websocket.h"
+#include "zc/scripting/types/weapondata.h"
+#include <cstddef>
+#include <functional>
+#include <optional>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+// Avoid including ffscript.h b/c it causes circular includes, errors on windows.
+// TODO: move all these to seperate files in `zc/scripting/types`, so this file doesn't need to rely on ffscript.cpp.
+
+struct dmap;
+class enemy;
+struct mapdata;
+struct user_paldata;
+struct sprite_data;
+struct MsgStr;
+
+sprite* ResolveBaseSprite(int32_t uid);
+newcombo* checkCombo(int32_t ref, bool skipError = false);
+dmap* checkDmap(int32_t ref);
+ffcdata* checkFFC(int32_t ref);
+enemy* checkNPC(int32_t ref);
+guydata* checkNPCData(int32_t ref);
+item* checkItem(int32_t ref);
+itemdata* checkItemData(int32_t ref);
+mapdata* checkMapData(int32_t ref);
+mapscr* checkMapDataScr(int32_t ref);
+screendata* checkScreen(int32_t ref);
+user_paldata* checkPalData(int32_t ref, bool skipError = false);
+weapon* checkWpn(int32_t uid);
+bottleshoptype *checkBottleShopData(int32_t ref, bool skipError = false);
+item_drop_object *checkDropSetData(int32_t ref);
+sprite_data *checkSpriteData(int32_t ref);
+MsgStr *checkMessageData(int32_t ref);
+SubscrWidget *checkSubWidg(int32_t ref, std::set<int> const& req_sub_tys = {}, int req_widg_ty = -1);
+ZCSubscreen *checkSubData(int32_t ref, std::set<int> const& req_tys = {});
+combo_trigger* checkComboTrigger(dword ref);
+
+#define MAX_ZC_ARRAY_SIZE 214748
+
+int zasm_array_size(int zasm_var, int ref);
+int zasm_array_get(int zasm_var, int ref, int index);
+std::vector<int> zasm_array_get_all(int zasm_var, int ref);
+bool zasm_array_set(int zasm_var, int ref, int index, int value, script_object_type type);
+bool zasm_array_supports(int zasm_var);
+
+template <typename T, size_t N>
+constexpr size_t comptime_array_size(T (&)[N])
+{
+	return N;
+}
+
+template <auto Fp>
+struct field_type;
+
+template<typename R, typename T, R (T::*FP)>
+struct field_type<FP>
+{
+    using type = R;
+};
+
+template<typename R, typename T, typename...Args, R (T::*FP)(Args...)>
+struct field_type<FP>
+{
+    using type = R;
+}; 
+
+template<auto FP>
+using field_type_t = typename field_type<FP>::type;
+
+namespace transforms
+{
+	template<int min_inclusive, int max_exclusive>
+	std::optional<int> validate(int value)
+	{
+		if (value < min_inclusive || value >= max_exclusive)
+		{
+			_scripting_log_error_with_context("Attempted to set invalid value for array: {} - must be >= {} and < {}", value, min_inclusive, max_exclusive);
+			return std::nullopt;
+		}
+
+		return value;
+	}
+
+	template<int max_exclusive>
+	std::optional<int> validate(int value)
+	{
+		if (value < 0 || value >= max_exclusive)
+		{
+			_scripting_log_error_with_context("Attempted to set invalid value for array: {} - must be >= {} and < {}", value, 0, max_exclusive);
+			return std::nullopt;
+		}
+
+		return value;
+	}
+
+	template<int low, int high>
+	std::optional<int> vbound(int value)
+	{
+		return ::vbound(value, low, high);
+	}
+
+	inline int vboundByte(int value)
+	{
+		return ::vbound(value, 0, 255);
+	}
+
+	inline int vboundWord(int value)
+	{
+		return ::vbound(value, 0, 65535);
+	}
+
+	inline int vboundInt(int value)
+	{
+		return ::vbound(value, -214747, 214747);
+	}
+}
+
+template <typename T>
+int convert_value(int value, bool mul10000)
+{
+	if constexpr (std::is_same<T, bool>::value)
+		return value;
+	else
+		return mul10000 ? value / 10000 : value;
+}
+
+inline int bound_index(int index, int low, int high)
+{
+	if (index >= low && index <= high)
+		return index;
+
+	_scripting_log_error_with_context("Using invalid index {}, bounding to valid range between {} and {}", index, low, high);
+	return index < low ? low : high;
+}
+
+// Helper struct to make the static_assert dependent on the template parameter
+template<typename>
+struct always_false : std::false_type {};
+
+template<typename T>
+T* resolveScriptingObject(int ref)
+{
+	if constexpr (std::is_same<T, user_genscript>::value)
+		return checkGenericScr(ref);
+	else if constexpr (std::is_same<T, sprite>::value)
+		return ResolveBaseSprite(ref);
+	else if constexpr (std::is_same<T, ffcdata>::value)
+		return checkFFC(ref);
+	else if constexpr (std::is_same<T, enemy>::value)
+		return checkNPC(ref);
+	else if constexpr (std::is_same<T, guydata>::value)
+		return checkNPCData(ref);
+	else if constexpr (std::is_same<T, item>::value)
+		return checkItem(ref);
+	else if constexpr (std::is_same<T, itemdata>::value)
+		return checkItemData(ref);
+	else if constexpr (std::is_same<T, newcombo>::value)
+		return checkCombo(ref);
+	else if constexpr (std::is_same<T, combo_trigger>::value)
+		return checkComboTrigger(ref);
+	else if constexpr (std::is_same<T, weapon>::value)
+		return checkWpn(ref);
+	else if constexpr (std::is_same<T, dmap>::value)
+		return checkDmap(ref);
+	else if constexpr (std::is_same<T, mapdata>::value)
+		return checkMapData(ref);
+	else if constexpr (std::is_same<T, mapscr>::value)
+		return checkMapDataScr(ref);
+	else if constexpr (std::is_same<T, user_paldata>::value)
+		return checkPalData(ref);
+	else if constexpr (std::is_same<T, user_websocket>::value)
+		return checkWebsocket(ref);
+	else if constexpr (std::is_same<T, screendata>::value)
+		return checkScreen(ref);
+	else if constexpr (std::is_same<T, ZCSubscreen>::value)
+		return checkSubData(ref);
+	else if constexpr (std::is_same<T, ZCSubscreenActive>::value)
+		return (ZCSubscreenActive*)checkSubData(ref, {sstACTIVE,sstMAP});
+	else if constexpr (std::is_same<T, SubscrWidget>::value)
+		return checkSubWidg(ref);
+	else if constexpr (std::is_same<T, SubscrWidgetActive>::value)
+		return (SubscrWidgetActive*)checkSubWidg(ref, {sstACTIVE,sstMAP});
+	else if constexpr (std::is_same<T, bottletype>::value)
+		return checkBottleData(ref);
+	else if constexpr (std::is_same<T, bottleshoptype>::value)
+		return checkBottleShopData(ref);
+	else if constexpr (std::is_same<T, item_drop_object>::value)
+		return checkDropSetData(ref);
+	else if constexpr (std::is_same<T, sprite_data>::value)
+		return checkSpriteData(ref);
+	else if constexpr (std::is_same<T, MsgStr>::value)
+		return checkMessageData(ref);
+	else if constexpr (std::is_same<T, SaveMenu>::value)
+		return checkSaveMenu(ref);
+	else if constexpr (std::is_same<T, gamedata>::value)
+		return game;
+	else if constexpr (std::is_same<T, HeroClass>::value)
+		return &Hero;
+	else if constexpr (std::is_same<T, weapon_data>::value)
+		return checkWeaponData(ref);
+	else
+		static_assert(always_false<T>::value, "Unhandled type in 'resolveScriptingObject' function");
+}
+
+// The ZASM register an object array resolves its object from - `npcdata->Flags[]`
+// resolves via REFNPCDATA, and so on. This is derived from the object type rather
+// than declared per-array so that it can't be forgotten: a new object type won't
+// compile until it is listed here, and zasm_array_validate_ref_registers() checks
+// the generated table in components/zasm agrees with what these say.
+template <typename T>
+constexpr std::optional<int> ref_register_for()
+{
+	if constexpr (std::is_same<T, user_genscript>::value)
+		return REFGENERICDATA;
+	else if constexpr (std::is_same<T, sprite>::value)
+		return REFSPRITE;
+	else if constexpr (std::is_same<T, ffcdata>::value)
+		return REFFFC;
+	else if constexpr (std::is_same<T, enemy>::value)
+		return REFNPC;
+	else if constexpr (std::is_same<T, guydata>::value)
+		return REFNPCDATA;
+	else if constexpr (std::is_same<T, item>::value)
+		return REFITEM;
+	else if constexpr (std::is_same<T, itemdata>::value)
+		return REFITEMDATA;
+	else if constexpr (std::is_same<T, newcombo>::value)
+		return REFCOMBODATA;
+	else if constexpr (std::is_same<T, combo_trigger>::value)
+		return REFCOMBOTRIGGER;
+	else if constexpr (std::is_same<T, dmap>::value)
+		return REFDMAPDATA;
+	else if constexpr (std::is_same<T, mapdata>::value)
+		return REFMAPDATA;
+	else if constexpr (std::is_same<T, mapscr>::value)
+		return REFMAPDATA;
+	else if constexpr (std::is_same<T, user_paldata>::value)
+		return REFPALDATA;
+	else if constexpr (std::is_same<T, user_websocket>::value)
+		return REFWEBSOCKET;
+	else if constexpr (std::is_same<T, screendata>::value)
+		return REFSCREEN;
+	else if constexpr (std::is_same<T, ZCSubscreen>::value)
+		return REFSUBSCREENDATA;
+	else if constexpr (std::is_same<T, ZCSubscreenActive>::value)
+		return REFSUBSCREENDATA;
+	else if constexpr (std::is_same<T, SubscrWidget>::value)
+		return REFSUBSCREENWIDG;
+	else if constexpr (std::is_same<T, SubscrWidgetActive>::value)
+		return REFSUBSCREENWIDG;
+	else if constexpr (std::is_same<T, bottletype>::value)
+		return REFBOTTLETYPE;
+	else if constexpr (std::is_same<T, bottleshoptype>::value)
+		return REFBOTTLESHOP;
+	else if constexpr (std::is_same<T, item_drop_object>::value)
+		return REFDROPSETDATA;
+	else if constexpr (std::is_same<T, sprite_data>::value)
+		return REFSPRITEDATA;
+	else if constexpr (std::is_same<T, MsgStr>::value)
+		return REFMSGDATA;
+	else if constexpr (std::is_same<T, SaveMenu>::value)
+		return REFSAVEMENU;
+	else if constexpr (std::is_same<T, weapon_data>::value)
+		return REFWEAPDATA;
+	// lweapon and eweapon share one array impl, registered under both LWPN* and
+	// EWPN*; the eweapon registration passes REFEWPN explicitly.
+	else if constexpr (std::is_same<T, weapon>::value)
+		return REFLWPN;
+	// Singletons - resolved without consulting a ref register.
+	else if constexpr (std::is_same<T, gamedata>::value)
+		return std::nullopt;
+	else if constexpr (std::is_same<T, HeroClass>::value)
+		return std::nullopt;
+	else
+		static_assert(always_false<T>::value, "Unhandled type in 'ref_register_for' - add the REF register this object's arrays resolve from");
+}
+
+class IScriptingArray
+{
+public:
+	virtual ~IScriptingArray() = default;
+	virtual size_t getResolvedIndex(int size, int index) const;
+	virtual size_t getSize(int ref) const = 0;
+	virtual std::vector<int> getAll(int ref) const;
+	virtual int getElement(int ref, int index) const = 0;
+	virtual bool setElement(int ref, int index, int value) = 0;
+	// Whether this array resolves a context object from a ref register. Only
+	// these can state which register that is; "Global" arrays may still consume
+	// the ref integer themselves (see SDD), so they make no claim.
+	virtual bool resolvesObject() const { return false; }
+	// Which ref register the object is resolved from - nullopt for singletons
+	// (Game, Hero), which need no ref. Only meaningful if resolvesObject().
+	virtual std::optional<int> getRefRegister() const { return std::nullopt; }
+
+	// Note: Do not use for new arrays.
+	void compatSetDefaultValue(int defaultValue) { m_defaultValue = defaultValue; }
+	int getDefaultValue() const
+	{
+		return get_qr(qr_OLD_SCRIPTS_ARRAYS_NON_ZERO_DEFAULT_VALUE) ? m_defaultValue : 0;
+	}
+
+	void setMul10000(bool v) { m_mul10000 = v; }
+
+	void setReadOnly() { m_readOnly = true; }
+	bool readOnly() { return m_readOnly; }
+
+	// Note: Do not use for new arrays.
+	void compatBoundIndex() { m_boundGetterIndex = m_boundSetterIndex = true; }
+	// Note: Do not use for new arrays.
+	void compatBoundGetterIndex() { m_boundGetterIndex = true; }
+	// Note: Do not use for new arrays.
+	void compatBoundSetterIndex() { m_boundSetterIndex = true; }
+
+	void setValueTransform(std::function<std::optional<int>(int)> valueTransform) { m_valueTransform = std::move(valueTransform); }
+
+private:
+	int m_defaultValue;
+
+protected:
+	bool m_mul10000 = true;
+	bool m_readOnly;
+	bool m_boundGetterIndex;
+	bool m_boundSetterIndex;
+	std::function<std::optional<int>(int)> m_valueTransform;
+
+	template <typename T_Element>
+	std::optional<int> transformValue(int value) const
+	{
+		if constexpr (!std::is_same<T_Element, bool>::value)
+			value = m_mul10000 ? value / 10000 : value;
+		return m_valueTransform ? m_valueTransform(value) : value;
+	}
+
+	std::optional<size_t> resolveIndex(int index, size_t size, bool compat_should_bound) const
+	{
+		bool supports_neg_indices = !get_qr(qr_OLD_SCRIPTS_INTERNAL_ARRAYS_BOUND_INDEX);
+		if (supports_neg_indices)
+		{
+			if (index >= 0)
+			{
+				if ((size_t)index < size)
+					return index;
+			}
+			else
+			{
+				// Wrap around from the end.
+				auto new_index = (std::ptrdiff_t)size + index;
+				if (new_index >= 0)
+					return new_index;
+			}
+
+			_scripting_log_error_with_context("Invalid array index {} for internal array of size {}", index, size);
+			return std::nullopt;
+		}
+
+		if (compat_should_bound)
+		{
+			if (size == 0)
+			{
+				_scripting_log_error_with_context("Attempted to access empty internal array with index: {}", index);
+				return std::nullopt;
+			}
+
+			return bound_index(index, 0, size - 1);
+		}
+
+		if (BC::checkIndex2(index, size) != SH::_NoError)
+			return std::nullopt;
+
+		return index;
+	}
+
+	std::optional<size_t> resolveIndexOneIndexed(int index, size_t size, bool compat_should_bound) const
+	{
+		if (index == 0)
+		{
+			_scripting_log_error_with_context("Invalid array index {} for 1-indexed internal array", index);
+			return std::nullopt;
+		}
+
+		bool supports_neg_indices = !get_qr(qr_OLD_SCRIPTS_INTERNAL_ARRAYS_BOUND_INDEX);
+		if (supports_neg_indices)
+		{
+			if (index >= 0)
+			{
+				if ((size_t)index <= size)
+					return index;
+			}
+			else
+			{
+				// Wrap around from the end. For a 1-indexed array (valid 1..size),
+				// -1 maps to size (the last element) and -size maps to 1.
+				auto new_index = (std::ptrdiff_t)size + index + 1;
+				if (new_index >= 1)
+					return new_index;
+			}
+
+			_scripting_log_error_with_context("Invalid array index {} for 1-indexed internal array of size {}", index, size);
+			return std::nullopt;
+		}
+
+		if (compat_should_bound)
+		{
+			if (size == 0)
+			{
+				_scripting_log_error_with_context("Attempted to access empty internal array with index: {}", index);
+				return std::nullopt;
+			}
+
+			return bound_index(index, 1, size);
+		}
+
+		if (BC::checkIndex2OneIndex(index, size) != SH::_NoError)
+			return std::nullopt;
+
+		return index;
+	}
+};
+
+inline size_t IScriptingArray::getResolvedIndex(int size, int index) const
+{
+	return resolveIndex(index, size, m_boundSetterIndex).value_or(-1);
+}
+
+// TODO: implement efficient versions for all derived classes. This default implementation will
+// "resolve" the object ref once per element.
+inline std::vector<int> IScriptingArray::getAll(int ref) const
+{
+	std::vector<int> values;
+
+	int size = getSize(ref);
+	values.reserve(size);
+	for (int i = 0; i < size; i++)
+		values.push_back(getElement(ref, i));
+
+	return values;
+}
+
+template<typename T_Element>
+class ScriptingArray_GlobalCArray : public IScriptingArray {
+public:
+	ScriptingArray_GlobalCArray(T_Element* data, size_t size) : m_data(data), m_size(size) {}
+
+	size_t getSize(int) const override { return m_size; }
+
+	std::vector<int> getAll(int) const override
+	{
+		std::vector<int> values(m_data, m_data + m_size);
+		if (m_mul10000)
+		{
+			for (int i = 0; i < m_size; i++)
+				values[i] *= 10000;
+		}
+
+		return values;
+	}
+
+	int getElement(int, int index) const override
+	{
+		if (auto resolved_index = resolveIndex(index, m_size, m_boundGetterIndex))
+			return m_data[*resolved_index] * (m_mul10000 ? 10000 : 1);
+
+		return getDefaultValue();
+	}
+
+	bool setElement(int, int index, int value) override
+	{
+		if (auto resolved_index = resolveIndex(index, m_size, m_boundSetterIndex))
+			index = *resolved_index;
+		else
+			return false;
+
+		if (auto val = transformValue<T_Element>(value))
+		{
+			m_data[index] = val.value();
+
+			if (m_writeSideEffect)
+				m_writeSideEffect(index);
+			return true;
+		}
+
+		return false;
+	}
+
+	void setSideEffect(std::function<void(int)> writeSideEffect) { m_writeSideEffect = std::move(writeSideEffect); }
+
+private:
+	T_Element* m_data;
+	const size_t m_size;
+	std::function<void(int)> m_writeSideEffect;
+};
+
+template<typename T_Element>
+class ScriptingArray_GlobalComputed : public IScriptingArray
+{
+public:
+	using SizeFunc = std::function<size_t(int ref)>;
+	using GetFunc = std::function<T_Element(int ref, int index)>;
+	using SetFunc = std::function<bool(int ref, int index, T_Element value)>;
+
+	template<typename T_GetFunc, typename T_SetFunc>
+	ScriptingArray_GlobalComputed(SizeFunc sf, T_GetFunc gf, T_SetFunc setf)
+		: m_sizeFunc(std::move(sf)), m_getFunc(std::move(gf)), m_setFunc(std::move(setf)), m_skipIndexCheck(false)
+	{
+		// Define the exact function pointer type we require.
+		using RequiredGetFun = T_Element(*)(int, int);
+		using RequiredSetFun = bool(*)(int, int, T_Element);
+
+		// Perform a compile-time check to ensure the provided lambda's signature matches.
+		// This check will fail if the lambda's parameters do not match exactly.
+		static_assert(
+			std::is_convertible_v<T_GetFunc, RequiredGetFun>,
+			"The provided lambda's signature does not match the required 'T_Element(int, int)'. "
+			"Ensure the value parameter's type is exactly T_Element."
+		);
+		static_assert(
+			std::is_convertible_v<T_SetFunc, RequiredSetFun>,
+			"The provided lambda's signature does not match the required 'bool(int, int, T_Element)'. "
+			"Ensure the value parameter's type is exactly T_Element."
+		);
+	}
+
+	size_t getSize(int ref) const override { return m_sizeFunc(ref); }
+
+	int getElement(int ref, int index) const override
+	{
+		if (!m_skipIndexCheck)
+		{
+			size_t sz = getSize(ref);
+			if (auto resolved_index = resolveIndex(index, sz, m_boundGetterIndex))
+				index = *resolved_index;
+			else
+				return getDefaultValue();
+		}
+
+		return m_getFunc(ref, index) * (m_mul10000 ? 10000 : 1);
+	}
+
+	bool setElement(int ref, int index, int value) override
+	{
+		if (!m_skipIndexCheck)
+		{
+			size_t sz = getSize(ref);
+			if (auto resolved_index = resolveIndex(index, sz, m_boundSetterIndex))
+				index = *resolved_index;
+			else
+				return false;
+		}
+
+		if (auto val = transformValue<T_Element>(value))
+			return m_setFunc(ref, index, val.value());
+
+		return false;
+	}
+
+	void skipIndexCheck() { m_skipIndexCheck = true; }
+
+private:
+	SizeFunc m_sizeFunc;
+	GetFunc m_getFunc;
+	SetFunc m_setFunc;
+	bool m_skipIndexCheck;
+};
+
+// Never use this for new ZASM.
+class ScriptingArray_GlobalComputedOneIndexed : public IScriptingArray
+{
+public:
+	using SizeFunc = std::function<size_t(int ref)>;
+	using GetFunc = std::function<int(int ref, int index)>;
+	using SetFunc = std::function<bool(int ref, int index, int value)>;
+
+	ScriptingArray_GlobalComputedOneIndexed(SizeFunc sf, GetFunc gf, SetFunc setf)
+		: m_sizeFunc(std::move(sf)), m_getFunc(std::move(gf)), m_setFunc(std::move(setf)) {}
+
+	size_t getSize(int ref) const override { return m_sizeFunc(ref); }
+
+	size_t getResolvedIndex(int size, int index) const override
+	{
+		return resolveIndexOneIndexed(index, size, m_boundSetterIndex).value_or(-1);
+	}
+
+	int getElement(int ref, int index) const override
+	{
+		size_t sz = getSize(ref);
+		if (auto resolved_index = resolveIndexOneIndexed(index, sz, m_boundGetterIndex))
+			return m_getFunc(ref, *resolved_index) * (m_mul10000 ? 10000 : 1);
+
+		return getDefaultValue();
+	}
+
+	bool setElement(int ref, int index, int value) override
+	{
+		size_t sz = getSize(ref);
+		if (auto resolved_index = resolveIndexOneIndexed(index, sz, m_boundSetterIndex))
+			index = *resolved_index;
+		else
+			return false;
+
+		if (auto val = transformValue<int>(value))
+			return m_setFunc(ref, index, val.value());
+
+		return false;
+	}
+
+private:
+	SizeFunc m_sizeFunc;
+	GetFunc m_getFunc;
+	SetFunc m_setFunc;
+};
+
+template<typename T_Object, auto T_MemberPtr>
+class ScriptingArray_ObjectMemberCArray : public IScriptingArray
+{
+public:
+	bool resolvesObject() const override { return true; }
+	std::optional<int> getRefRegister() const override { return ref_register_for<T_Object>(); }
+	using MemberType = field_type<T_MemberPtr>::type;
+	using ElementType = std::remove_extent<MemberType>::type;
+	using N = std::extent<MemberType>;
+
+	static_assert(std::is_array<MemberType>(), "Can only use ScriptingArray_ObjectMemberCArray for array types");
+
+	size_t getSize(int) const override { return N::value; }
+
+	std::vector<int> getAll(int ref) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return {};
+
+		size_t size = N::value;
+
+		std::vector<int> values(obj->*T_MemberPtr, obj->*T_MemberPtr + size);
+		if (m_mul10000)
+		{
+			for (int i = 0; i < values.size(); i++)
+				values[i] *= 10000;
+		}
+
+		return values;
+	}
+
+	int getElement(int ref, int index) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return 0;
+
+		if (auto resolved_index = resolveIndex(index, N::value, m_boundGetterIndex))
+			return (obj->*T_MemberPtr)[*resolved_index] * (m_mul10000 ? 10000 : 1);
+
+		return getDefaultValue();
+	}
+
+	bool setElement(int ref, int index, int value) override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return false;
+
+		if (auto resolved_index = resolveIndex(index, N::value, m_boundSetterIndex))
+			index = *resolved_index;
+		else
+			return false;
+
+		if (auto val = transformValue<ElementType>(value))
+		{
+			(obj->*T_MemberPtr)[index] = val.value();
+
+			if (m_writeSideEffect)
+				m_writeSideEffect(obj, index, val.value());
+			return true;
+		}
+
+		return false;
+	}
+
+	void setSideEffect(std::function<void(T_Object*, int, ElementType)> writeSideEffect) { m_writeSideEffect = std::move(writeSideEffect); }
+
+private:
+	std::function<void(T_Object*, int, ElementType)> m_writeSideEffect;
+};
+
+template<typename T_Object, auto T_MemberPtr, auto T_SubMemberPtr>
+class ScriptingArray_ObjectSubMemberCArray : public IScriptingArray
+{
+public:
+	bool resolvesObject() const override { return true; }
+	std::optional<int> getRefRegister() const override { return ref_register_for<T_Object>(); }
+	using MemberType = field_type<T_SubMemberPtr>::type;
+	using ElementType = std::remove_extent<MemberType>::type;
+	using N = std::extent<MemberType>;
+
+	static_assert(std::is_array<MemberType>(), "Can only use ScriptingArray_ObjectSubMemberCArray for array types");
+
+	size_t getSize(int) const override { return N::value; }
+
+	int getElement(int ref, int index) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return 0;
+
+		if (auto resolved_index = resolveIndex(index, N::value, m_boundGetterIndex))
+			return (obj->*T_MemberPtr.*T_SubMemberPtr)[*resolved_index] * (m_mul10000 ? 10000 : 1);
+
+		return getDefaultValue();
+	}
+
+	bool setElement(int ref, int index, int value) override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return false;
+
+		if (auto resolved_index = resolveIndex(index, N::value , m_boundSetterIndex))
+			index = *resolved_index;
+		else
+			return false;
+
+		if (auto val = transformValue<ElementType>(value))
+		{
+			(obj->*T_MemberPtr.*T_SubMemberPtr)[index] = val.value();
+
+			if (m_writeSideEffect)
+				m_writeSideEffect(obj, index, val.value());
+			return true;
+		}
+
+		return false;
+	}
+
+	void setSideEffect(std::function<void(T_Object*, int, ElementType)> writeSideEffect) { m_writeSideEffect = std::move(writeSideEffect); }
+
+private:
+	std::function<void(T_Object*, int, ElementType)> m_writeSideEffect;
+};
+
+template<typename T_Object, typename T_Element>
+class ScriptingArray_ObjectComputed : public IScriptingArray
+{
+public:
+	bool resolvesObject() const override { return true; }
+	std::optional<int> getRefRegister() const override { return ref_register_for<T_Object>(); }
+	using SizeFunc = std::function<size_t(T_Object* obj)>;
+	using GetFunc = std::function<T_Element(T_Object* obj, int index)>;
+	using SetFunc = std::function<void(T_Object* obj, int index, T_Element value)>;
+
+	template<typename T_GetFunc, typename T_SetFunc>
+	ScriptingArray_ObjectComputed(SizeFunc sf, T_GetFunc gf, T_SetFunc setf)
+		: m_sizeFunc(std::move(sf)), m_getFunc(std::move(gf)), m_setFunc(std::move(setf)), m_skipIndexCheck(false)
+	{
+		// Define the exact function pointer type we require.
+		using RequiredGetFun = T_Element(*)(T_Object*, int);
+		using RequiredSetFun = void(*)(T_Object*, int, T_Element);
+
+		// Perform a compile-time check to ensure the provided lambda's signature matches.
+		// This check will fail if the lambda's parameters do not match exactly.
+		static_assert(
+			std::is_convertible_v<T_GetFunc, RequiredGetFun>,
+			"The provided lambda's signature does not match the required 'T_Element(T_Object*, int)'. "
+			"Ensure the value parameter's type is exactly T_Element."
+		);
+		static_assert(
+			std::is_convertible_v<T_SetFunc, RequiredSetFun>,
+			"The provided lambda's signature does not match the required 'void(T_Object*, int, T_Element)'. "
+			"Ensure the value parameter's type is exactly T_Element."
+		);
+	}
+
+	size_t getSize(int ref) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return 0;
+
+		return m_sizeFunc(obj);
+	}
+
+	std::vector<int> getAll(int ref) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return {};
+
+		size_t size = m_sizeFunc(obj);
+
+		std::vector<int> values;
+		values.reserve(size);
+		for (int i = 0; i < size; i++)
+		{
+			T_Element result = m_getFunc(obj, i);
+			if constexpr (std::is_same<T_Element, bool>::value)
+				values.push_back(result ? (m_mul10000 ? 10000 : 1) : 0);
+			else
+				values.push_back(result * (m_mul10000 ? 10000 : 1));
+		}
+
+		return values;
+	}
+
+	int getElement(int ref, int index) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return getDefaultValue();
+
+		if (!m_skipIndexCheck)
+		{
+			size_t sz = m_sizeFunc(obj);
+			if (auto resolved_index = resolveIndex(index, sz, m_boundGetterIndex))
+				index = *resolved_index;
+			else
+				return getDefaultValue();
+		}
+
+		T_Element result = m_getFunc(obj, index);
+
+		if constexpr (std::is_same<T_Element, bool>::value)
+			return result ? (m_mul10000 ? 10000 : 1) : 0;
+		else
+			return result * (m_mul10000 ? 10000 : 1);
+	}
+
+	bool setElement(int ref, int index, int value) override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return false;
+
+		if (!m_skipIndexCheck)
+		{
+			size_t sz = m_sizeFunc(obj);
+			if (auto resolved_index = resolveIndex(index, sz, m_boundSetterIndex))
+				index = *resolved_index;
+			else
+				return false;
+		}
+
+		if (auto val = transformValue<T_Element>(value))
+		{
+			m_setFunc(obj, index, val.value());
+			return true;
+		}
+
+		return false;
+	}
+
+	void skipIndexCheck() { m_skipIndexCheck = true; }
+
+private:
+	SizeFunc m_sizeFunc;
+	GetFunc m_getFunc;
+	SetFunc m_setFunc;
+	bool m_skipIndexCheck;
+};
+
+template<typename T_Object, auto T_MemberPtr, size_t N>
+class ScriptingArray_ObjectMemberBitwiseFlags : public IScriptingArray
+{
+public:
+	bool resolvesObject() const override { return true; }
+	std::optional<int> getRefRegister() const override { return ref_register_for<T_Object>(); }
+	using MemberType = field_type<T_MemberPtr>::type;
+
+	size_t getSize(int) const override { return N; }
+
+	int getElement(int ref, int index) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return 0;
+
+		if (auto resolved_index = resolveIndex(index, N, m_boundGetterIndex))
+			return ((obj->*T_MemberPtr >> *resolved_index) & 1 ? 1 : 0) * (m_mul10000 ? 10000 : 1);
+
+		return getDefaultValue();
+	}
+
+	bool setElement(int ref, int index, int value) override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return false;
+
+		if (auto resolved_index = resolveIndex(index, N, m_boundSetterIndex))
+			index = *resolved_index;
+		else
+			return false;
+
+		if (auto val = transformValue<bool>(value))
+		{
+			auto flag = (MemberType)(1ULL<<index);
+			SETFLAG(obj->*T_MemberPtr, flag, val.value());
+
+			if (m_writeSideEffect)
+				m_writeSideEffect(obj, index, val.value());
+			return true;
+		}
+
+		return false;
+	}
+
+	void setSideEffect(std::function<void(T_Object*, int, int)> writeSideEffect) { m_writeSideEffect = std::move(writeSideEffect); }
+
+private:
+	std::function<void(T_Object*, int, int)> m_writeSideEffect;
+};
+
+template<typename T_Object, auto T_MemberPtr, auto T_SubMemberPtr, size_t N>
+class ScriptingArray_ObjectSubMemberBitwiseFlags : public IScriptingArray
+{
+public:
+	bool resolvesObject() const override { return true; }
+	std::optional<int> getRefRegister() const override { return ref_register_for<T_Object>(); }
+	using MemberType = field_type<T_SubMemberPtr>::type;
+
+	size_t getSize(int) const override { return N; }
+
+	int getElement(int ref, int index) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return 0;
+
+		if (auto resolved_index = resolveIndex(index, N, m_boundGetterIndex))
+			return ((obj->*T_MemberPtr.*T_SubMemberPtr >> *resolved_index) & 1 ? 1 : 0) * (m_mul10000 ? 10000 : 1);
+
+		return getDefaultValue();
+	}
+
+	bool setElement(int ref, int index, int value) override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return false;
+
+		if (auto resolved_index = resolveIndex(index, N, m_boundSetterIndex))
+			index = *resolved_index;
+		else
+			return false;
+
+		if (auto val = transformValue<bool>(value))
+		{
+			auto flag = (MemberType)(1ULL<<index);
+			SETFLAG(obj->*T_MemberPtr.*T_SubMemberPtr, flag, val.value());
+
+			if (m_writeSideEffect)
+				m_writeSideEffect(obj, index, val.value());
+			return true;
+		}
+
+		return false;
+	}
+
+	void setSideEffect(std::function<void(T_Object*, int, int)> writeSideEffect) { m_writeSideEffect = std::move(writeSideEffect); }
+
+private:
+	std::function<void(T_Object*, int, int)> m_writeSideEffect;
+};
+
+template<typename T_Object, auto T_MemberPtr, size_t N>
+class ScriptingArray_ObjectMemberBitstring : public IScriptingArray
+{
+public:
+	bool resolvesObject() const override { return true; }
+	std::optional<int> getRefRegister() const override { return ref_register_for<T_Object>(); }
+	using MemberType = field_type<T_MemberPtr>::type;
+
+	size_t getSize(int) const override { return N; }
+
+	int getElement(int ref, int index) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return 0;
+
+		if (auto resolved_index = resolveIndex(index, N, m_boundGetterIndex))
+			return ((obj->*T_MemberPtr).get(*resolved_index) ? 1 : 0) * (m_mul10000 ? 10000 : 1);
+
+		return getDefaultValue();
+	}
+
+	bool setElement(int ref, int index, int value) override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return false;
+
+		if (auto resolved_index = resolveIndex(index, N, m_boundSetterIndex))
+			index = *resolved_index;
+		else
+			return false;
+
+		if (auto val = transformValue<bool>(value))
+		{
+			(obj->*T_MemberPtr).set(index, val.value());
+
+			if (m_writeSideEffect)
+				m_writeSideEffect(obj, index, val.value());
+			return true;
+		}
+
+		return false;
+	}
+
+	void setSideEffect(std::function<void(T_Object*, int, int)> writeSideEffect) { m_writeSideEffect = std::move(writeSideEffect); }
+
+private:
+	std::function<void(T_Object*, int, int)> m_writeSideEffect;
+};
+
+template<typename T_Object, auto T_MemberPtr, size_t N>
+class ScriptingArray_ObjectMemberSet : public IScriptingArray
+{
+public:
+	bool resolvesObject() const override { return true; }
+	std::optional<int> getRefRegister() const override { return ref_register_for<T_Object>(); }
+	using MemberType = field_type<T_MemberPtr>::type;
+
+	size_t getSize(int) const override { return N; }
+
+	int getElement(int ref, int index) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return 0;
+
+		if (auto resolved_index = resolveIndex(index, N, m_boundGetterIndex))
+			return ((obj->*T_MemberPtr).contains(*resolved_index) ? 1 : 0) * (m_mul10000 ? 10000 : 1);
+
+		return getDefaultValue();
+	}
+
+	bool setElement(int ref, int index, int value) override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj)
+			return false;
+
+		if (auto resolved_index = resolveIndex(index, N, m_boundSetterIndex))
+			index = *resolved_index;
+		else
+			return false;
+
+		if (auto val = transformValue<bool>(value))
+		{
+			if (val.value())
+				(obj->*T_MemberPtr).insert(index);
+			else
+				(obj->*T_MemberPtr).erase(index);
+
+			if (m_writeSideEffect)
+				m_writeSideEffect(obj, index, val.value());
+			return true;
+		}
+
+		return false;
+	}
+
+	void setSideEffect(std::function<void(T_Object*, int, int)> writeSideEffect) { m_writeSideEffect = std::move(writeSideEffect); }
+
+private:
+	std::function<void(T_Object*, int, int)> m_writeSideEffect;
+};
+
+template<typename T_Object, auto T_MemberPtr>
+class ScriptingArray_ObjectMemberContainer : public IScriptingArray
+{
+public:
+	bool resolvesObject() const override { return true; }
+	std::optional<int> getRefRegister() const override { return ref_register_for<T_Object>(); }
+	using ContainerType = field_type<T_MemberPtr>::type;
+	using ElementType = ContainerType::value_type;
+
+	size_t getSize(int ref) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj) return 0;
+
+		return (obj->*T_MemberPtr).size();
+	}
+
+	int getElement(int ref, int index) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj) return getDefaultValue();
+
+		const auto& container = obj->*T_MemberPtr;
+
+		if (auto resolved_index = resolveIndex(index, container.size(), m_boundGetterIndex))
+		{
+			if constexpr (is_gettable_container<ContainerType>)
+				return container.get(*resolved_index) * (m_mul10000 ? 10000 : 1);
+			else
+				return container[*resolved_index] * (m_mul10000 ? 10000 : 1);
+		}
+
+		return getDefaultValue();
+	}
+
+	bool setElement(int ref, int index, int value) override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj) return false;
+
+		auto& container = (obj->*T_MemberPtr);
+
+		if (auto resolved_index = resolveIndex(index, container.size(), m_boundSetterIndex))
+			index = *resolved_index;
+		else
+			return false;
+
+		if (auto val = transformValue<ElementType>(value))
+		{
+			container[index] = val.value();
+			
+			if (m_writeSideEffect)
+				m_writeSideEffect(obj, &container, index, val.value());
+			return true;
+		}
+		return false;
+	}
+	void setSideEffect(std::function<void(T_Object*, ContainerType*, int, int)> writeSideEffect) { m_writeSideEffect = std::move(writeSideEffect); }
+
+private:
+	std::function<void(T_Object*, ContainerType*, int, int)> m_writeSideEffect;
+};
+
+template<typename T_Object, auto T_MemberPtr, auto T_SubMemberPtr>
+class ScriptingArray_ObjectSubMemberContainer : public IScriptingArray
+{
+public:
+	bool resolvesObject() const override { return true; }
+	std::optional<int> getRefRegister() const override { return ref_register_for<T_Object>(); }
+	using MemberType = field_type<T_MemberPtr>::type;
+	using ContainerType = field_type<T_SubMemberPtr>::type;
+	using ElementType = ContainerType::value_type;
+
+	size_t getSize(int ref) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj) return 0;
+
+		return (obj->*T_MemberPtr.*T_SubMemberPtr).size();
+	}
+
+	int getElement(int ref, int index) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj) return getDefaultValue();
+
+		const auto& container = obj->*T_MemberPtr.*T_SubMemberPtr;
+
+		if (auto resolved_index = resolveIndex(index, container.size(), m_boundGetterIndex))
+		{
+			if constexpr (is_gettable_container<ContainerType>)
+				return container.get(*resolved_index) * (m_mul10000 ? 10000 : 1);
+			else
+				return container[*resolved_index] * (m_mul10000 ? 10000 : 1);
+		}
+
+		return getDefaultValue();
+	}
+
+	bool setElement(int ref, int index, int value) override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj) return false;
+
+		auto& member = (obj->*T_MemberPtr);
+		auto& container = (member.*T_SubMemberPtr);
+
+		if (auto resolved_index = resolveIndex(index, container.size(), m_boundSetterIndex))
+			index = *resolved_index;
+		else
+			return false;
+
+		if (auto val = transformValue<ElementType>(value))
+		{
+			container[index] = val.value();
+			
+			if (m_writeSideEffect)
+				m_writeSideEffect(obj, &member, &container, index, val.value());
+			return true;
+		}
+		return false;
+	}
+	void setSideEffect(std::function<void(T_Object*, MemberType*, ContainerType*, int, int)> writeSideEffect) { m_writeSideEffect = std::move(writeSideEffect); }
+
+private:
+	std::function<void(T_Object*, MemberType*, ContainerType*, int, int)> m_writeSideEffect;
+};
+
+template<typename T_Object, auto T_MemberPtr, auto T_SubMemberPtr, auto T_SubSubMemberPtr>
+class ScriptingArray_ObjectSubSubMemberContainer : public IScriptingArray
+{
+public:
+	bool resolvesObject() const override { return true; }
+	std::optional<int> getRefRegister() const override { return ref_register_for<T_Object>(); }
+	using MemberType = field_type<T_MemberPtr>::type;
+	using SubMemberType = field_type<T_SubMemberPtr>::type;
+	using ContainerType = field_type<T_SubSubMemberPtr>::type;
+	using ElementType = ContainerType::value_type;
+
+	size_t getSize(int ref) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj) return 0;
+
+		return (obj->*T_MemberPtr.*T_SubMemberPtr.*T_SubSubMemberPtr).size();
+	}
+
+	int getElement(int ref, int index) const override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj) return getDefaultValue();
+
+		const auto& container = obj->*T_MemberPtr.*T_SubMemberPtr.*T_SubSubMemberPtr;
+
+		if (auto resolved_index = resolveIndex(index, container.size(), m_boundGetterIndex))
+		{
+			if constexpr (is_gettable_container<ContainerType>)
+				return container.get(*resolved_index) * (m_mul10000 ? 10000 : 1);
+			else
+				return container[*resolved_index] * (m_mul10000 ? 10000 : 1);
+		}
+
+		return getDefaultValue();
+	}
+
+	bool setElement(int ref, int index, int value) override
+	{
+		auto* obj = resolveScriptingObject<T_Object>(ref);
+		if (!obj) return false;
+
+		auto& member = (obj->*T_MemberPtr);
+		auto& sub_member = (member.*T_SubMemberPtr);
+		auto& container = (sub_member.*T_SubSubMemberPtr);
+
+		if (auto resolved_index = resolveIndex(index, container.size(), m_boundSetterIndex))
+			index = *resolved_index;
+		else
+			return false;
+
+		if (auto val = transformValue<ElementType>(value))
+		{
+			container[index] = val.value();
+			
+			if (m_writeSideEffect)
+				m_writeSideEffect(obj, &member, &sub_member, &container, index, val.value());
+			return true;
+		}
+		return false;
+	}
+	void setSideEffect(std::function<void(T_Object*, MemberType*, SubMemberType*, ContainerType*, int, int)> writeSideEffect) { m_writeSideEffect = std::move(writeSideEffect); }
+
+private:
+	std::function<void(T_Object*, MemberType*, SubMemberType*, ContainerType*, int, int)> m_writeSideEffect;
+};
+
+struct ArrayRegistrar
+{
+	ArrayRegistrar(int zasm_var, IScriptingArray* arrayImpl, std::optional<int> ref_register = std::nullopt);
+};
+
+void zasm_array_register(int zasm_var, IScriptingArray* impl, std::optional<int> ref_register = std::nullopt);
+
+// The array registered for a ZASM register, if any.
+const IScriptingArray* zasm_array_get(int zasm_var);
+
+// The ref register the array's object resolves from: the registration's
+// override if one was given (lweapon/eweapon), else what the object type says.
+// Only meaningful for arrays whose resolvesObject() is true; test_arrays checks
+// the generated zasm table agrees with this.
+std::optional<int> zasm_array_ref_register(int zasm_var);
+
+#endif

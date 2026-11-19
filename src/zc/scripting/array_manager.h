@@ -1,0 +1,62 @@
+#ifndef ZC_SCRIPTING_ARRAY_MANAGER_H_
+#define ZC_SCRIPTING_ARRAY_MANAGER_H_
+
+#include "base/general.h"
+#include "base/zc_array.h"
+#include "user_object.h"
+#include <cstdint>
+#include <functional>
+#include <string>
+
+// A tiny cache of the most recent id -> script_array resolutions, consulted
+// by ArrayManager on every script array access (see array_manager.cpp). Ids
+// are reused after deletion, so it must be invalidated on every script object
+// deletion and container reset.
+struct ScriptArrayCache
+{
+	struct Entry { uint32_t id; script_array* array; };
+	static constexpr size_t MAX = 8;
+	Entry entries[MAX];
+	size_t cursor;
+};
+extern ScriptArrayCache script_array_cache;
+void script_array_cache_invalidate(uint32_t id);
+void script_array_cache_clear();
+
+class ArrayManager
+{
+public:
+	ArrayManager(int32_t ptr, bool neg);
+	ArrayManager(int32_t ptr);
+	
+	int32_t get(int32_t indx) const;
+	void set(int32_t indx, int32_t val, script_object_type is_object = script_object_type::none);
+	int32_t normalize_index(int32_t indx) const;
+	int32_t size() const;
+	std::vector<int32_t> data() const;
+	const struct script_array* script_array() const;
+	
+	bool resize(size_t newsize);
+	bool resize_min(size_t minsz);
+	bool holds_object(int indx);
+	script_object_type get_object_type(int indx) const;
+	bool can_resize();
+	bool push(int32_t val, int indx = -1, script_object_type type = script_object_type::none);
+	int32_t pop(int indx = -1);
+	
+	bool invalid() const {return _invalid;}
+	bool internal() const {return !_invalid && !aptr;}
+
+	std::string asString(std::function<char const*(int32_t)> formatter, const size_t& limit) const;
+	void log_invalid_operation() const;
+	
+	bool negAccess;
+private:
+	ZScriptArray* aptr;
+	struct script_array* script_array_object;
+	int32_t legacy_internal_id;
+	script_array::internal_array_id internal_array_id;
+	bool _invalid;
+};
+
+#endif

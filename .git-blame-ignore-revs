@@ -1,0 +1,31 @@
+# Run this to utilzie this file:
+# git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# Bunch of whitespace changes.
+99a363647e21f0e50fc44d5236f7c06cad65a26d
+4a60fd30f78754db103f40d07983e64715b28258
+1e91131d0228d8492fb12703eb7c3005610c3e64
+3ba99ebfe3731b60eb2358cc0e2e7b596d513034
+9492513da453edf2ad2fb2ff4ea18d6128a248ab
+4efd9e4c0200db4f253fe800ca6c86f0859f6084
+6e9c3767ed30e84cc13df2674fd8a141d761b084
+d6655bb57fe6502d0538e1f83771e680042749f9
+fa73284ec247200e4efb382d0a959d9835cf3b84
+5439a8d8ea245774596aa4f958962cd4a1df695d
+6f9b23667b87241d926a878220830a4844b478fb
+
+# Mass comment update
+f3ae9af4b92021cbfcf14ced7714968532b96b78
+
+# Major/trivial refactors
+44e2bbf42b4d5ff02fa8b0aa63d50f487853dde9
+
+# Python reformat
+c54f2619599e9031e38f5b832f77a41fc7fa0ef0
+2cabfdb7c062cdf5c1febc70792422289f0db850
+
+# Touched every header guard
+f661f010af5cdd45f3ad21c2362268a13d1c95c3
+
+# TextField bounds = {low, high} migration
+cf55ed2543d25ec11c5bb2d04aa01d3e0c410f07

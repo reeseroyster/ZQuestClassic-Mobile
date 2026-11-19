@@ -1,0 +1,134 @@
+stderr:
+
+Compiling 'screen_script.zs'
+Pass 1: Parsing
+Pass 2: Preprocessing
+Pass 3: Registration
+Pass 4: Analyzing Code
+Pass 5: Checking code paths
+Pass 6: Generating object code
+Pass 7: Assembling
+Success!
+Compile finished with exit code '0' (success)
+
+stdout:
+
+{
+  "success": true,
+  "diagnostics": [],
+  "metadata": {
+    "currentFileSymbols": 3,
+    "symbols": 21,
+    "identifiers": 47,
+    "elided": true
+  }
+}
+
+zasm:
+
+QUIT; void run() Body
+PUSHR D0; void run(int, int) Params
+PUSHR D1
+PUSHV 0; void run(int, int) Body Start
+SETR D4 SP2
+SETR D2 LINKHP
+DIVV D2 2
+PUSHR D2
+POP D2
+SETR LINKHP D2
+SETV D2 0.0001; InlineFunc[int ComboAt(int, int)] Params Start AND while(true) #2 Body [Opt:AlwaysOn] Start
+PUSHR D2
+POP REFSPRITE
+SETR D2 SPRITE_X
+ADDV D2 8
+PUSHR D2
+SETV D2 0.0001
+PUSHR D2
+POP REFSPRITE
+SETR D2 SPRITE_Y
+ADDV D2 8
+SETR D3 D2; InlineFunc[int ComboAt(int, int)] Params End
+POP D2; InlineFunc[int ComboAt(int, int)] Body Start
+COMBO_AT D2 D3; InlineFunc[int ComboAt(int, int)] Body End
+STORE D2 0
+LOAD D2 0; if() #388 Test
+PUSHR D2
+POP D0
+SETR D2 COMBODD
+PUSHR D2
+LOAD D2 0.0002
+POP D3
+COMPARER D3 D2
+SETCMP D2 I==
+COMPAREV D2 0
+GOTOCMP 50 ==; Test 'if'
+LOAD D2 0; if() #388 Body Start
+PUSHR D2
+POP D0
+SETR D2 COMBODD
+ADDV D2 1
+PUSHR D2
+LOAD D2 0
+PUSHR D2
+POP D0
+POP D2
+SETR COMBODD D2
+LOAD D2 0.0001; InlineFunc[void Audio::PlaySound(int)] Params
+PLAYSOUNDR D2; InlineFunc[void Audio::PlaySound(int)] Body AND if() #388 Body End
+NOP
+PUSHV 6; InlineFunc[void screendata::DrawTile(int, int, int, int, int, int, int, int, int, int, int, int, int, bool, int)] Params Start
+SETV D2 0.0001
+PUSHR D2
+POP REFSPRITE
+PUSHR SPRITE_X
+SETV D2 0.0001
+PUSHR D2
+POP REFSPRITE
+SETR D2 SPRITE_Y
+SUBV D2 16
+PUSHR D2
+SETV D2 0.0001
+PUSHR D2
+POP REFSPRITE
+PUSHR SPRITE_TILE
+PUSHARGSV 1 0.0002
+SETV D2 0.0001
+PUSHR D2
+POP REFSPRITE
+PUSHR SPRITE_CSET
+PUSHARGSV -1 0.0002
+PUSHARGSV 0 0.0004
+PUSHV 1
+PUSHV 128; InlineFunc[void screendata::DrawTile(int, int, int, int, int, int, int, int, int, int, int, int, int, bool, int)] Params End
+DRAWTILER; InlineFunc[void screendata::DrawTile(int, int, int, int, int, int, int, int, int, int, int, int, int, bool, int)] Body Start
+POPARGS D5 0.0015; InlineFunc[void screendata::DrawTile(int, int, int, int, int, int, int, int, int, int, int, int, int, bool, int)] Body End
+WAITDRAW; InlineFunc[void Waitdraw()] Body
+PUSHV 6; InlineFunc[void screendata::DrawTile(int, int, int, int, int, int, int, int, int, int, int, int, int, bool, int)] Params Start
+SETV D2 0.0001
+PUSHR D2
+POP REFSPRITE
+PUSHR SPRITE_X
+SETV D2 0.0001
+PUSHR D2
+POP REFSPRITE
+SETR D2 SPRITE_Y
+ADDV D2 16
+PUSHR D2
+SETV D2 0.0001
+PUSHR D2
+POP REFSPRITE
+PUSHR SPRITE_TILE
+PUSHARGSV 1 0.0002
+SETV D2 0.0001
+PUSHR D2
+POP REFSPRITE
+PUSHR SPRITE_CSET
+PUSHARGSV -1 0.0002
+PUSHARGSV 0 0.0003
+PUSHV 2
+PUSHV 1
+PUSHV 128; InlineFunc[void screendata::DrawTile(int, int, int, int, int, int, int, int, int, int, int, int, int, bool, int)] Params End
+DRAWTILER; InlineFunc[void screendata::DrawTile(int, int, int, int, int, int, int, int, int, int, int, int, int, bool, int)] Body Start
+POPARGS D5 0.0015; InlineFunc[void screendata::DrawTile(int, int, int, int, int, int, int, int, int, int, int, int, int, bool, int)] Body End
+WAITFRAME; InlineFunc[void Waitframe()] Body AND while(true) #2 Body [Opt:AlwaysOn] End
+GOTO 11; while() #2 End AND [Opt:NeverRet] AND void run(int, int) Body End

@@ -1,0 +1,700 @@
+# Downloads all the replays uploaded via the replay upload service,
+# copies them to a new replay file that can be updated without modifying
+# the original, and enables running all of them via run_replay_tests.py.
+#
+# This requires an auth key placed at `~/.aws/credentials`
+# (or `C:\Users\USERNAME\.aws\credentials`) under `[zc-replays]`.
+# Ask Connor to get a personal key.
+#
+# Note this currently accepts any graphical changes, and will only report
+# an error if a replay fails to update due to behavioral changes (ex: rng
+# desync, not loading into a screen on the expected frame, etc).
+#
+# To see a list of all uploaded replays grouped by qst, run:
+#
+#   python scripts/replay_uploads.py
+#
+# To attempt to update the local copy of all replays using the current local build, run:
+#
+#   python scripts/replay_uploads.py --update
+#
+# These replays can be used to validate changes - but only by exluding the
+# "known bad" replays which currently fail to update for some unknown reason.
+# For example:
+#
+#   You have a change you want more validation for. Go to the commit just
+#   before, build, and run `python scripts/replay_uploads.py --update --only_known_good`.
+#   Then, with your new change, run
+#   `python scripts/replay_uploads.py --assert --only_known_good`. If
+#   anything fails, generate a compare report and investigate.
+#
+# The known good replays (scripts/replay_uploads_known_good_replays.json) are pinned
+# to how much of each replay was validated, so everyone runs the same replays even
+# as players upload longer versions of them. To refresh that list (picking up new
+# and re-uploaded replays), run `python scripts/replay_uploads.py --update --update_known_good`
+# (some will fail to update, that is ok) and commit the result.
+#
+# To debug why a replay can't be updated, run:
+#
+#   python scripts/replay_uploads.py --debug 50C00A5197148F3D1587A16509DCC89F/0be80dd3-c719-4203-a314-fec7e9557a7f.zplay
+#
+# To view a specific replay, run:
+#
+#   python tests/run_replay_tests.py $PWD/.tmp/replay_uploads/D2905F6A4976CBC02C3ACC92AD6CB12C/c4c21082-dc31-49e0-9f35-d18bfb87c841-updated-main.zplay --show
+#
+# TODO: consider running in CI (see the "For example" above)
+
+import argparse
+import csv
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+
+from pathlib import Path
+
+import archives
+import boto3
+import common
+import database
+
+script_dir = Path(os.path.dirname(os.path.realpath(__file__)))
+root_dir = script_dir.parent
+replays_dir = root_dir / '.tmp/replay_uploads'
+
+os.sys.path.append(str((root_dir / 'tests/lib').absolute()))
+os.sys.path.append(str((root_dir / 'tests').absolute()))
+import replay_helpers
+
+from replays import ReplayTestResults
+
+channel = 'main'
+updated_suffx = f'-updated-{channel}.zplay'
+updated_suffix_no_ext = f'-updated-{channel}'
+
+parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument(
+    '--update', action='store_true', help='Update all the local replay copies'
+)
+parser.add_argument(
+    '--assert',
+    action='store_true',
+    help='Assert all the local replay copies',
+    dest='assertmode',
+)
+parser.add_argument(
+    '--only_known_good',
+    action='store_true',
+    help='Filter out all replays that are not known to be good / update-able',
+)
+parser.add_argument(
+    '--update_known_good',
+    action='store_true',
+    help='Update the checked-in file for which replays are update-able',
+)
+parser.add_argument('--debug', help='Debug why the given replay cannot be updated')
+parser.add_argument(
+    '--coverage',
+    action='store_true',
+    help='Save CSV of replay coverage across all database quests, using uploaded replays and test replays',
+)
+args = parser.parse_args()
+
+bucket = None
+db = database.Database()
+
+
+def connect_bucket():
+    global bucket
+
+    bucket_name = 'zc-replays'
+    boto3.setup_default_session(profile_name='zc-replays')
+    s3 = boto3.resource(
+        's3',
+        region_name='nyc3',
+        endpoint_url='https://nyc3.digitaloceanspaces.com',
+    )
+    bucket = s3.Bucket(bucket_name)
+
+
+def prepare_and_get_replay_keys():
+    connect_bucket()
+
+    get_qst_keys_by_hash = db.get_qst_keys_by_hash()
+    sizes_by_key = {obj.key: obj.size for obj in bucket.objects.all()}
+    # Note: currently no plans to actual upload updated replays back to bucket.
+    original_keys = [key for key in sizes_by_key if updated_suffx not in key]
+
+    print('All replays downloaded from the upload bucket\n')
+    print(f'Directory: {replays_dir}')
+    print(f'Total: {len(original_keys)}')
+
+    # Download everything. A replay can be re-uploaded with more frames appended
+    # (same key), so also re-download any local copy whose size doesn't match.
+    for key, size in sizes_by_key.items():
+        # Don't clobber local update results with whatever is in the bucket.
+        if updated_suffx in key:
+            size = None
+        download_replay(key, size)
+
+    # Group replays by qst_hash.
+    keys_by_qst_hash = {}
+    for key in original_keys:
+        qst_hash = key.split('/')[0]
+        if qst_hash not in keys_by_qst_hash:
+            keys_by_qst_hash[qst_hash] = []
+        keys_by_qst_hash[qst_hash].append(key)
+
+    # Copy qst files.
+    for qst_hash in keys_by_qst_hash.keys():
+        qst_key, qst_release = get_qst_keys_by_hash[qst_hash]
+        db.download_release(qst_release)
+        qst_path = db.download(qst_key)
+
+        qst_replays_dir = replays_dir / qst_hash
+        copied_qst_path = qst_replays_dir / f'{qst_hash}.qst'
+        if not copied_qst_path.exists():
+            shutil.copyfile(qst_path, copied_qst_path)
+
+    known_good = get_known_good_replays() if args.only_known_good else {}
+    for key in original_keys:
+        init_updated_replay(key, known_good.get(key))
+
+    return original_keys
+
+
+def get_replay_path(key: str) -> Path:
+    return replays_dir / key
+
+
+def download_replay(key: str, size: int | None):
+    path = get_replay_path(key)
+    if path.exists():
+        local_size = path.stat().st_size
+        if size is None or local_size == size:
+            return
+
+        print(f'updating: {key} (re-uploaded, {local_size} -> {size} bytes)')
+    else:
+        print(f'downloading: {key}')
+
+    path.parent.mkdir(exist_ok=True, parents=True)
+    bucket.download_file(key, path)
+
+
+def parse_meta_line(line: str) -> tuple[str, str]:
+    # Not stripped: a meta line may have an empty value ("M qst_title ").
+    _, meta_key, value = line.split(' ', 2)
+    return meta_key, value
+
+
+# Note: these avoid replay_helpers.read_replay_meta, which caches by path - but the
+# files here change during a run.
+def read_replay_meta(path: Path) -> dict[str, str]:
+    """Reads just the leading meta lines, without loading the rest of the replay."""
+    meta = {}
+    with path.open(encoding='utf-8') as f:
+        for line in f:
+            if not line.startswith('M'):
+                break
+            meta_key, value = parse_meta_line(line.rstrip('\n'))
+            meta[meta_key] = value
+    return meta
+
+
+def read_replay(path: Path) -> tuple[dict[str, str], list[str]]:
+    """Returns tuple: meta, steps"""
+    lines = path.read_text('utf-8').splitlines()
+    meta = {}
+    num_meta = 0
+    while num_meta < len(lines) and lines[num_meta].startswith('M'):
+        meta_key, value = parse_meta_line(lines[num_meta])
+        meta[meta_key] = value
+        num_meta += 1
+    return meta, [l for l in lines[num_meta:] if l]
+
+
+def get_replay_pin(key: str) -> dict:
+    """The length (number of steps) and frames of the local copy of an uploaded replay."""
+    # The api server only accepts a replay whose length meta matches its steps, so the
+    # whole replay need not be read.
+    meta = read_replay_meta(get_replay_path(key))
+    return {'length': int(meta['length']), 'frames': int(meta['frames'])}
+
+
+def get_updated_key(key: str):
+    return key.replace('.zplay', updated_suffx)
+
+
+def read_updated_replay_pin(path: Path) -> dict | None:
+    meta = read_replay_meta(path)
+    if 'replay_upload_length' not in meta:
+        return None
+    return {
+        'length': int(meta['replay_upload_length']),
+        'frames': int(meta['replay_upload_frames']),
+    }
+
+
+# Creates the local copy of an uploaded replay that gets updated / asserted.
+#
+# If `pin` is given, only that much of the uploaded replay is used. Replays are
+# append-only (the api server rejects any re-upload that changes existing steps),
+# so a pin always recreates exactly the replay that was previously validated, no
+# matter how much has been uploaded since. Without a pin, the whole replay is used.
+#
+# The copy is only recreated (discarding local update results) when what it was
+# made from changes, and only in --update mode. Recreating it otherwise would make
+# --assert fail for reasons unrelated to the build being tested.
+def init_updated_replay(key: str, pin: dict | None):
+    original_replay_path = get_replay_path(key)
+    updated_replay_path = original_replay_path.with_name(
+        original_replay_path.name.replace('.zplay', updated_suffx)
+    )
+
+    if not pin:
+        pin = get_replay_pin(key)
+
+    if updated_replay_path.exists():
+        current_pin = read_updated_replay_pin(updated_replay_path)
+        if current_pin == pin:
+            return
+
+        rel_path = updated_replay_path.relative_to(replays_dir)
+        if not args.update:
+            if args.assertmode:
+                print(
+                    f'warning: {rel_path} was made from {current_pin}, not {pin} (run with --update to recreate)'
+                )
+            return
+
+        print(f'recreating: {rel_path} ({current_pin} -> {pin})')
+
+    meta, steps = read_replay(original_replay_path)
+    if len(steps) < pin['length']:
+        raise Exception(f'{key} has fewer steps than its pin: {pin}')
+
+    qst_hash = key.split('/')[0]
+    meta['debug'] = 'true'  # Not all uploaded replays are in debug mode.
+    meta['qst'] = f'{qst_hash}.qst'
+    meta['replay_upload_key'] = key
+    meta['replay_upload_length'] = pin['length']
+    meta['replay_upload_frames'] = pin['frames']
+    meta['length'] = pin['length']
+    meta['frames'] = pin['frames']
+
+    new_lines = []
+    for meta_key, value in meta.items():
+        new_lines.append(f'M {meta_key} {value}')
+
+    # TODO: if we make these replays viewable publicly, should first remove key
+    # events. It's rare that a quest needs them.
+    # if line.startswith('D') or line.startswith('U'):
+    #     parts = line.split(' ')
+    #     if len(parts) == 4 and parts[2] == 'k':
+    #         continue
+    new_lines.extend(steps[: pin['length']])
+
+    updated_replay_path.write_text('\n'.join(new_lines), 'utf-8')
+
+
+def run_replays_process(args):
+    test_results_folder = root_dir / '.tmp/replay_uploads_test_results'
+    if test_results_folder.exists():
+        shutil.rmtree(test_results_folder)
+    test_results_folder.parent.mkdir(parents=True, exist_ok=True)
+    # There can be hundreds of replay paths here, which blows past Windows'
+    # ~32k command line limit, so pass them in a response file instead.
+    args_path = test_results_folder.parent / 'replay_uploads_args.txt'
+    args_path.write_text('\n'.join(str(arg) for arg in args))
+    subprocess.run(
+        [
+            sys.executable,
+            root_dir / 'tests/run_replay_tests.py',
+            '--test_results_folder',
+            test_results_folder,
+            '--root_replays_folder',
+            replays_dir,
+            f'@{args_path}',
+        ]
+    )
+    test_results_json = json.loads(
+        (test_results_folder / 'test_results.json').read_text('utf-8')
+    )
+    test_results = ReplayTestResults(**test_results_json)
+    return test_results
+
+
+def run_replays_process_with_version(zc_version, args):
+    release_platform = common.get_release_platform()
+    build_folder = archives.download(zc_version, release_platform)
+    if release_platform == 'mac':
+        zc_app_path = next(build_folder.glob('*.app'))
+        build_folder = zc_app_path / 'Contents/Resources'
+    return run_replays_process([*args, '--build_folder', build_folder])
+
+
+# Maps each known good replay to its pin: how much of the replay was validated
+# (see init_updated_replay).
+def get_known_good_replays() -> dict[str, dict]:
+    known_good_path = Path(script_dir / 'replay_uploads_known_good_replays.json')
+    return json.loads(known_good_path.read_text())
+
+
+def run_replays():
+    if args.update:
+        mode = 'update'
+    elif args.assertmode:
+        mode = 'assert'
+
+    original_keys = prepare_and_get_replay_keys()
+    exclude_keys = [
+        # This replay has an RNG desync even when played in the same release it was made in.
+        # Warrants further investigation.
+        'DFA6082440977B8C2C0BD323D17068C4/f064251f-0507-44ef-8cc3-42c0c71dd979.zplay'
+    ]
+    original_keys = [key for key in original_keys if key not in exclude_keys]
+    if args.only_known_good:
+        known_good = get_known_good_replays()
+        original_keys = [k for k in original_keys if k in known_good]
+    updated_keys = [get_updated_key(key) for key in original_keys]
+    updated_paths = [get_replay_path(key) for key in updated_keys]
+
+    test_results = run_replays_process([f'--{mode}', *updated_paths])
+
+    if args.update_known_good:
+        known_good = {}
+        for run in test_results.runs[0]:
+            if run.success:
+                index = updated_paths.index(Path(run.path))
+                pin = read_updated_replay_pin(updated_paths[index])
+                known_good[original_keys[index]] = pin
+        known_good = dict(sorted(known_good.items()))
+        known_good_path = Path(script_dir / 'replay_uploads_known_good_replays.json')
+        known_good_path.write_text(json.dumps(known_good, indent=2))
+
+    failing_runs = []
+    for run in test_results.runs[-1]:
+        if not run.success:
+            failing_runs.append(run)
+
+    if failing_runs:
+        print('These replays failed (to debug, use `--debug replay/path.zplay`):\n')
+
+        for run in failing_runs:
+            meta = replay_helpers.read_replay_meta(Path(run.path))
+            title = meta.get('qst_title', meta['qst'])
+            print(Path(run.path).relative_to(replays_dir))
+            print(title)
+            print()
+    else:
+        print('All replays passed')
+
+
+# https://docs.google.com/spreadsheets/d/1BD0wsO2fDpvZDMgI9-wwgcLKNqCc7j8e8ZLJlfNdTz8/edit?gid=0#gid=0&fvid=2018909849
+def make_coverage_csv():
+    known_good = get_known_good_replays()
+    original_keys = prepare_and_get_replay_keys()
+
+    replays_by_qst_hash = {}
+    for key in original_keys:
+        path = get_replay_path(key)
+        meta = replay_helpers.read_replay_meta(path)
+
+        qst_hash = meta['qst_hash']
+        if qst_hash not in replays_by_qst_hash:
+            replays_by_qst_hash[qst_hash] = []
+        replays_by_qst_hash[qst_hash].append(path)
+
+    quests = db.quests
+    quests.sort(
+        key=lambda x: x.rating_score if x.rating_score != None else -1, reverse=True
+    )
+
+    test_replay_datas = []
+    for path in (root_dir / 'tests/replays').rglob('*.zplay'):
+        if 'playground' in str(path):
+            continue
+        if 'z3' in str(path):
+            continue
+        if 'misc' in str(path):
+            continue
+
+        meta = replay_helpers.read_replay_meta(path)
+        qst_hash = meta.get('qst_hash')
+        title = meta.get('qst_title')
+
+        if 'nargads_trail_crystal_crusades' in str(path):
+            title = "Nargad's Trail: Crystal Crusades"
+        if 'demosp' in str(path):
+            title = 'Demo Quest SP'
+        if 'new2013' in str(path):
+            title = 'New Quest 2013'
+
+        d = next(
+            (
+                d
+                for d in test_replay_datas
+                if (title and d['title'] == title)
+                or (qst_hash and d['hash'] == qst_hash)
+            ),
+            None,
+        )
+        if not d:
+            d = {'title': title, 'hash': qst_hash, 'paths': []}
+            test_replay_datas.append(d)
+        d['paths'].append(path)
+
+    rows = []
+    for quest in quests:
+        replay_paths = []
+        hashes = []
+
+        for rls in quest.releases:
+            if not rls.resource_hashes:
+                continue
+
+            for i, r in enumerate(rls.resources):
+                if r.lower().endswith('.qst'):
+                    h = rls.resource_hashes[i]
+                    paths = replays_by_qst_hash.get(h, [])
+                    replay_paths.extend(paths)
+                    hashes.append(h)
+
+        replay_paths = set(replay_paths)
+
+        frames = 0
+        frames_good = 0
+        for path in replay_paths:
+            meta = replay_helpers.read_replay_meta(path)
+            frames += meta['frames']
+            if str(path.relative_to(replays_dir)) in known_good:
+                frames_good += meta['frames']
+
+        test_replay_data = next(
+            (
+                d
+                for d in test_replay_datas
+                if d['title'] == quest.name or d['hash'] in hashes
+            ),
+            None,
+        )
+        if test_replay_data:
+            for path in test_replay_data['paths']:
+                meta = replay_helpers.read_replay_meta(path)
+                frames += meta['frames']
+                frames_good += meta['frames']
+            test_replay_datas.remove(test_replay_data)
+
+        version = quest.data.get('zcVersion', '')
+        if version.startswith('1.92'):
+            version = '1.92'
+        elif version.startswith('2.50'):
+            version = '2.50'
+
+        url = quest.data.get('projectUrl', '')
+        frames_minutes = '{0:.1f}'.format(frames / 60 / 60)
+        frames_good_minutes = '{0:.1f}'.format(frames_good / 60 / 60)
+        rows.append(
+            [
+                quest.name,
+                url,
+                version,
+                len(replay_paths),
+                frames_minutes,
+                frames_good_minutes,
+            ]
+        )
+
+    if test_replay_datas:
+        print('warning: unused test replays')
+        for d in test_replay_datas:
+            print(d)
+
+    path = root_dir / '.tmp/replay_coverage.csv'
+    with open(path, 'w', newline='') as csvfile:
+        w = csv.writer(csvfile, quoting=csv.QUOTE_MINIMAL)
+        w.writerow(
+            [
+                'Quest',
+                'URL',
+                'ZC Version',
+                '# Replays',
+                'Minutes (total)',
+                'Minutes (good)',
+            ]
+        )
+        w.writerows(rows)
+        print(f'saved: {path}')
+
+
+def print_info():
+    original_keys = prepare_and_get_replay_keys()
+
+    replays_by_qst_hash = {}
+    frames = 0
+    for key in original_keys:
+        path = get_replay_path(key)
+        meta = replay_helpers.read_replay_meta(path)
+        frames += meta['frames']
+
+        qst_hash = meta['qst_hash']
+        if qst_hash not in replays_by_qst_hash:
+            replays_by_qst_hash[qst_hash] = []
+        replays_by_qst_hash[qst_hash].append(path)
+
+    print(f'Frames: {frames}')
+    print('Hours: {0:.1f}'.format(frames / 60 / 60 / 60))
+    print()
+
+    for qst_hash, paths in replays_by_qst_hash.items():
+        paths.sort(key=lambda p: -replay_helpers.read_replay_meta(p)['frames'])
+
+        title = replay_helpers.read_replay_meta(paths[0]).get('qst_title', qst_hash)
+        print(f'{title.strip()} ({len(paths)})')
+        for path in paths:
+            meta = replay_helpers.read_replay_meta(path)
+            frames = meta['frames']
+            print(f'\t{path.relative_to(replays_dir)} ({frames} frames)')
+        print()
+
+
+# Finds the most recent ZC version that can update the replay, does that update, and prints a
+# command to run to see a compare report against the current local build.
+def debug_replay(replay_path: Path):
+    if updated_suffix_no_ext not in replay_path.name:
+        replay_path = replay_path.with_stem(
+            f'{replay_path.stem}{updated_suffix_no_ext}'
+        )
+
+    replay_path = replays_dir / replay_path
+    meta = replay_helpers.read_replay_meta(replay_path)
+    title = meta.get('qst_title', meta['qst'])
+    zc_version_updated = meta['zc_version_updated']
+    print(f'title: {title}')
+    print(f'zc_version_updated: {zc_version_updated}')
+
+    tmp_path = replay_path.with_stem(f'{replay_path.stem}-tmp')
+    shutil.copyfile(replay_path, tmp_path)
+
+    # Validate that this replay can even be updated in the version that created it.
+    test_results = run_replays_process_with_version(
+        zc_version_updated, [tmp_path, '--update']
+    )
+    if not test_results.runs[-1][0].success:
+        print('cannot update the replay even in the same ZC version it was created in')
+        tmp_path.unlink()
+        sys.exit(1)
+
+    shutil.copyfile(replay_path, tmp_path)
+    test_results = run_replays_process([tmp_path, '--update'])
+    if test_results.runs[-1][0].success:
+        print(test_results.runs[-1][0])
+        print(
+            'was able to update the replay with the current build - nothing to debug.'
+        )
+        tmp_path.unlink()
+        sys.exit()
+
+    # Reduce the replay to just the part that is failing.
+    stopped_frame = test_results.runs[-1][0].frame
+    lines = tmp_path.read_text().splitlines()
+    for i, line in enumerate(lines):
+        type, frame, _ = line.split(' ', 2)
+        if type == 'M':
+            continue
+
+        frame = int(frame)
+        # Go 1s beyond where it fails.
+        if frame > stopped_frame + 60:
+            lines = lines[: i + 1]
+            break
+
+    tmp_trimmed_path = replay_path.with_stem(f'{replay_path.stem}-tmp-trimmed')
+    tmp_trimmed_path.write_text('\n'.join(lines))
+    shutil.copyfile(tmp_trimmed_path, tmp_path)
+
+    # Bisect to find the newest version that can update this replay.
+
+    # First, assume and validate the good/bad versions.
+    if zc_version_updated == '2.55.7':
+        good_version = '3.0.0-prerelease.76+2024-10-19'
+    elif zc_version_updated == '2.55.8':
+        good_version = '3.0.0-prerelease.85+2025-01-10'
+    elif zc_version_updated == '2.55.9':
+        good_version = '3.0.0-prerelease.95+2025-03-25'
+    else:
+        good_version = '3.0.0-prerelease.1+2023-11-12'
+    bad_version = archives.get_revisions(common.get_release_platform(), 'main')[-1].tag
+    print(f'assuming good: {good_version}, bad: {bad_version}')
+
+    print('Running bisect...')
+    output = subprocess.check_output(
+        [
+            sys.executable,
+            root_dir / 'scripts/bisect_builds.py',
+            '--good',
+            good_version,
+            '--bad',
+            bad_version,
+            '--check_return_code',
+            '--',
+            'bash',
+            '-c',
+            f'cp {tmp_trimmed_path} {tmp_path} && %zc -v0 -headless -replay-exit-when-done -update {tmp_path}',
+        ],
+        encoding='utf-8',
+        stderr=subprocess.STDOUT,
+    )
+
+    bisect_done = False
+    last_good_version = None
+    for line in output.splitlines():
+        print(line)
+        if bisect_done:
+            # print(line)
+            if line.startswith('GOOD'):
+                last_good_version = line[4:].strip()
+        elif line.strip() == 'bisect finished!':
+            bisect_done = True
+
+    print('\nBisect done.')
+    print(f'Last version that can update replay: {last_good_version}')
+
+    shutil.copyfile(tmp_trimmed_path, tmp_path)
+    test_results = run_replays_process_with_version(
+        last_good_version, [tmp_path, '--update']
+    )
+    if not test_results.runs[-1][0].success:
+        print(
+            f'was unable to update the replay with the calculated "last good" version: {last_good_version}.'
+        )
+        tmp_path.unlink()
+        tmp_trimmed_path.unlink()
+        sys.exit(1)
+
+    debug_replay_path = replay_path.with_stem(f'{replay_path.stem}-debug')
+    shutil.copyfile(tmp_path, debug_replay_path)
+    print(f'Replayed updated at: {debug_replay_path}')
+
+    print('\nTo see a compare report, run:')
+    print(
+        f'  python tests/run_replay_tests.py --baseline_version {last_good_version} {debug_replay_path}'
+    )
+
+    tmp_path.unlink()
+    tmp_trimmed_path.unlink()
+
+
+if args.coverage:
+    make_coverage_csv()
+elif args.update or args.assertmode:
+    run_replays()
+elif args.debug:
+    debug_replay(Path(args.debug))
+else:
+    print_info()
+    print('exiting (use --assert or --update to run replays)')
+    sys.exit()

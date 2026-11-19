@@ -1,0 +1,716 @@
+#include <cstring>
+#include <memory>
+
+#include "core/qrs.h"
+#include "core/dmap.h"
+#include "base/util.h"
+#include "core/zdefs.h"
+#include "zc/maps.h"
+#include "zc/zelda.h"
+#include "subscr.h"
+#include "zc/zc_subscr.h"
+#include "zc/hero.h"
+#include "gamedata.h"
+#include "zc/guys.h"
+#include "zc/ffscript.h"
+#include "zc/replay.h"
+#include "core/mapscr.h"
+#include "core/misctypes.h"
+#include "zc/zscriptversion.h"
+
+extern int32_t directItemA;
+extern int32_t directItemB;
+extern int32_t directItemY;
+extern int32_t directItemX;
+
+//DIALOG *sso_properties_dlg;
+
+int current_subscr_pos = sspUP;
+static bool opening_subscr_show_bottom_8px;
+
+void put_active_subscr(int32_t y, int32_t pos)
+{
+	// Active subscreens do not yet get to use those 8 extra pixels. Until then,
+	// draw 8 black pixels at the top (as the active subscreen will move an additional
+	// 8 pixels and so must obscure the playing field somehow).
+	if (opening_subscr_show_bottom_8px && get_qr(qr_ACTIVE_SUB_IGNORE_8PX))
+	{
+		rectfill(framebuf, 0, y, framebuf->w, y+8-1, BLACK);
+		y += 8;
+	}
+    show_custom_subscreen(framebuf, CURRENT_ACTIVE_SUBSCREEN, 0, y, game->should_show_time(), pos);
+}
+
+void draw_subscrs(BITMAP* dest, int x, int y, bool showtime, int pos)
+{
+	int distance = opening_subscr_show_bottom_8px ? 176 : 168;
+	if(get_qr(qr_OLD_SUBSCR))
+	{
+		put_passive_subscr(dest,x,y+distance,showtime,pos);
+		put_active_subscr(y,pos);
+	}
+	else
+	{
+		put_active_subscr(y,pos);
+		put_passive_subscr(dest,x,y+distance,showtime,pos);
+	}
+}
+
+bool run_active_subscript(bool waitdraw)
+{
+	if (new_subscreen_active && new_subscreen_active->scrconfig.script && FFCore.doscript(ScriptType::EngineSubscreen, sstACTIVE)
+		&& (!waitdraw || FFCore.waitdraw(ScriptType::EngineSubscreen, sstACTIVE)))
+	{
+		auto ret = ZScriptVersion::RunScript(ScriptType::EngineSubscreen, new_subscreen_active->scrconfig.script, sstACTIVE);
+		if (ret == RUNSCRIPT_SELFDELETE)
+			return true;
+		if (waitdraw) FFCore.waitdraw(ScriptType::EngineSubscreen, sstACTIVE) = false;
+	}
+	if (new_subscreen_map && new_subscreen_map->scrconfig.script && FFCore.doscript(ScriptType::EngineSubscreen, sstMAP)
+		&& (!waitdraw || FFCore.waitdraw(ScriptType::EngineSubscreen, sstMAP)))
+	{
+		auto ret = ZScriptVersion::RunScript(ScriptType::EngineSubscreen, new_subscreen_map->scrconfig.script, sstMAP);
+		if (ret == RUNSCRIPT_SELFDELETE)
+			return true;
+		if (waitdraw) FFCore.waitdraw(ScriptType::EngineSubscreen, sstMAP) = false;
+	}
+	return false;
+}
+void dosubscr()
+{
+	PALETTE temppal;
+	
+	if (no_subscreen())
+		return;
+	
+	if(usebombpal)
+	{
+		memcpy(temppal, RAMpal, PAL_SIZE*sizeof(RGB));
+		memcpy(RAMpal, tempbombpal, PAL_SIZE*sizeof(RGB));
+		refreshpal=true;
+	}
+	
+	bool showtime = game->should_show_time();
+	if(replay_version_check(0,19))
+		refresh_subscr_items();
+	else flushItemCache();
+	
+	pause_sfx(WAV_BRANG);
+	
+	if(current_item_id(itype_brang)>=0)
+		pause_sfx(get_item_data(current_item_id(itype_brang)).usesound);
+		
+	if(current_item_id(itype_hookshot)>=0)
+		pause_sfx(get_item_data(current_item_id(itype_hookshot)).usesound);
+		
+	adjust_sfx(QMisc.miscsfx[sfxLOWHEART],128,false);
+	adjust_sfx(QMisc.miscsfx[sfxREFILL],128,false);
+	adjust_sfx(QMisc.miscsfx[sfxDRAIN],128,false);
+	
+	set_clip_rect(scrollbuf, 0, 0, scrollbuf->w, scrollbuf->h);
+	set_clip_rect(framebuf, 0, 0, framebuf->w, framebuf->h);
+
+	int h = is_extended_height_mode() ? 240 : 176;
+	std::unique_ptr<BITMAP, decltype(&destroy_bitmap)> subscr_scrolling_bitmap_owner(create_bitmap(256, h), destroy_bitmap);
+	BITMAP* subscr_scrolling_bitmap = subscr_scrolling_bitmap_owner.get();
+
+	// Copy the complete frame.
+	// Go see the long comment in game_loop about drawPassiveSubscreenSeparate.
+	if (is_extended_height_mode())
+	{
+		blit(framebuf_no_passive_subscreen,subscr_scrolling_bitmap,0,playing_field_offset,0,0,256,h);
+	}
+	else
+	{
+		// Capture the screen as displayed, so presentation-only effects (the
+		// wavy distortion) stay baked into the frozen background while the
+		// subscreen is up.
+		blit(latest_screen_image(),subscr_scrolling_bitmap,0,playing_field_offset,0,0,256,h);
+	}
+	
+	bool use_a = get_qr(qr_SELECTAWPN), use_x = get_qr(qr_SET_XBUTTON_ITEMS),
+		 use_y = get_qr(qr_SET_YBUTTON_ITEMS);
+	bool b_only = !(use_a||use_x||use_y||get_qr(qr_SUBSCR_PRESS_TO_EQUIP));
+	//Set the selector to the correct position before bringing up the subscreen -DD
+	if(!CURRENT_ACTIVE_SUBSCREEN) return;
+	bool compat = get_qr(qr_OLD_SUBSCR);
+	bool noverify = get_qr(qr_NO_BUTTON_VERIFY);
+	if(compat)
+	{
+		CURRENT_ACTIVE_SUBSCREEN->curpage = 0;
+		auto& pg = CURRENT_ACTIVE_SUBSCREEN->pages[0];
+		if((game->bwpn&0xFF) == 0)
+			pg.cursor_pos = game->bwpn>>8;
+		else if((game->awpn&0xFF) == 0)
+			pg.cursor_pos = game->awpn>>8;
+		else if((game->xwpn&0xFF) == 0)
+			pg.cursor_pos = game->xwpn>>8;
+		else if((game->ywpn&0xFF) == 0)
+			pg.cursor_pos = game->ywpn>>8;
+		else pg.cursor_pos = 0;
+	}
+
+	opening_subscr_show_bottom_8px = show_bottom_8px;
+
+	int distance = opening_subscr_show_bottom_8px ? 176 : 168;
+	int offy = is_extended_height_mode() ? 0 : passive_subscreen_height;
+
+	FFCore.initZScriptSubscreenScript();
+	ScopedScriptEngineDataClear engine_data_guard{ScriptType::EngineSubscreen, 0};
+	subscrpg_clear_animation();
+	subscreen_open = true;
+	current_subscr_pos = sspSCROLLING;
+	bool force_exit = false;
+	bool done = false;
+	int y;
+	for(y = -distance; y <= 0 && !force_exit; y += 3*Hero.subscr_speed)
+	{
+		if(replay_version_check(19))
+		{
+			load_control_state();
+			script_drawing_commands.Clear();
+		}
+		active_sub_yoff = y-playing_field_offset;
+		if (!force_exit)
+			force_exit = run_active_subscript(false);
+		do_dcounters();
+		Hero.refill();
+		if (!force_exit)
+			force_exit = run_active_subscript(true);
+		//fill in the screen with black to prevent the hall of mirrors effect
+		clear_to_color(framebuf, BLACK);
+
+		// With COOLSCROLL on, the subscreen crawls down over the playing field.
+		// Otherwise the playing field scrolls down past the bottom of the screen.
+		if(COOLSCROLL)
+		{
+			blit(subscr_scrolling_bitmap,framebuf,0,0,0,offy,256,h);
+		}
+		else if(is_extended_height_mode())
+		{
+			// The playing field fills the whole screen, so slide all of it
+			// down from the top rather than from under the passive subscreen.
+			blit(subscr_scrolling_bitmap,framebuf,0,0,0,y+distance,256,h);
+		}
+		else
+		{
+			blit(subscr_scrolling_bitmap,framebuf,0,0,0,y+distance+passive_subscreen_height,256,-y+(opening_subscr_show_bottom_8px?8:0));
+		}
+		
+		draw_subscrs(framebuf,0,y,showtime,sspSCROLLING);
+		if(replay_version_check(19))
+			do_script_draws(framebuf, origin_scr, 0, playing_field_offset);
+		
+		advanceframe(false);
+		
+		if(Quit)
+			return;
+	}
+	active_sub_yoff = -playing_field_offset;
+	current_subscr_pos = sspDOWN;
+
+	// Consume whatever input was registered during opening animation.
+	if (replay_version_check(18))
+		load_control_state();
+
+	bool legacy_btn_press_peek = false;
+	if (replay_is_active())
+	{
+		std::string qst = replay_get_meta_str("qst");
+		legacy_btn_press_peek |= qst == "demosp253.qst";
+		legacy_btn_press_peek |= qst == "first_quest_layered.qst";
+		legacy_btn_press_peek |= qst == "hell_awaits.qst";
+	}
+
+	while (!done && !force_exit)
+	{
+		if (replay_version_check(0, 11))
+			load_control_state();
+		if(replay_version_check(19))
+			script_drawing_commands.Clear();
+		if (!force_exit)
+			force_exit = run_active_subscript(false);
+		auto pgnum = CURRENT_ACTIVE_SUBSCREEN->curpage;
+		auto& pg = CURRENT_ACTIVE_SUBSCREEN->cur_page();
+		bool can_btn = !subscr_pg_animating && !force_exit;
+		if(can_btn)
+		{
+			byte btn_press = getIntBtnInput(0xFF, INPUT_PRESS | (legacy_btn_press_peek ? INPUT_PEEK : 0));
+			int32_t pos = pg.cursor_pos;
+			
+			if(getInput(btnUp, INPUT_PRESS)) pg.move_cursor(SEL_UP);
+			else if(getInput(btnDown, INPUT_PRESS)) pg.move_cursor(SEL_DOWN);
+			else if(getInput(btnLeft, INPUT_PRESS)) pg.move_cursor(SEL_LEFT);
+			else if(getInput(btnRight, INPUT_PRESS)) pg.move_cursor(SEL_RIGHT);
+			else if(compat)
+			{
+				if(getInput(btnL, INPUT_PRESS))
+				{
+					if (!get_qr(qr_NO_L_R_BUTTON_INVENTORY_SWAP))
+					{
+						pg.cursor_pos = pg.movepos_legacy(SEL_LEFT, (pos<<8)|pg.getIndex(), 255, 255, 255, false, true)>>8;
+					}
+				}
+				else if(getInput(btnR, INPUT_PRESS))
+				{
+					if (!get_qr(qr_NO_L_R_BUTTON_INVENTORY_SWAP)) 
+					{
+						pg.cursor_pos = pg.movepos_legacy(SEL_RIGHT, (pos<<8)|pg.getIndex(), 255, 255, 255, false, true)>>8;
+					}
+				}
+				else if(getInput(btnEx3, INPUT_PRESS))
+				{
+					if ( use_a && get_qr(qr_USE_EX1_EX2_INVENTORYSWAP) )
+					{
+						selectNextAWpn(SEL_LEFT);
+					}
+				}
+				else if(getInput(btnEx4, INPUT_PRESS))
+				{
+					if ( use_a && get_qr(qr_USE_EX1_EX2_INVENTORYSWAP) )
+					{
+						selectNextAWpn(SEL_RIGHT);
+					}
+				}
+			}
+			
+			if(pos!=pg.cursor_pos)
+				sfx(QMisc.miscsfx[sfxSUBSCR_CURSOR_MOVE]);
+			
+			SubscrWidget* widg = pg.get_sel_widg();
+			
+			if(widg)
+			{
+				bool can_interact = true, can_equip = true,
+					must_equip = false, can_unequip = noverify;
+				auto data = widg->getItemVal();
+				if(widg->getType() == widgITEMSLOT)
+				{
+					if((widg->flags & SUBSCR_CURITM_NO_INTER_WO_ITEM)
+						&& widg->getDisplayItem().id < 0)
+						can_interact = false;
+					if(widg->flags & SUBSCR_CURITM_NONEQP)
+						can_equip = false;
+					if(widg->flags & SUBSCR_CURITM_NO_UNEQUIP)
+						can_unequip = false;
+					must_equip = !b_only && (widg->flags & SUBSCR_CURITM_NO_INTER_WO_EQUIP);
+				}
+				if(must_equip && (!can_equip || data.id < 0))
+					can_interact = false;
+				
+				if(can_interact)
+				{
+					auto bpress = btn_press;
+					if(must_equip)
+					{
+						bpress &= ((!can_unequip || Bwpn != data) ? INT_BTN_B : 0)
+							| ((use_a && (!can_unequip || Awpn != data)) ? INT_BTN_A : 0)
+							| ((use_x && (!can_unequip || Xwpn != data)) ? INT_BTN_X : 0)
+							| ((use_y && (!can_unequip || Ywpn != data)) ? INT_BTN_Y : 0);
+					}
+					if(widg->generic_scrconfig.script && (bpress&widg->gen_script_btns))
+					{
+						FFCore.runGenericFrozenEngine(widg->generic_scrconfig);
+						data = widg->getItemVal(); //update incase script changed
+						if(must_equip) //update values depending on data.id
+						{
+							bpress = btn_press;
+							bpress &= (Bwpn != data ? INT_BTN_B : 0)
+								| ((use_a && Awpn != data) ? INT_BTN_A : 0)
+								| ((use_x && Xwpn != data) ? INT_BTN_X : 0)
+								| ((use_y && Ywpn != data) ? INT_BTN_Y : 0);
+						}
+					}
+					
+					if(can_equip)
+					{
+						if(data.id > -1)
+						{
+							if(b_only || (btn_press&INT_BTN_B))
+							{
+								if(can_unequip && !b_only && data == Bwpn)
+								{
+									Bwpn = {-1};
+									game->forced_bwpn = -1;
+									sfx(QMisc.miscsfx[sfxSUBSCR_ITEM_ASSIGN]);
+									
+									game->bwpn = 255;
+									directItemB = -1;
+								}
+								else
+								{
+									if(use_a && data == Awpn)
+									{
+										Awpn = Bwpn;
+										game->awpn = game->bwpn;
+										directItemA = directItemB;
+									}
+									else if(use_x && data == Xwpn)
+									{
+										Xwpn = Bwpn;
+										game->xwpn = game->bwpn;
+										directItemX = directItemB;
+									}
+									else if(use_y && data == Ywpn)
+									{
+										Ywpn = Bwpn;
+										game->ywpn = game->bwpn;
+										directItemY = directItemB;
+									}
+									
+									Bwpn = data;
+									game->forced_bwpn = -1; //clear forced if the item is selected using the actual subscreen
+									if(!b_only) sfx(QMisc.miscsfx[sfxSUBSCR_ITEM_ASSIGN]);
+									game->bwpn = ((pg.cursor_pos)<<8) | CURRENT_ACTIVE_SUBSCREEN->curpage;
+									directItemB = data.id;
+								}
+							}
+							else if(use_a && (btn_press&INT_BTN_A))
+							{
+								if(can_unequip && data == Awpn)
+								{
+									Awpn = {-1};
+									game->forced_awpn = -1;
+									sfx(QMisc.miscsfx[sfxSUBSCR_ITEM_ASSIGN]);
+									
+									game->awpn = 255;
+									directItemA = -1;
+								}
+								else
+								{
+									if(data == Bwpn)
+									{
+										Bwpn = Awpn;
+										game->bwpn = game->awpn;
+										directItemB = directItemA;
+									}
+									else if(use_x && data == Xwpn)
+									{
+										Xwpn = Awpn;
+										game->xwpn = game->awpn;
+										directItemX = directItemA;
+									}
+									else if(use_y && data == Ywpn)
+									{
+										Ywpn = Awpn;
+										game->ywpn = game->awpn;
+										directItemY = directItemA;
+									}
+									
+									Awpn = data;
+									sfx(QMisc.miscsfx[sfxSUBSCR_ITEM_ASSIGN]);
+									game->awpn = ((pg.cursor_pos)<<8) | CURRENT_ACTIVE_SUBSCREEN->curpage;
+									game->forced_awpn = -1; //clear forced if the item is selected using the actual subscreen
+									directItemA = data.id;
+								}
+							}
+							else if(use_x && (btn_press&INT_BTN_EX1))
+							{
+								if(can_unequip && data == Xwpn)
+								{
+									Xwpn = {-1};
+									game->forced_xwpn = -1;
+									sfx(QMisc.miscsfx[sfxSUBSCR_ITEM_ASSIGN]);
+									
+									game->xwpn = 255;
+									directItemX = -1;
+								}
+								else
+								{
+									if(data == Bwpn)
+									{
+										Bwpn = Xwpn;
+										game->bwpn = game->xwpn;
+										directItemB = directItemX;
+									}
+									else if(use_a && data == Awpn)
+									{
+										Awpn = Xwpn;
+										game->awpn = game->xwpn;
+										directItemA = directItemX;
+									}
+									else if(use_y && data == Ywpn)
+									{
+										Ywpn = Xwpn;
+										game->ywpn = game->xwpn;
+										directItemY = directItemX;
+									}
+									
+									Xwpn = data;
+									sfx(QMisc.miscsfx[sfxSUBSCR_ITEM_ASSIGN]);
+									game->xwpn = ((pg.cursor_pos)<<8) | CURRENT_ACTIVE_SUBSCREEN->curpage;
+									game->forced_xwpn = -1; //clear forced if the item is selected using the actual subscreen
+									directItemX = data.id;
+								}
+							}
+							else if(use_y && (btn_press&INT_BTN_EX2))
+							{
+								if(can_unequip && data == Ywpn)
+								{
+									Ywpn = {-1};
+									game->forced_ywpn = -1;
+									sfx(QMisc.miscsfx[sfxSUBSCR_ITEM_ASSIGN]);
+									
+									game->ywpn = 255;
+									directItemY = -1;
+								}
+								else
+								{
+									if(data == Bwpn)
+									{
+										Bwpn = Ywpn;
+										game->bwpn = game->ywpn;
+										directItemB = directItemY;
+									}
+									else if(use_a && data == Awpn)
+									{
+										Awpn = Ywpn;
+										game->awpn = game->ywpn;
+										directItemA = directItemY;
+									}
+									else if(use_x && data == Xwpn)
+									{
+										Xwpn = Ywpn;
+										game->xwpn = game->ywpn;
+										directItemX = directItemY;
+									}
+									
+									Ywpn = data;
+									sfx(QMisc.miscsfx[sfxSUBSCR_ITEM_ASSIGN]);
+									game->ywpn = ((pg.cursor_pos)<<8) | CURRENT_ACTIVE_SUBSCREEN->curpage;
+									game->forced_ywpn = -1; //clear forced if the item is selected using the actual subscreen
+									directItemY = data.id;
+								}
+							}
+						}
+					}
+					if(!must_equip || data.id > -1)
+						widg->check_btns(bpress,*CURRENT_ACTIVE_SUBSCREEN);
+				}
+			}
+			if(CURRENT_ACTIVE_SUBSCREEN->curpage == pgnum)
+			{
+				btn_press = CURRENT_ACTIVE_SUBSCREEN->cur_page().check_btns(btn_press, *CURRENT_ACTIVE_SUBSCREEN);
+				if(CURRENT_ACTIVE_SUBSCREEN->curpage == pgnum)
+					CURRENT_ACTIVE_SUBSCREEN->check_btns(btn_press);
+			}
+		}
+		
+		do_dcounters();
+		Hero.refill();
+		
+		if (!force_exit)
+			force_exit = run_active_subscript(true);
+
+		clear_to_color(framebuf, BLACK);
+
+		if(COOLSCROLL) //copy the playing field back onto the screen
+			blit(subscr_scrolling_bitmap,framebuf,0,0,0,offy,256,h);
+		else if(is_extended_height_mode())
+		{
+			// Keep the playing field where the opening slide left it, so the
+			// rows under a transparent passive subscreen don't pop in and out.
+			blit(subscr_scrolling_bitmap,framebuf,0,0,0,distance,256,h);
+		}
+		//else nothing to do; the playing field has scrolled off the screen
+		
+		//draw the passive and active subscreen
+		draw_subscrs(framebuf,0,0,showtime,sspDOWN);
+		if(replay_version_check(19))
+			do_script_draws(framebuf, origin_scr, 0, playing_field_offset);
+		
+		advanceframe(false);
+		if (replay_version_check(11))
+			load_control_state();
+		
+		if(can_btn && NESquit && getInput(btnUp) && getInput(btnA) && getInput(btnB))
+		{
+			down_control_states[btnUp] = true;
+			Quit=qQUIT;
+		}
+		
+		if(Quit)
+			return;
+			
+		if(can_btn && (getInput(btnS, INPUT_PRESS) || ((map_subscreen_open || get_qr(qr_MAP_BUTTON_CLOSES_SUBSCREEN)) && getInput(btnP, INPUT_PRESS))))
+			done=true;
+	}
+
+	subscrpg_clear_animation();
+	current_subscr_pos = sspSCROLLING;
+	for(y = zc_min(y, 0); y >= -distance; y -= 3*Hero.subscr_speed)
+	{
+		if(replay_version_check(19))
+		{
+			load_control_state();
+			script_drawing_commands.Clear();
+		}
+		active_sub_yoff = y-playing_field_offset;
+		if (!force_exit)
+			force_exit = run_active_subscript(false);
+		do_dcounters();
+		Hero.refill();
+		if (!force_exit)
+			force_exit = run_active_subscript(true);
+		//fill in the screen with black to prevent the hall of mirrors effect
+		clear_to_color(framebuf, BLACK);
+		
+		if(COOLSCROLL)
+		{
+			blit(subscr_scrolling_bitmap,framebuf,0,0,0,offy,256,h);
+		}
+		else if(is_extended_height_mode())
+		{
+			// The playing field fills the whole screen, so slide all of it
+			// down from the top rather than from under the passive subscreen.
+			blit(subscr_scrolling_bitmap,framebuf,0,0,0,y+distance,256,h);
+		}
+		else
+		{
+			blit(subscr_scrolling_bitmap,framebuf,0,0,0,y+distance+passive_subscreen_height,256,-y+(opening_subscr_show_bottom_8px?8:0));
+		}
+		
+		draw_subscrs(framebuf,0,y,showtime,sspSCROLLING);
+		if(replay_version_check(19))
+			do_script_draws(framebuf, origin_scr, 0, playing_field_offset);
+		advanceframe(false);
+		
+		if(Quit)
+			return;
+	}
+	active_sub_yoff = -224;
+	subscreen_open = false;
+	current_subscr_pos = sspUP;
+	updateShowBottomPixels(); // might have changed.
+	if(usebombpal)
+	{
+		memcpy(RAMpal, temppal, PAL_SIZE*sizeof(RGB));
+	}
+	
+	resume_sfx(WAV_BRANG);
+}
+void dosubscr(bool map_subscr)
+{
+	bool skipdraws = FFCore.skipscriptdraws;
+	FFCore.skipscriptdraws = false;
+
+	// The active subscreen blocks in the middle of a game_loop frame, and its
+	// internal loops repeatedly clear the script drawing queue. Stash the draws
+	// the interrupted frame already queued and restore them once the subscreen
+	// closes, so the frame that resumes doesn't render without its script draws.
+	CScriptDrawingCommands* outer_draws = script_drawing_commands.pop_commands();
+
+	auto old = map_subscreen_open;
+	map_subscreen_open = map_subscr;
+	dosubscr();
+	map_subscreen_open = old;
+
+	// Anything the subscreen's own scripts left queued was already rendered
+	// by the subscreen loops; drop it before restoring the stashed draws.
+	script_drawing_commands.Clear();
+	script_drawing_commands.push_commands(outer_draws);
+
+	FFCore.skipscriptdraws = skipdraws;
+}
+
+void markBmap(int32_t dir, int32_t sc, int32_t dmap)
+{
+    if(dmap < 0)
+        dmap = get_currdmap();
+
+    if(sc>=128 || sc<0)
+    {
+        return;
+    }
+
+    byte drow = DMaps[dmap].grid[sc>>4];
+    byte mask = 1 << (7-((sc&15)-DMaps[dmap].xoff));
+    int32_t di = (dmap << 7) + (sc & 0x7F); //+ ((sc&0xF)-(DMaps[dmap].type==dmOVERW ? 0 : DMaps[dmap].xoff));
+    int32_t code = 0;
+
+    switch((DMaps[dmap].type&dmfTYPE))
+    {
+    case dmDNGN:
+		if(get_qr(qr_DUNGEONS_USE_CLASSIC_CHARTING))
+		{
+			// check dmap
+			if((drow&mask)==0) //Only squares marked in dmap editor can be charted
+				return;
+				
+			// calculate code
+			for(int32_t i=3; i>=0; i--)
+			{
+				code <<= 1;
+				code += origin_scr->door[i]&1; //Mark directions only for sides that have the door state set
+			}
+			
+			// mark the map
+			game->bmaps[di] = code|128;
+		}
+		else goto bmaps_default;
+        break;
+        
+    case dmOVERW:
+		if(get_qr(qr_NO_OVERWORLD_MAP_CHARTING))
+			break;
+        
+    default:
+	bmaps_default:
+        game->bmaps[di] |= 128;
+        
+        if(dir>=0)
+            game->bmaps[di] |= (1<<dir);
+            
+        break;
+    }
+}
+void markBmap()
+{
+	markBmap(-1, Hero.current_screen);
+}
+
+void put_passive_subscr(BITMAP *dest,int32_t x,int32_t y,bool showtime,int32_t pos2)
+{
+	++subscr_item_clk;
+	animate_subscr_buttonitems();
+	BITMAP *subscr = create_sub_bitmap(dest,x,y,256,passive_subscreen_height);
+
+	if(no_subscreen())
+	{
+		if (playing_field_offset)
+			rectfill(subscr, 0, 0, subscr->w, playing_field_offset, 0);
+		destroy_bitmap(subscr);
+		return;
+	}
+
+	// Since regions were added, all passive subscreens get a black background underneath (unless
+	// using an extended height viewport). Otherwise the portion of the region behind the passive
+	// subscreen would be visible.
+	// Previously, custom but blank subscreens could be used to allow scripts to draw to the entire
+	// screen (ex: yuurand), but post-z3 such use cases should enable the "no subscreen" screen
+	// flag.
+	// Only needed when not opening the active subscreen. That allows for the passive subscreen to
+	// have a transparent background when moving over the playing field – if not desired, a black
+	// rectangle widget should be used in the passive subscreen.
+	if (QHeader.is_z3 && !subscreen_open && playing_field_offset)
+		rectfill(subscr, 0, 0, subscr->w, playing_field_offset - 1, 0);
+
+	int32_t prev_currscr;
+	if (currscr_for_passive_subscr != -1)
+	{
+		prev_currscr = cur_screen;
+		cur_screen = currscr_for_passive_subscr;
+	}
+
+	show_custom_subscreen(subscr, new_subscreen_passive, 0, 0, showtime, pos2);
+	destroy_bitmap(subscr);
+	if(new_subscreen_overlay)
+	{
+		subscr = create_sub_bitmap(dest,x,0,dest->w,dest->h);
+		show_custom_subscreen(subscr, new_subscreen_overlay, 0, 0, showtime, pos2);
+		destroy_bitmap(subscr);
+	}
+
+	if (currscr_for_passive_subscr != -1)
+		cur_screen = prev_currscr;
+}

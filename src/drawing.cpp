@@ -1,0 +1,1355 @@
+#include "core/zdefs.h"
+#include "drawing.h"
+#include "base/zc_math.h"
+#include "core/combo.h"
+#include "zalleg/pal_tables.h"
+#include "zc/zelda.h"
+#include <allegro/internal/aintern.h>
+#include <cstdlib>
+#include <type_traits>
+
+#ifdef IS_PLAYER
+extern BITMAP *darkscr_bmp, *darkscr_bmp_trans;
+
+#include "core/initdata.h"
+#include "gamedata.h"
+extern dword light_wave_clk;
+#define DITH_PERC (game ? game->get_dither_perc() : zinit.dither_percent)
+#define TRANS_PERC (game ? game->get_transdark_perc() : zinit.transdark_percent)
+#define DITH_TYPE (game ? game->get_dither_type() : zinit.dither_type)
+#define DITH_ARG (game ? game->get_dither_arg() : zinit.dither_arg)
+#define LIGHT_WAVE_RATE (game ? game->get_light_wave_rate() : zinit.light_wave_rate)
+#define LIGHT_WAVE_SIZE (game ? game->get_light_wave_size() : zinit.light_wave_size)
+#define LIGHT_WAVE_CLK light_wave_clk
+//end IS_PLAYER
+#elif defined(IS_EDITOR)
+
+#include "core/initdata.h"
+#include "gamedata.h"
+#define DITH_PERC (game ? game->get_dither_perc() : zinit.dither_percent)
+#define TRANS_PERC (game ? game->get_transdark_perc() : zinit.transdark_percent)
+#define DITH_TYPE (game ? game->get_dither_type() : zinit.dither_type)
+#define DITH_ARG (game ? game->get_dither_arg() : zinit.dither_arg)
+#define LIGHT_WAVE_RATE (game ? game->get_light_wave_rate() : zinit.light_wave_rate)
+#define LIGHT_WAVE_SIZE (game ? game->get_light_wave_size() : zinit.light_wave_size)
+#define LIGHT_WAVE_CLK 0
+#else
+#define DITH_PERC 0
+#define TRANS_PERC 0
+#define DITH_TYPE 0
+#define DITH_ARG 0
+#define LIGHT_WAVE_RATE 0
+#define LIGHT_WAVE_SIZE 0
+#define LIGHT_WAVE_CLK 0
+#endif
+
+// Scales val by perc/100, truncating like the original double math. The
+// volatile temp forces the product to round to a double before truncation,
+// so the result doesn't depend on per-target fusion/reassociation choices
+// made under -ffp-model=fast. Without it, light radii computed here differ
+// by a pixel between x86 and arm64, breaking cross-platform replays.
+static int32_t scale_by_percent(int32_t val, int perc)
+{
+	volatile double prod = val * (perc/(double)100.0);
+	return (int32_t)prod;
+}
+
+static word calc_wave_rad(word rad, word rate, word size)
+{
+	// non-positive rate and 0 size mean no change
+	auto clk = LIGHT_WAVE_CLK;
+	if(rate <= 0 || !size || !clk)
+		return rad;
+	clk %= rate*2; // fit within one period of the wave
+
+	// clk is now in the range 0=..rate*2
+	// convert to floating point, and convert to range 0=..2pi
+	// The volatile temps pin each operation's rounding (see scale_by_percent).
+	volatile double turns_frac = clk / double(rate*2);
+	volatile double factor = turns_frac * (2*PI);
+	// now add the size, scaled by the sin wave
+	volatile double scaled = size * zc::math::Sin(factor);
+	int offset = zc::math::Round(scaled);
+	return (word)vbound(rad + offset, 0, 65535);
+}
+
+void doDarkroomCircle(int32_t cx, int32_t cy, word glowRad,BITMAP* dest, BITMAP* transdest,
+	int dith_perc, int trans_perc, int dith_type, int dith_arg,
+	optional<word> wave_rate, optional<word> wave_size)
+{
+	if(!glowRad) return;
+
+#ifdef IS_PLAYER
+	cx -= viewport.x;
+	cy -= viewport.y;
+	//Default bitmap handling
+	if(!dest) dest = darkscr_bmp;
+	if(dest == darkscr_bmp) transdest = darkscr_bmp_trans;
+#endif
+
+	if(dith_perc < 0) dith_perc = DITH_PERC;
+	if(trans_perc < 0) trans_perc = TRANS_PERC;
+	if(dith_type < 0) dith_type = DITH_TYPE;
+	if(dith_arg < 0) dith_arg = DITH_ARG;
+	if(!wave_rate) wave_rate = LIGHT_WAVE_RATE;
+	if(!wave_size) wave_size = LIGHT_WAVE_SIZE;
+	glowRad = calc_wave_rad(glowRad, *wave_rate, *wave_size);
+	
+	int32_t ditherRad = glowRad + scale_by_percent(glowRad, dith_perc);
+	int32_t transRad = glowRad + scale_by_percent(glowRad, trans_perc);
+	auto maxRad = zc_max(glowRad,transRad);
+
+	int offx = 0;
+	int offy = 0;
+#ifdef IS_PLAYER
+	offx = viewport.x;
+	offy = viewport.y - playing_field_offset;
+#endif
+
+	if(dest)
+	{
+		dithercircfill(dest, cx, cy, ditherRad, 0, dith_type, dith_arg, offx, offy);
+		circlefill(dest, cx, cy, maxRad, 0);
+	}
+	if(transdest)
+	{
+		dithercircfill(transdest, cx, cy, ditherRad, 0, dith_type, dith_arg, offx, offy);
+		circlefill(transdest, cx, cy, glowRad, 0);
+	}
+}
+
+void doDarkroomCone(int32_t sx, int32_t sy, word glowRad, int32_t dir, BITMAP* dest, BITMAP* transdest,
+	int dith_perc, int trans_perc, int dith_type, int dith_arg,
+	optional<word> wave_rate, optional<word> wave_size)
+{
+	if(!glowRad) return;
+
+	#ifdef IS_PLAYER
+	sx -= viewport.x;
+	sy -= viewport.y;
+	//Default bitmap handling
+	if(!dest) dest = darkscr_bmp;
+	if(dest == darkscr_bmp) transdest = darkscr_bmp_trans;
+	#endif
+	if(dith_perc < 0) dith_perc = DITH_PERC;
+	if(trans_perc < 0) trans_perc = TRANS_PERC;
+	if(dith_type < 0) dith_type = DITH_TYPE;
+	if(dith_arg < 0) dith_arg = DITH_ARG;
+	if(!wave_rate) wave_rate = LIGHT_WAVE_RATE;
+	if(!wave_size) wave_size = LIGHT_WAVE_SIZE;
+	glowRad = calc_wave_rad(glowRad, *wave_rate, *wave_size);
+	
+	int32_t ditherDiff = scale_by_percent(glowRad, dith_perc);
+	int32_t transDiff = scale_by_percent(glowRad, trans_perc);
+	
+	int32_t ditherRad = glowRad + 2*ditherDiff;
+	int32_t transRad = glowRad + 2*transDiff;
+	auto maxRad = zc_max(glowRad,transRad);
+	
+	double xs = 0, ys = 0;
+	int32_t d = NORMAL_DIR(dir);
+	if(d<0) return;
+	switch(d)
+	{
+		case up: case l_up: case r_up: ys=1; break;
+		case down: case l_down: case r_down: ys=-1; break;
+	}
+	switch(d)
+	{
+		case left: case l_up: case l_down: xs=1; break;
+		case right: case r_up: case r_down: xs=-1; break;
+	}
+	if(d&4) {xs*=0.75; ys*=0.75;}
+	if(glowRad>transRad) transDiff = 0;
+
+	int offx = 0;
+	int offy = 0;
+#ifdef IS_PLAYER
+	offx = viewport.x;
+	offy = viewport.y - playing_field_offset;
+#endif
+
+	if(dest)
+	{
+		ditherLampCone(dest, sx+(xs*ditherDiff), sy+(ys*ditherDiff), ditherRad, d, 0, dith_type, dith_arg, offx, offy);
+		lampcone(dest, sx+(xs*transDiff), sy+(ys*transDiff), maxRad, d, 0);
+	}
+	if(transdest)
+	{
+		ditherLampCone(transdest, sx+(xs*ditherDiff), sy+(ys*ditherDiff), ditherRad, d, 0, dith_type, dith_arg, offx, offy);
+		lampcone(transdest, sx, sy, glowRad, d, 0);
+	}
+}
+
+void doDarkroomSquare(int32_t cx, int32_t cy, word glowRad, BITMAP* dest, BITMAP* transdest,
+	int dith_perc, int trans_perc, int dith_type, int dith_arg,
+	optional<word> wave_rate, optional<word> wave_size)
+{
+	if(!glowRad) return;
+
+
+#ifdef IS_PLAYER
+	cx -= viewport.x;
+	cy -= viewport.y;
+	//Default bitmap handling
+	if(!dest) dest = darkscr_bmp;
+	if(dest == darkscr_bmp) transdest = darkscr_bmp_trans;
+#endif
+
+	if(dith_perc < 0) dith_perc = DITH_PERC;
+	if(trans_perc < 0) trans_perc = TRANS_PERC;
+	if(dith_type < 0) dith_type = DITH_TYPE;
+	if(dith_arg < 0) dith_arg = DITH_ARG;
+	if(!wave_rate) wave_rate = LIGHT_WAVE_RATE;
+	if(!wave_size) wave_size = LIGHT_WAVE_SIZE;
+	glowRad = calc_wave_rad(glowRad, *wave_rate, *wave_size);
+	
+	int32_t ditherRad = glowRad + (int32_t)(glowRad * (dith_perc/(double)100.0));
+	int32_t transRad = glowRad + (int32_t)(glowRad * (trans_perc/(double)100.0));
+	auto mrad = zc_max(glowRad,transRad);
+
+	int offx = 0;
+	int offy = 0;
+#ifdef IS_PLAYER
+	offx = viewport.x;
+	offy = viewport.y - playing_field_offset;
+#endif
+
+	if(dest)
+	{
+		ditherrectfill(dest, cx-ditherRad, cy-ditherRad, cx+ditherRad, cy+ditherRad, 0, dith_type, dith_arg, offx, offy);
+		rectfill(dest, cx-mrad, cy-mrad, cx+mrad, cy+mrad, 0);
+	}
+	if(transdest)
+	{
+		ditherrectfill(transdest, cx-ditherRad, cy-ditherRad, cx+ditherRad, cy+ditherRad, 0, dith_type, dith_arg, offx, offy);
+		rectfill(transdest, cx-glowRad, cy-glowRad, cx+glowRad, cy+glowRad, 0);
+	}
+}
+
+void handle_lighting(int cx, int cy, dword shape, dword rad, dword dir, BITMAP* dest, BITMAP* transdest,
+	int dith_perc, int trans_perc, int dith_type, int dith_arg,
+	optional<word> wave_rate, optional<word> wave_size)
+{
+	if(!rad) return;
+	dir = NORMAL_DIR(dir);
+	switch(shape)
+	{
+		case 0:
+			doDarkroomCircle(cx,cy,rad,dest,transdest, dith_perc, trans_perc,
+				dith_type, dith_arg, wave_rate, wave_size);
+			break;
+		case 1:
+			doDarkroomCone(cx,cy,rad,dir,dest,transdest, dith_perc, trans_perc,
+				dith_type, dith_arg, wave_rate, wave_size);
+			break;
+		case 2:
+			doDarkroomSquare(cx,cy,rad,dest,transdest, dith_perc, trans_perc,
+				dith_type, dith_arg, wave_rate, wave_size);
+			break;
+	}
+}
+
+void do_torch_combo(newcombo const& cmb, int cx, int cy, BITMAP* dest, BITMAP* transdest)
+{
+	ASSERT(cmb.type == cTORCH);
+	int dir = cmb.c_attributes[10].getTrunc();
+	if (int offs = cmb.c_attributes[11].getTrunc())
+	{
+		switch (dir)
+		{
+			case up:
+				cy -= offs;
+				break;
+			case down:
+				cy += offs;
+				break;
+			case left:
+				cx -= offs;
+				break;
+			case right:
+				cx += offs;
+				break;
+		}
+	}
+	handle_lighting(cx, cy, cmb.c_attributes[9].getTrunc(), cmb.c_attributes[8].getTrunc(), dir, dest, transdest);
+}
+
+// In clang, [[gnu::always_inline]] is ignored on template lambdas (e.g. [&]<int T>(...) ATTR {}),
+// so suppress the resulting -Wignored-attributes for the macros below.
+// See: https://godbolt.org/z/Yqx357rfx
+// I assume ZC_LAMBDA_FORCE_INLINE works here on MSVC.
+#ifdef __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wignored-attributes"
+#endif
+
+// Note: I tried using a templated function, but the compiler stopped inlining / optimizing and
+// drastically slowed down the code.
+#define DO_DITHER_OPTIMIZED(dType, dArg, wid, hei, check_func, body) \
+do { \
+	bool inv = (dType % 2); \
+	byte type = dType & ~1; \
+	int arg = dArg; \
+	if(type != dithStatic && type != dithStatic2 && type != dithStatic3) \
+		arg = zc_max(1, arg); \
+	bool is_replay = replay_is_active(); \
+	auto execute_dither = [&]<int CompileTimeArg>(std::integral_constant<int, CompileTimeArg>) ZC_LAMBDA_FORCE_INLINE \
+	{ \
+		double filt = (CompileTimeArg > 0 ? CompileTimeArg : arg) / 255.0 * 2.0; \
+		auto run_loop = [&](auto dither_check_func) ZC_LAMBDA_FORCE_INLINE \
+		{ \
+			auto check_func = [&](int x, int y) ZC_LAMBDA_FORCE_INLINE { return dither_check_func(x, y) ^ inv; }; \
+			body \
+		}; \
+		switch(type) \
+		{ \
+			case dithChecker: \
+				run_loop([&](int x, int y) ZC_LAMBDA_FORCE_INLINE -> bool { \
+					if constexpr(CompileTimeArg > 0) return (((x/CompileTimeArg)&1)^((y/CompileTimeArg)&1)); \
+					else return (((x/arg)&1)^((y/arg)&1)); \
+				}); \
+				break; \
+			case dithCrissCross: \
+				run_loop([&](int x, int y) ZC_LAMBDA_FORCE_INLINE -> bool { \
+					if constexpr(CompileTimeArg > 0) return (((x%CompileTimeArg)==(y%CompileTimeArg)) || ((CompileTimeArg-(x%CompileTimeArg))==(y%CompileTimeArg))); \
+					else return (((x%arg)==(y%arg)) || ((arg-(x%arg))==(y%arg))); \
+				}); \
+				break; \
+			case dithDiagULDR: \
+				run_loop([&](int x, int y) ZC_LAMBDA_FORCE_INLINE -> bool { \
+					if constexpr(CompileTimeArg > 0) return ((x%CompileTimeArg)==(y%CompileTimeArg)); \
+					else return ((x%arg)==(y%arg)); \
+				}); \
+				break; \
+			case dithDiagURDL: \
+				run_loop([&](int x, int y) ZC_LAMBDA_FORCE_INLINE -> bool { \
+					if constexpr(CompileTimeArg > 0) return (((CompileTimeArg-1)-(x%CompileTimeArg))==(y%CompileTimeArg)); \
+					else return (((arg-1)-(x%arg))==(y%arg)); \
+				}); \
+				break; \
+			case dithRow: \
+				run_loop([&](int, int y) ZC_LAMBDA_FORCE_INLINE -> bool { \
+					if constexpr(CompileTimeArg > 0) return !(y%CompileTimeArg); \
+					else return !(y%arg); \
+				}); \
+				break; \
+			case dithCol: \
+				run_loop([&](int x, int) ZC_LAMBDA_FORCE_INLINE -> bool { \
+					if constexpr(CompileTimeArg > 0) return !(x%CompileTimeArg); \
+					else return !(x%arg); \
+				}); \
+				break; \
+			case dithDots: \
+				run_loop([&](int x, int y) ZC_LAMBDA_FORCE_INLINE -> bool { \
+					if constexpr(CompileTimeArg > 0) return !(x%CompileTimeArg || y%CompileTimeArg); \
+					else return !(x%arg || y%arg); \
+				}); \
+				break; \
+			case dithGrid: \
+				run_loop([&](int x, int y) ZC_LAMBDA_FORCE_INLINE -> bool { \
+					if constexpr(CompileTimeArg > 0) return !(x%CompileTimeArg) || !(y%CompileTimeArg); \
+					else return !(x%arg) || !(y%arg); \
+				}); \
+				break; \
+			case dithStatic: \
+				run_loop([&](int x, int y) ZC_LAMBDA_FORCE_INLINE { \
+					return dither_staticcheck(x, y, filt, is_replay); \
+				}); \
+				break; \
+			case dithStatic2: \
+				run_loop([&](int x, int y) ZC_LAMBDA_FORCE_INLINE { \
+					return dither_staticcheck(x-(wid/2), y-(hei/2), filt, is_replay); \
+				}); \
+				break; \
+			case dithStatic3: \
+				run_loop([&](int x, int y) ZC_LAMBDA_FORCE_INLINE { \
+					return dither_staticcheck(x+(wid/2), y+(hei/2), filt, is_replay); \
+				}); \
+				break; \
+			case dithDots2: \
+				run_loop([&](int x, int y) ZC_LAMBDA_FORCE_INLINE -> bool { \
+					if constexpr(CompileTimeArg > 0) { \
+						constexpr int a2 = (CompileTimeArg+1)*2; \
+						return !(x%a2 || y%a2) || ((x%a2==CompileTimeArg+1) && (y%a2==CompileTimeArg+1)); \
+					} else { \
+						int a2 = (arg+1)*2; \
+						return !(x%a2 || y%a2) || ((x%a2==arg+1) && (y%a2==arg+1)); \
+					} \
+				}); \
+				break; \
+			case dithDots3: \
+				run_loop([&](int x, int y) ZC_LAMBDA_FORCE_INLINE -> bool { \
+					if constexpr(CompileTimeArg > 0) { \
+						constexpr int a2 = (CompileTimeArg+1)*2; \
+						return !(x%a2 || y%2) || ((x%a2==CompileTimeArg+1) && (y%2==1)); \
+					} else { \
+						int a2 = (arg+1)*2; \
+						return !(x%a2 || y%2) || ((x%a2==arg+1) && (y%2==1)); \
+					} \
+				}); \
+				break; \
+			case dithDots4: \
+				run_loop([&](int x, int y) ZC_LAMBDA_FORCE_INLINE -> bool { \
+					if constexpr(CompileTimeArg > 0) { \
+						constexpr int a2 = (CompileTimeArg+1)*2; \
+						return !(x%2 || y%a2) || ((x%2==1) && (y%a2==CompileTimeArg+1)); \
+					} else { \
+						int a2 = (arg+1)*2; \
+						return !(x%2 || y%a2) || ((x%2==1) && (y%a2==arg+1)); \
+					} \
+				}); \
+				break; \
+			default: \
+				run_loop([](int, int) ZC_LAMBDA_FORCE_INLINE { return true; }); \
+				break; \
+		} \
+	}; \
+	switch(arg) \
+	{ \
+		case 1:  execute_dither(std::integral_constant<int, 1>{});  break; \
+		case 2:  execute_dither(std::integral_constant<int, 2>{});  break; \
+		case 3:  execute_dither(std::integral_constant<int, 3>{});  break; \
+		case 4:  execute_dither(std::integral_constant<int, 4>{});  break; \
+		case 5:  execute_dither(std::integral_constant<int, 5>{});  break; \
+		case 8:  execute_dither(std::integral_constant<int, 8>{});  break; \
+		case 16: execute_dither(std::integral_constant<int, 16>{}); break; \
+		default: execute_dither(std::integral_constant<int, 0>{});  break; \
+	} \
+} while(0)
+
+
+void mask_colorfill(BITMAP* dest, BITMAP* src, int32_t color)
+{
+	int32_t wid = zc_min(dest->w, src->w);
+	int32_t hei = zc_min(dest->h, src->h);
+	for(int32_t ty = 0; ty < hei; ++ty)
+	{
+		uint8_t* read_addr = src->line[ty];
+		uint8_t* write_addr = dest->line[ty];
+		for(int32_t tx = 0; tx < wid; ++tx)
+		{
+			if(read_addr[tx])
+			{
+				write_addr[tx] = (uint8_t)color;
+			}
+		}
+	}
+}
+void mask_colorfill(BITMAP* dest, BITMAP* src, int32_t color, int32_t targStart, int32_t targEnd)
+{
+	int32_t wid = zc_min(dest->w, src->w);
+	int32_t hei = zc_min(dest->h, src->h);
+	for(int32_t ty = 0; ty < hei; ++ty)
+	{
+		uint8_t* read_addr = src->line[ty];
+		uint8_t* write_addr = dest->line[ty];
+		for(int32_t tx = 0; tx < wid; ++tx)
+		{
+			auto oldc = read_addr[tx];
+			if(oldc >= targStart && oldc <= targEnd)
+			{
+				write_addr[tx] = (uint8_t)color;
+			}
+		}
+	}
+}
+void mask_blit(BITMAP* dest, BITMAP* mask, BITMAP* pattern, bool repeats)
+{
+	int32_t wid = zc_min(dest->w, mask->w);
+	int32_t hei = zc_min(dest->h, mask->h);
+	if(!repeats)
+	{
+		wid = zc_min(wid, pattern->w);
+		hei = zc_min(hei, pattern->h);
+	}
+	for(int32_t ty = 0; ty < hei; ++ty)
+	{
+		uint8_t* mask_addr = mask->line[ty];
+		uint8_t* pattern_addr = pattern->line[ty % pattern->h];
+		uint8_t* write_addr = dest->line[ty];
+		for(int32_t tx = 0; tx < wid; ++tx)
+		{
+			if(mask_addr[tx])
+			{
+				auto color = pattern_addr[tx % pattern->w];
+				write_addr[tx] = color;
+			}
+		}
+	}
+}
+void mask_blit(BITMAP* dest, BITMAP* mask, BITMAP* pattern, bool repeats, int32_t targStart, int32_t targEnd)
+{
+	int32_t wid = zc_min(dest->w, mask->w);
+	int32_t hei = zc_min(dest->h, mask->h);
+	if(!repeats)
+	{
+		wid = zc_min(wid, pattern->w);
+		hei = zc_min(hei, pattern->h);
+	}
+	for(int32_t ty = 0; ty < hei; ++ty)
+	{
+		uint8_t* mask_addr = mask->line[ty];
+		uint8_t* pattern_addr = pattern->line[ty % pattern->h];
+		uint8_t* write_addr = dest->line[ty];
+		for(int32_t tx = 0; tx < wid; ++tx)
+		{
+			auto oldc = mask_addr[tx];
+			if(oldc >= targStart && oldc <= targEnd)
+			{
+				auto patternc = pattern_addr[tx % pattern->w];
+				write_addr[tx] = patternc;
+			}
+		}
+	}
+}
+
+int dither_offx;
+int dither_offy;
+
+void ditherblit(BITMAP* dest, BITMAP* src, int32_t color, byte dType, byte dArg, int32_t xoffs, int32_t yoffs)
+{
+	int32_t wid = src ? zc_min(dest->w, src->w) : dest->w;
+	int32_t hei = src ? zc_min(dest->h, src->h) : dest->h;
+	int sx = 0, sy = 0;
+
+#ifdef IS_PLAYER
+	xoffs += dither_offx;
+	yoffs += dither_offy;
+#endif
+	if (dest->clip)
+	{
+		wid = zc_min(dest->cr, wid);
+		hei = zc_min(dest->cb, hei);
+		sx = zc_max(dest->cl, sx);
+		sy = zc_max(dest->ct, sy);
+	}
+
+	DO_DITHER_OPTIMIZED(dType, dArg, wid, hei, check_func,
+	{
+		for(int32_t ty = sy; ty < hei; ++ty)
+		{
+			uint8_t* read_addr = src ? (uint8_t*)src->line[ty] : nullptr;
+			uint8_t* write_addr = (uint8_t*)dest->line[ty];
+			for(int32_t tx = sx; tx < wid; ++tx)
+			{
+				if((!read_addr || read_addr[tx]) && check_func(tx+xoffs,ty+yoffs))
+				{
+					write_addr[tx] = (uint8_t)color;
+				}
+			}
+		}
+	});
+}
+void bmp_dither(BITMAP* dest, BITMAP* src, byte dType, byte dArg, int32_t xoffs, int32_t yoffs)
+{
+#ifdef IS_PLAYER
+	xoffs += dither_offx;
+	yoffs += dither_offy;
+#endif
+
+	int32_t wid = zc_min(dest->w, src->w);
+	int32_t hei = zc_min(dest->h, src->h);
+	DO_DITHER_OPTIMIZED(dType, dArg, wid, hei, check_func,
+	{
+		for(int32_t ty = 0; ty < hei; ++ty)
+		{
+			uint8_t* read_addr = (uint8_t*)src->line[ty];
+			uint8_t* write_addr = (uint8_t*)dest->line[ty];
+			for(int32_t tx = 0; tx < wid; ++tx)
+			{
+				if(check_func(tx+xoffs,ty+yoffs))
+				{
+					write_addr[tx] = read_addr[tx];
+				}
+			}
+		}
+	});
+}
+void custom_bmp_dither(BITMAP* dest, BITMAP* src, std::function<bool(int,int,int,int)> proc)
+{
+	int32_t wid = zc_min(dest->w, src->w);
+	int32_t hei = zc_min(dest->h, src->h);
+	for(int32_t ty = 0; ty < hei; ++ty)
+	{
+		uint8_t* read_addr = (uint8_t*)src->line[ty];
+		uint8_t* write_addr = (uint8_t*)dest->line[ty];
+		for(int32_t tx = 0; tx < wid; ++tx)
+		{
+			if(proc(tx,ty,wid,hei))
+			{
+				write_addr[tx] = read_addr[tx];
+			}
+		}
+	}
+}
+
+void ditherblit_clipped(BITMAP* dest, BITMAP* src, int32_t color, byte dType, byte dArg, int32_t xoffs, int32_t yoffs)
+{
+#ifdef IS_PLAYER
+	xoffs += dither_offx;
+	yoffs += dither_offy;
+#endif
+
+	int32_t wid = std::min(dest->w, src->w);
+	int32_t hei = std::min(dest->h, src->h);
+	int32_t max_x = std::min(wid, src->cr);
+	int32_t max_y = std::min(hei, src->cb);
+
+	DO_DITHER_OPTIMIZED(dType, dArg, wid, hei, check_func,
+	{
+		for(int32_t ty = dest->ct; ty < max_y; ++ty)
+		{
+			uint8_t* read_addr = (uint8_t*)src->line[ty];
+			uint8_t* write_addr = (uint8_t*)dest->line[ty];
+			for(int32_t tx = dest->cl; tx < max_x; ++tx)
+			{
+				if(read_addr[tx] && check_func(tx+xoffs,ty+yoffs))
+				{
+					write_addr[tx] = (uint8_t)color;
+				}
+			}
+		}
+	});
+}
+
+void dithercircfill(BITMAP* dest, int32_t cx, int32_t cy, int32_t rad, int32_t color, byte ditherType, byte ditherArg, int32_t xoffs, int32_t yoffs)
+{
+#ifdef IS_PLAYER
+	xoffs += dither_offx;
+	yoffs += dither_offy;
+#endif
+
+	int32_t wid = dest->w;
+	int32_t hei = dest->h;
+
+	int32_t x1 = zc_max(cx - rad, 0);
+	int32_t y1 = zc_max(cy - rad, 0);
+	int32_t x2 = zc_min(cx + rad, dest->w - 1);
+	int32_t y2 = zc_min(cy + rad, dest->h - 1);
+	if (dest->clip)
+	{
+		x1 = zc_max(x1, dest->cl);
+		y1 = zc_max(y1, dest->ct);
+		x2 = zc_min(x2, dest->cr - 1);
+		y2 = zc_min(y2, dest->cb - 1);
+	}
+
+	// +rad/2 gets this closer (but not quite exact) to how circlefill works.
+	int32_t rad_sq = rad * rad + rad/2;
+	DO_DITHER_OPTIMIZED(ditherType, ditherArg, wid, hei, check_func,
+	{
+		for (int32_t ty = y1; ty <= y2; ++ty)
+		{
+			int32_t dy = ty - cy;
+			int32_t dy_sq = dy * dy;
+			uint8_t* write_addr = (uint8_t*)dest->line[ty];
+			for (int32_t tx = x1; tx <= x2; ++tx)
+			{
+				int32_t dx = tx - cx;
+				if (dx * dx + dy_sq <= rad_sq && check_func(tx + xoffs, ty + yoffs))
+					write_addr[tx] = (uint8_t)color;
+			}
+		}
+	});
+}
+void ditherrectfill(BITMAP* dest, int x1, int y1, int x2, int y2, int color,
+	byte dType, byte dArg, int xoffs, int yoffs, optional<int> inv_color)
+{
+#ifdef IS_PLAYER
+	xoffs += dither_offx;
+	yoffs += dither_offy;
+#endif
+
+	if(x1 > x2) zc_swap(x1,x2);
+	if(y1 > y2) zc_swap(y1,y2);
+	int wid = zc_min(x2-x1+1, dest->w-x1);
+	int hei = zc_min(y2-y1+1, dest->h-y1);
+
+	int xstart = zc_max(0, x1);
+	int xend = x1 + wid;
+	int ystart = zc_max(0, y1);
+	int yend = y1 + hei;
+
+	DO_DITHER_OPTIMIZED(dType, dArg, wid, hei, check_func,
+	{
+		for(int ty = ystart; ty < yend; ++ty)
+		{
+			uint8_t* write_addr = (uint8_t*)dest->line[ty];
+			for(int tx = xstart; tx < xend; ++tx)
+			{
+				if(check_func(tx + xoffs, ty + yoffs))
+					write_addr[tx] = (uint8_t)color;
+				else if(inv_color)
+					write_addr[tx] = (uint8_t)*inv_color;
+			}
+		}
+	});
+}
+
+#ifdef __GNUC__
+#pragma GCC diagnostic pop
+#endif
+
+void lampcone(BITMAP* dest, int32_t sx, int32_t sy, int32_t range, int32_t dir, int32_t color)
+{
+	int32_t vert[34] = {sx,sy};
+	int32_t vertcnt = 11;
+	switch(dir)
+	{
+		case up:
+		{
+			vert[2] = sx-ceil((17.0/66.0)*range);
+			vert[3] = sy-ceil((8.0/66.0)*range);
+			//
+			vert[4] = vert[2]-ceil((16.0/66.0)*range);
+			vert[5] = vert[3]-ceil((31.0/66.0)*range);
+			//
+			vert[6] = vert[4];
+			vert[7] = vert[5]-ceil((4.0/66.0)*range);
+			//
+			vert[8] = vert[6]+ceil((8.0/66.0)*range);
+			vert[9] = vert[7]-ceil((15.0/66.0)*range);
+			//
+			vert[10] = vert[8]+ceil((15.0/66.0)*range);
+			vert[11] = vert[9]-ceil((8.0/66.0)*range);
+			//
+			vert[12] = vert[10]+ceil((19.0/66.0)*range);
+			vert[13] = vert[11];
+			//
+			vert[14] = vert[12]+ceil((15.0/66.0)*range);
+			vert[15] = vert[13]+ceil((8.0/66.0)*range);
+			//
+			vert[16] = vert[14]+ceil((8.0/66.0)*range);
+			vert[17] = vert[15]+ceil((15.0/66.0)*range);
+			//
+			vert[18] = vert[16];
+			vert[19] = vert[17]+ceil((4.0/66.0)*range);
+			//
+			vert[20] = sx+ceil((17.0/66.0)*range);
+			vert[21] = sy-ceil((8.0/66.0)*range);
+			break;
+		}
+		case down:
+		{
+			vert[2] = sx-ceil((17.0/66.0)*range);
+			vert[3] = sy+ceil((8.0/66.0)*range);
+			//
+			vert[4] = vert[2]-ceil((16.0/66.0)*range);
+			vert[5] = vert[3]+ceil((31.0/66.0)*range);
+			//
+			vert[6] = vert[4];
+			vert[7] = vert[5]+ceil((4.0/66.0)*range);
+			//
+			vert[8] = vert[6]+ceil((8.0/66.0)*range);
+			vert[9] = vert[7]+ceil((15.0/66.0)*range);
+			//
+			vert[10] = vert[8]+ceil((15.0/66.0)*range);
+			vert[11] = vert[9]+ceil((8.0/66.0)*range);
+			//
+			vert[12] = vert[10]+ceil((19.0/66.0)*range);
+			vert[13] = vert[11];
+			//
+			vert[14] = vert[12]+ceil((15.0/66.0)*range);
+			vert[15] = vert[13]-ceil((8.0/66.0)*range);
+			//
+			vert[16] = vert[14]+ceil((8.0/66.0)*range);
+			vert[17] = vert[15]-ceil((15.0/66.0)*range);
+			//
+			vert[18] = vert[16];
+			vert[19] = vert[17]-ceil((4.0/66.0)*range);
+			//
+			vert[20] = sx+ceil((17.0/66.0)*range);
+			vert[21] = sy+ceil((8.0/66.0)*range);
+			break;
+		}
+		case left:
+		{
+			vert[2] = sx-ceil((8.0/66.0)*range);
+			vert[3] = sy-ceil((17.0/66.0)*range);
+			//
+			vert[4] = vert[2]-ceil((31.0/66.0)*range);
+			vert[5] = vert[3]-ceil((16.0/66.0)*range);
+			//
+			vert[6] = vert[4]-ceil((4.0/66.0)*range);
+			vert[7] = vert[5];
+			//
+			vert[8] = vert[6]-ceil((15.0/66.0)*range);
+			vert[9] = vert[7]+ceil((8.0/66.0)*range);
+			//
+			vert[10] = vert[8]-ceil((8.0/66.0)*range);
+			vert[11] = vert[9]+ceil((15.0/66.0)*range);
+			//
+			vert[12] = vert[10];
+			vert[13] = vert[11]+ceil((19.0/66.0)*range);
+			//
+			vert[14] = vert[12]+ceil((8.0/66.0)*range);
+			vert[15] = vert[13]+ceil((15.0/66.0)*range);
+			//
+			vert[16] = vert[14]+ceil((15.0/66.0)*range);
+			vert[17] = vert[15]+ceil((8.0/66.0)*range);
+			//
+			vert[18] = vert[16]+ceil((4.0/66.0)*range);
+			vert[19] = vert[17];
+			//
+			vert[20] = sx-ceil((8.0/66.0)*range);
+			vert[21] = sy+ceil((17.0/66.0)*range);
+			break;
+		}
+		case right:
+		{
+			vert[2] = sx+ceil((8.0/66.0)*range);
+			vert[3] = sy-ceil((17.0/66.0)*range);
+			//
+			vert[4] = vert[2]+ceil((31.0/66.0)*range);
+			vert[5] = vert[3]-ceil((16.0/66.0)*range);
+			//
+			vert[6] = vert[4]+ceil((4.0/66.0)*range);
+			vert[7] = vert[5];
+			//
+			vert[8] = vert[6]+ceil((15.0/66.0)*range);
+			vert[9] = vert[7]+ceil((8.0/66.0)*range);
+			//
+			vert[10] = vert[8]+ceil((8.0/66.0)*range);
+			vert[11] = vert[9]+ceil((15.0/66.0)*range);
+			//
+			vert[12] = vert[10];
+			vert[13] = vert[11]+ceil((19.0/66.0)*range);
+			//
+			vert[14] = vert[12]-ceil((8.0/66.0)*range);
+			vert[15] = vert[13]+ceil((15.0/66.0)*range);
+			//
+			vert[16] = vert[14]-ceil((15.0/66.0)*range);
+			vert[17] = vert[15]+ceil((8.0/66.0)*range);
+			//
+			vert[18] = vert[16]-ceil((4.0/66.0)*range);
+			vert[19] = vert[17];
+			//
+			vert[20] = sx+ceil((8.0/66.0)*range);
+			vert[21] = sy+ceil((17.0/66.0)*range);
+			break;
+		}
+		case l_up:
+		{
+			vertcnt = 17;
+			vert[2] = sx+ceil((6.0/66.0)*range);
+			vert[3] = sy-ceil((16.0/66.0)*range);
+			//
+			vert[4] = vert[2];
+			vert[5] = vert[3]-ceil((3.0/66.0)*range);
+			//
+			vert[6] = vert[4]-ceil((4.0/66.0)*range);
+			vert[7] = vert[5]-ceil((12.0/66.0)*range);
+			//
+			vert[8] = vert[6]-ceil((6.0/66.0)*range);
+			vert[9] = vert[7]-ceil((18.0/66.0)*range);
+			//
+			vert[10] = vert[8]-ceil((1.0/66.0)*range);
+			vert[11] = vert[9]-ceil((1.0/66.0)*range);
+			//
+			vert[12] = vert[10]-ceil((14.0/66.0)*range);
+			vert[13] = vert[11]-ceil((4.0/66.0)*range);
+			//
+			vert[14] = vert[12]-ceil((6.0/66.0)*range);
+			vert[15] = vert[13];
+			//
+			vert[16] = vert[14]-ceil((18.0/66.0)*range);
+			vert[17] = vert[15]+ceil((4.0/66.0)*range);
+			//
+			vert[18] = vert[16]-ceil((12.0/66.0)*range);
+			vert[19] = vert[17]+ceil((12.0/66.0)*range);
+			//
+			vert[20] = vert[18]-ceil((4.0/66.0)*range);
+			vert[21] = vert[19]+ceil((18.0/66.0)*range);
+			//
+			vert[22] = vert[20];
+			vert[23] = vert[21]+ceil((6.0/66.0)*range);
+			//
+			vert[24] = vert[22]+ceil((4.0/66.0)*range);
+			vert[25] = vert[23]+ceil((14.0/66.0)*range);
+			//
+			vert[26] = vert[24]+ceil((1.0/66.0)*range);
+			vert[27] = vert[25]+ceil((1.0/66.0)*range);
+			//
+			vert[28] = vert[26]+ceil((18.0/66.0)*range);
+			vert[29] = vert[27]+ceil((6.0/66.0)*range);
+			//
+			vert[30] = vert[28]+ceil((12.0/66.0)*range);
+			vert[31] = vert[29]+ceil((4.0/66.0)*range);
+			//
+			vert[32] = vert[30]+ceil((3.0/66.0)*range);
+			vert[33] = vert[31];
+			break;
+		}
+		case r_up:
+		{
+			vertcnt = 17;
+			vert[2] = sx-ceil((6.0/66.0)*range);
+			vert[3] = sy-ceil((16.0/66.0)*range);
+			//
+			vert[4] = vert[2];
+			vert[5] = vert[3]-ceil((3.0/66.0)*range);
+			//
+			vert[6] = vert[4]+ceil((4.0/66.0)*range);
+			vert[7] = vert[5]-ceil((12.0/66.0)*range);
+			//
+			vert[8] = vert[6]+ceil((6.0/66.0)*range);
+			vert[9] = vert[7]-ceil((18.0/66.0)*range);
+			//
+			vert[10] = vert[8]+ceil((1.0/66.0)*range);
+			vert[11] = vert[9]-ceil((1.0/66.0)*range);
+			//
+			vert[12] = vert[10]+ceil((14.0/66.0)*range);
+			vert[13] = vert[11]-ceil((4.0/66.0)*range);
+			//
+			vert[14] = vert[12]+ceil((6.0/66.0)*range);
+			vert[15] = vert[13];
+			//
+			vert[16] = vert[14]+ceil((18.0/66.0)*range);
+			vert[17] = vert[15]+ceil((4.0/66.0)*range);
+			//
+			vert[18] = vert[16]+ceil((12.0/66.0)*range);
+			vert[19] = vert[17]+ceil((12.0/66.0)*range);
+			//
+			vert[20] = vert[18]+ceil((4.0/66.0)*range);
+			vert[21] = vert[19]+ceil((18.0/66.0)*range);
+			//
+			vert[22] = vert[20];
+			vert[23] = vert[21]+ceil((6.0/66.0)*range);
+			//
+			vert[24] = vert[22]-ceil((4.0/66.0)*range);
+			vert[25] = vert[23]+ceil((14.0/66.0)*range);
+			//
+			vert[26] = vert[24]-ceil((1.0/66.0)*range);
+			vert[27] = vert[25]+ceil((1.0/66.0)*range);
+			//
+			vert[28] = vert[26]-ceil((18.0/66.0)*range);
+			vert[29] = vert[27]+ceil((6.0/66.0)*range);
+			//
+			vert[30] = vert[28]-ceil((12.0/66.0)*range);
+			vert[31] = vert[29]+ceil((4.0/66.0)*range);
+			//
+			vert[32] = vert[30]-ceil((3.0/66.0)*range);
+			vert[33] = vert[31];
+			break;
+		}
+		case l_down:
+		{
+			vertcnt = 17;
+			vert[2] = sx+ceil((6.0/66.0)*range);
+			vert[3] = sy+ceil((16.0/66.0)*range);
+			//
+			vert[4] = vert[2];
+			vert[5] = vert[3]+ceil((3.0/66.0)*range);
+			//
+			vert[6] = vert[4]-ceil((4.0/66.0)*range);
+			vert[7] = vert[5]+ceil((12.0/66.0)*range);
+			//
+			vert[8] = vert[6]-ceil((6.0/66.0)*range);
+			vert[9] = vert[7]+ceil((18.0/66.0)*range);
+			//
+			vert[10] = vert[8]-ceil((1.0/66.0)*range);
+			vert[11] = vert[9]+ceil((1.0/66.0)*range);
+			//
+			vert[12] = vert[10]-ceil((14.0/66.0)*range);
+			vert[13] = vert[11]+ceil((4.0/66.0)*range);
+			//
+			vert[14] = vert[12]-ceil((6.0/66.0)*range);
+			vert[15] = vert[13];
+			//
+			vert[16] = vert[14]-ceil((18.0/66.0)*range);
+			vert[17] = vert[15]-ceil((4.0/66.0)*range);
+			//
+			vert[18] = vert[16]-ceil((12.0/66.0)*range);
+			vert[19] = vert[17]-ceil((12.0/66.0)*range);
+			//
+			vert[20] = vert[18]-ceil((4.0/66.0)*range);
+			vert[21] = vert[19]-ceil((18.0/66.0)*range);
+			//
+			vert[22] = vert[20];
+			vert[23] = vert[21]-ceil((6.0/66.0)*range);
+			//
+			vert[24] = vert[22]+ceil((4.0/66.0)*range);
+			vert[25] = vert[23]-ceil((14.0/66.0)*range);
+			//
+			vert[26] = vert[24]+ceil((1.0/66.0)*range);
+			vert[27] = vert[25]-ceil((1.0/66.0)*range);
+			//
+			vert[28] = vert[26]+ceil((18.0/66.0)*range);
+			vert[29] = vert[27]-ceil((6.0/66.0)*range);
+			//
+			vert[30] = vert[28]+ceil((12.0/66.0)*range);
+			vert[31] = vert[29]-ceil((4.0/66.0)*range);
+			//
+			vert[32] = vert[30]+ceil((3.0/66.0)*range);
+			vert[33] = vert[31];
+			break;
+		}
+		case r_down:
+		{
+			vertcnt = 17;
+			vert[2] = sx-ceil((6.0/66.0)*range);
+			vert[3] = sy+ceil((16.0/66.0)*range);
+			//
+			vert[4] = vert[2];
+			vert[5] = vert[3]+ceil((3.0/66.0)*range);
+			//
+			vert[6] = vert[4]+ceil((4.0/66.0)*range);
+			vert[7] = vert[5]+ceil((12.0/66.0)*range);
+			//
+			vert[8] = vert[6]+ceil((6.0/66.0)*range);
+			vert[9] = vert[7]+ceil((18.0/66.0)*range);
+			//
+			vert[10] = vert[8]+ceil((1.0/66.0)*range);
+			vert[11] = vert[9]+ceil((1.0/66.0)*range);
+			//
+			vert[12] = vert[10]+ceil((14.0/66.0)*range);
+			vert[13] = vert[11]+ceil((4.0/66.0)*range);
+			//
+			vert[14] = vert[12]+ceil((6.0/66.0)*range);
+			vert[15] = vert[13];
+			//
+			vert[16] = vert[14]+ceil((18.0/66.0)*range);
+			vert[17] = vert[15]-ceil((4.0/66.0)*range);
+			//
+			vert[18] = vert[16]+ceil((12.0/66.0)*range);
+			vert[19] = vert[17]-ceil((12.0/66.0)*range);
+			//
+			vert[20] = vert[18]+ceil((4.0/66.0)*range);
+			vert[21] = vert[19]-ceil((18.0/66.0)*range);
+			//
+			vert[22] = vert[20];
+			vert[23] = vert[21]-ceil((6.0/66.0)*range);
+			//
+			vert[24] = vert[22]-ceil((4.0/66.0)*range);
+			vert[25] = vert[23]-ceil((14.0/66.0)*range);
+			//
+			vert[26] = vert[24]-ceil((1.0/66.0)*range);
+			vert[27] = vert[25]-ceil((1.0/66.0)*range);
+			//
+			vert[28] = vert[26]-ceil((18.0/66.0)*range);
+			vert[29] = vert[27]-ceil((6.0/66.0)*range);
+			//
+			vert[30] = vert[28]-ceil((12.0/66.0)*range);
+			vert[31] = vert[29]-ceil((4.0/66.0)*range);
+			//
+			vert[32] = vert[30]-ceil((3.0/66.0)*range);
+			vert[33] = vert[31];
+			break;
+		}
+	}
+	polygon(dest, vertcnt, vert, color);
+}
+
+void ditherLampCone(BITMAP* dest, int32_t sx, int32_t sy, int32_t range, int32_t dir, int32_t color, byte ditherType, byte ditherArg, int32_t xoffs, int32_t yoffs)
+{
+	static BITMAP* dither_tmp_bmp;
+	zalleg_update_bmp_size(&dither_tmp_bmp, dest->w, dest->h);
+	clear_bitmap(dither_tmp_bmp);
+	lampcone(dither_tmp_bmp, sx, sy, range, dir, 1);
+	ditherblit(dest, dither_tmp_bmp, color, ditherType, ditherArg, xoffs, yoffs);
+}
+
+void monocolor(BITMAP* dest, byte col, byte transp_passes)
+{
+	int32_t wid = dest->w;
+	int32_t hei = dest->h;
+	for (int ty = 0; ty < hei; ++ty)
+	{
+		uintptr_t read_addr = bmp_read_line(dest, ty);
+		uintptr_t write_addr = bmp_write_line(dest, ty);
+		for (int tx = 0; tx < wid; ++tx)
+		{
+			byte c = bmp_read8(read_addr + tx);
+			if (c)
+			{
+				if (transp_passes)
+				{
+					for (int q = 0; q < transp_passes; ++q)
+					{
+						c = trans_table2->data[c][col];
+					}
+				}
+				else
+					c = col;
+				bmp_write8(write_addr + tx, c);
+			}
+		}
+	}
+	bmp_unwrite_line(dest);
+}
+
+void replColor(BITMAP* dest, byte col, byte startCol, byte endCol, bool shift)
+{
+	int32_t wid = dest->w;
+	int32_t hei = dest->h;
+	for(int32_t ty = 0; ty < hei; ++ty)
+	{
+		uintptr_t read_addr = bmp_read_line(dest, ty);
+		uintptr_t write_addr = bmp_write_line(dest, ty);
+		for(int32_t tx = 0; tx < wid; ++tx)
+		{
+			byte c = bmp_read8(read_addr+tx);
+			if(c >= startCol && c <= endCol)
+			{
+				bmp_write8(write_addr+tx, shift ? byte(c+col) : col);
+			}
+		}
+	}
+	bmp_unwrite_line(dest);
+}
+
+void replColors(BITMAP* dest, vector<byte> srcCol, vector<byte> dstCol)
+{
+	size_t sz = std::min(srcCol.size(), dstCol.size());
+	if(!sz) return;
+	int32_t wid = dest->w;
+	int32_t hei = dest->h;
+	for(int32_t ty = 0; ty < hei; ++ty)
+	{
+		uintptr_t read_addr = bmp_read_line(dest, ty);
+		uintptr_t write_addr = bmp_write_line(dest, ty);
+		for(int32_t tx = 0; tx < wid; ++tx)
+		{
+			byte c = bmp_read8(read_addr+tx);
+			int dc = -1;
+			for(size_t q = 0; q < sz; ++q)
+			{
+				if(c == srcCol[q])
+				{
+					dc = dstCol[q];
+					break;
+				}
+			}
+			if(dc > -1)
+			{
+				bmp_write8(write_addr+tx, byte(dc));
+			}
+		}
+	}
+	bmp_unwrite_line(dest);
+}
+
+//Counts the number of pixels in 'src' matching 'checkCol' in the masked area that matches 'maskCol'
+//Any color < 0 will match with any non-zero color.
+int32_t countColor(BITMAP* src, BITMAP* mask, int32_t x, int32_t y, int32_t checkCol, int32_t maskCol)
+{
+	int32_t wid = zc_min(src->w-x, mask->w);
+	int32_t hei = zc_min(src->h-y, mask->h);
+	int32_t count = 0;
+	for(int32_t ty = 0; ty < hei; ++ty)
+	{
+		uintptr_t mask_addr = bmp_read_line(mask, ty);
+		uintptr_t read_addr = bmp_read_line(src, ty+y);
+		for(int32_t tx = 0; tx < wid; ++tx)
+		{
+			int32_t maskc = bmp_read8(mask_addr+tx);
+			if(maskCol < 0 ? maskc : maskc==maskCol)
+			{
+				int32_t color = bmp_read8(read_addr+tx+x);
+				if(checkCol < 0 ? color : color==checkCol)
+					++count;
+			}
+		}
+	}
+	bmp_unwrite_line(mask);
+	bmp_unwrite_line(src);
+	return count;
+}
+
+vector<byte> getColors(BITMAP* bmp, int maxCount)
+{
+	vector<byte> ret;
+	
+	int32_t wid = bmp->w;
+	int32_t hei = bmp->h;
+	for(int32_t ty = 0; ty < hei; ++ty)
+	{
+		uintptr_t read_addr = bmp_read_line(bmp, ty);
+		for(int32_t tx = 0; tx < wid; ++tx)
+		{
+			byte c = bmp_read8(read_addr+tx);
+			bool dupe = false;
+			for(byte col : ret)
+			{
+				if(c == col)
+				{
+					dupe = true;
+					break;
+				}
+			}
+			if(!dupe)
+			{
+				ret.push_back(c);
+				if(ret.size() >= maxCount)
+				{
+					ty = hei;
+					break;
+				}
+			}
+		}
+	}
+	bmp_unwrite_line(bmp);
+	return ret;
+}
+
+void textout_styled_aligned_ex(BITMAP *bmp, const FONT *f, const char *s, int32_t x, int32_t y, int32_t textstyle, int32_t alignment, int32_t color, int32_t shadow, int32_t bg)
+{
+	switch(alignment)
+	{
+	case ALIGN_RIGHT:
+		switch(textstyle)
+		{
+		case sstsSHADOW:
+			textout_shadow_right_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsSHADOWU:
+			textout_shadow_right_u_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsOUTLINE8:
+			textout_shadow_right_o_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsOUTLINEPLUS:
+			textout_shadow_right_plus_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsOUTLINEX:
+			textout_shadow_right_x_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsSHADOWED:
+			textout_shadowed_right_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsSHADOWEDU:
+			textout_shadowed_right_u_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsOUTLINED8:
+			textout_shadowed_right_o_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsOUTLINEDPLUS:
+			textout_shadowed_right_plus_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsOUTLINEDX:
+			textout_shadowed_right_x_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsNORMAL:
+		default:
+			textout_right_ex(bmp, f, s, x, y, color, bg);
+			break;
+		}
+		
+		break;
+		
+	case ALIGN_CENTER:
+		switch(textstyle)
+		{
+		case sstsSHADOW:
+			textout_shadow_center_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsSHADOWU:
+			textout_shadow_center_u_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsOUTLINE8:
+			textout_shadow_center_o_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsOUTLINEPLUS:
+			textout_shadow_center_plus_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsOUTLINEX:
+			textout_shadow_center_x_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsSHADOWED:
+			textout_shadowed_center_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsSHADOWEDU:
+			textout_shadowed_center_u_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsOUTLINED8:
+			textout_shadowed_center_o_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsOUTLINEDPLUS:
+			textout_shadowed_center_plus_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsOUTLINEDX:
+			textout_shadowed_center_x_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsNORMAL:
+		default:
+			textout_centre_ex(bmp, f, s, x, y, color, bg);
+			break;
+		}
+		
+		break;
+		
+	case ALIGN_LEFT:
+	default:
+		switch(textstyle)
+		{
+		case sstsSHADOW:
+			textout_shadow_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsSHADOWU:
+			textout_shadow_u_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsOUTLINE8:
+			textout_shadow_o_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsOUTLINEPLUS:
+			textout_shadow_plus_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsOUTLINEX:
+			textout_shadow_x_ex(bmp, f, s, x, y, shadow, bg);
+			break;
+			
+		case sstsSHADOWED:
+			textout_shadowed_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsSHADOWEDU:
+			textout_shadowed_u_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsOUTLINED8:
+			textout_shadowed_o_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsOUTLINEDPLUS:
+			textout_shadowed_plus_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsOUTLINEDX:
+			textout_shadowed_x_ex(bmp, f, s, x, y, color, shadow, bg);
+			break;
+			
+		case sstsNORMAL:
+		default:
+			textout_ex(bmp, f, s, x, y, color, bg);
+			break;
+		}
+		
+		break;
+	}
+}
+

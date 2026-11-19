@@ -1,0 +1,157 @@
+#include "alert.h"
+#include <gui/builder.h>
+#include <utility>
+
+void info_dsa(string const& title, string const& text, string const& dsastr)
+{
+	if(!zc_get_config("dsa",dsastr.c_str(),0))
+	{
+		AlertDialog(title, text,
+			[&]([[maybe_unused]] bool ret, bool dsa)
+			{
+				if(dsa)
+				{
+					zc_set_config("dsa",dsastr.c_str(),1);
+				}
+			},
+			"OK","",
+			0,false, //timeout - none
+			true //"Don't show this again"
+		).show();
+	}
+}
+static bool return_val, dsa_val;
+static void _default_alert_proc(bool ret, bool)
+{
+	return_val = ret;
+}
+static void _default_alert_dsa_proc(bool ret, bool dsa)
+{
+	return_val = ret;
+	dsa_val = dsa;
+}
+bool alert_confirm(string const& title, string const& text,
+	optional<string> yes_btn, optional<string> no_btn, optional<string> subtext)
+{
+#ifdef __ANDROID__
+	// The desktop GUI framework isn't wired to the Android surface, so confirm
+	// dialogs are shown as a native Android AlertDialog from the cog menu (the
+	// Java confirmAction helper) before the engine handler is invoked. Here the
+	// engine just proceeds.
+	(void)title; (void)text; (void)yes_btn; (void)no_btn; (void)subtext;
+	return true;
+#else
+	return_val = false;
+	AlertDialog alert(title, text,
+		_default_alert_proc,
+		yes_btn.value_or("Yes"),
+		no_btn.value_or("No"),
+		0,false,false);
+	if (subtext)
+		alert.set_subtext(subtext);
+	alert.show();
+	return return_val;
+#endif
+}
+std::pair<bool,bool> alert_confirm_dsa(string const& title, string const& text,
+	optional<string> yes_btn, optional<string> no_btn, optional<string> subtext)
+{
+	return_val = false;
+	dsa_val = false;
+	AlertDialog alert(title, text,
+		_default_alert_dsa_proc,
+		yes_btn.value_or("Yes"),
+		no_btn.value_or("No"),
+		0,false,true);
+	if (subtext)
+		alert.set_subtext(subtext);
+	alert.show();
+	return {return_val, dsa_val};
+}
+
+AlertDialog::AlertDialog(string const& title, string const& text, std::function<void(bool,bool)> onEnd, string truebtn, string falsebtn, uint32_t timeout, bool default_ret, bool dontshow):
+	InfoDialog(title,text), truebtn(truebtn), falsebtn(falsebtn), timer(0), timeout(timeout), default_ret(default_ret), dontshowagain(dontshow), onEnd(onEnd)
+{}
+
+AlertDialog::AlertDialog(string const& title, vector<string> const& lines, std::function<void(bool,bool)> onEnd, string truebtn, string falsebtn, uint32_t timeout, bool default_ret, bool dontshow):
+	InfoDialog(title,lines), truebtn(truebtn), falsebtn(falsebtn), timer(0), timeout(timeout), default_ret(default_ret), dontshowagain(dontshow), onEnd(onEnd)
+{}
+
+int32_t AlertDialog::alert_on_tick()
+{
+	if(timeout)
+	{
+		if(++timer > timeout)
+		{
+			onEnd(default_ret,dontshowagain);
+			return ONTICK_EXIT;
+		}
+	}
+	return ONTICK_CONTINUE;
+}
+
+std::shared_ptr<GUI::Widget> AlertDialog::view()
+{
+	using namespace GUI::Builder;
+	using namespace GUI::Props;
+	using namespace GUI::Key;
+	bool dsa = dontshowagain;
+	dontshowagain = false;
+	
+	std::shared_ptr<GUI::Widget> trueb = DummyWidget();
+	std::shared_ptr<GUI::Widget> falseb = DummyWidget();
+	if (truebtn.size())
+		trueb = Button(
+			text = truebtn,
+			minwidth = 90_px,
+			onClick = message::OK,
+			focused = true
+		);
+	if (falsebtn.size())
+		falseb = Button(
+			text = falsebtn,
+			minwidth = 90_px,
+			onClick = message::CANCEL
+		);
+	
+	return Window(
+		title = std::move(d_title),
+		onClose = message::CANCEL,
+		use_vsync = true,
+		onTick = [&](){return alert_on_tick();},
+		hPadding = 0_px,
+		Column(
+			hPadding = 0_px,
+			build_text(),
+			Checkbox(visible = dsa,
+				text = "Don't show this message again",
+				checked = false,
+				onToggleFunc = [&](bool state)
+				{
+					dontshowagain = state;
+				}
+			),
+			Row(
+				topPadding = 0.5_em,
+				vAlign = 1.0,
+				spacing = 2_em,
+				trueb,
+				falseb
+			)
+		)
+	);
+}
+
+bool AlertDialog::handleMessage(const GUI::DialogMessage<message>& msg)
+{
+	switch(msg.message)
+	{
+		case message::OK:
+			onEnd(true,dontshowagain);
+			return true;
+		case message::CANCEL:
+			onEnd(false,dontshowagain);
+			return true;
+	}
+	return false;
+}

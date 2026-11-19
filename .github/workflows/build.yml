@@ -1,0 +1,187 @@
+run-name: ${{ inputs.release-name || 'Build' }}, ${{ inputs.runs-on }} ${{ inputs.arch }} ${{ inputs.config }} w/ ${{ inputs.compiler }}
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+      arch:
+        type: string
+      compiler:
+        type: string
+        required: false
+      config:
+        type: string
+        default: "Release"
+        required: true
+      cache:
+        type: boolean
+        default: true
+      debug-info:
+        type: boolean
+        default: false
+        description: "Whether to include debug info in the packaged artifact"
+      test-runner:
+        type: boolean
+        default: false
+        description: "Whether to include the test runner in the packaged artifact"
+      # The following is for releases only.
+      official:
+        type: boolean
+        default: false
+        description: "Do not set this directly! Use release workflow."
+      sentry:
+        type: boolean
+        default: false
+        description: "Do not set this directly! Use release workflow."
+      release-version:
+        type: string
+        required: false
+        description: "Do not set this directly! Use release workflow."
+      release-name:
+        type: string
+        required: false
+        description: "Do not set this directly! Use release workflow."
+    outputs:
+      artifact-name:
+        description: "The name of the artifact that should be downloaded by the caller workflow"
+        value: build-${{ inputs.runs-on }}-${{ inputs.arch }}-${{ inputs.compiler }}-${{ inputs.config }}
+      package-name:
+        description: "The name of the package inside the uploaded artifact"
+        value: ${{ jobs.build.outputs.package-name }}
+    secrets:
+      SENTRY_TOKEN:
+        required: false
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      package-name: ${{ steps.set-package-vars.outputs.package-name }}
+    steps:
+      - name: Install cmake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.31.10'
+
+      - name: git clone
+        uses: connorjclark/action-cached-lfs-checkout@3ea4dc59b06f3baa8c01ba891fbfc2dbfdce5bc8
+        with:
+          include: 'resources/**/*'
+          fetch-depth: 0
+          enableCrossOsArchive: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Setup MSVC (Windows only)
+        if: ${{ contains(inputs.runs-on, 'windows') }}
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ inputs.arch }}
+
+      - name: Install LLVM and Clang
+        if: inputs.compiler == 'clang' && runner.os == 'Linux' && runner.arch == 'X64'
+        uses: KyleMayes/install-llvm-action@v1
+        with:
+          version: 17.0.2
+          env: true
+
+      # install-llvm-action@v1 only knows x86-64 Linux assets, so on arm64 it
+      # installs an x86-64 clang (Exec format error). Fetch the matching
+      # aarch64 release directly.
+      - name: Install LLVM and Clang (Linux arm64)
+        if: inputs.compiler == 'clang' && runner.os == 'Linux' && runner.arch == 'ARM64'
+        run: |
+          curl -sL -o llvm.tar.xz https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.2/clang+llvm-17.0.2-aarch64-linux-gnu.tar.xz
+          mkdir -p "$GITHUB_WORKSPACE/llvm"
+          tar -xf llvm.tar.xz -C "$GITHUB_WORKSPACE/llvm" --strip-components=1
+          rm llvm.tar.xz
+          # The llvm.org binaries link against libtinfo5.
+          sudo apt-get install -y libtinfo5 || true
+          echo "$GITHUB_WORKSPACE/llvm/bin" >> $GITHUB_PATH
+          echo "CC=$GITHUB_WORKSPACE/llvm/bin/clang" >> $GITHUB_ENV
+          echo "CXX=$GITHUB_WORKSPACE/llvm/bin/clang++" >> $GITHUB_ENV
+          "$GITHUB_WORKSPACE/llvm/bin/clang" --version
+
+      - name: Restore ccache
+        if: inputs.cache
+        uses: actions/cache@v5
+        with:
+          path: .ccache
+          key: ${{ inputs.runs-on }}-${{ inputs.arch }}-${{ inputs.compiler }}-${{ inputs.config }}-v3-ccache-${{ github.run_id }}
+          restore-keys: ${{ inputs.runs-on }}-${{ inputs.arch }}-${{ inputs.compiler }}-${{ inputs.config }}-v3-
+
+      - name: Setup vcpkg
+        if: ${{ contains(inputs.runs-on, 'windows') }}
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 120deac3062162151622ca4860575a33844ba10b
+
+      - name: Install OS Dependencies
+        run: >
+          python .github/workflows/ci.py install-deps
+          --repo ${{ github.repository }}
+          --arch ${{ inputs.arch }}
+          --compiler ${{ inputs.compiler }}
+
+      - name: Build
+        run: >
+          bash .github/workflows/run_python.sh .github/workflows/ci.py build
+          --arch ${{ inputs.arch }}
+          --compiler ${{ inputs.compiler }}
+          --config ${{ inputs.config }}
+          --release-version "${{ inputs.release-version || '3.0.0' }}"
+          --repo "${{ github.repository }}"
+          ${{ inputs.official && '--official' || '' }}
+          ${{ inputs.test-runner && '--test-runner' || '' }}
+          ${{ inputs.sentry && '--sentry' || '' }}
+          ${{ !inputs.cache && '--no-cache' || '' }}
+
+      - name: Package
+        run: >
+          bash .github/workflows/run_python.sh .github/workflows/ci.py package
+          --repo ${{ github.repository }}
+          --arch ${{ inputs.arch }}
+          --config ${{ inputs.config }}
+          --release-version "${{ inputs.release-version || 'zc' }}"
+          --packages-dir packages
+          ${{ inputs.debug-info && '--debug-info' || '' }}
+
+      - name: Set package output variable
+        id: set-package-vars
+        shell: bash
+        run: |
+          # Dynamically grab the name of the file our script put in the packages directory
+          # excluding build.tar.gz if it exists
+          PACKAGE_NAME=$(ls packages/ | grep -v build.tar.gz | head -n 1)
+          echo "package-name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ inputs.runs-on }}-${{ inputs.arch }}-${{ inputs.compiler }}-${{ inputs.config }}
+          path: packages/*.*
+
+      - name: Setup Sentry CLI
+        if: inputs.sentry
+        uses: mathieu-bour/setup-sentry-cli@dbbd0776d55f6e0e5cd7e81fa1a80f4fd0c60369
+        with:
+          version: '2.20.6'
+          token: ${{ secrets.SENTRY_TOKEN }}
+          organization: zeldaclassic
+          project: zelda-classic
+
+      - name: Verify Sentry CLI
+        if: inputs.sentry
+        run: sentry-cli --version
+
+      - name: Upload debugging symbols
+        if: inputs.sentry
+        run: sentry-cli --log-level=DEBUG upload-dif 'zelda-classic@${{ inputs.release-version }}' --include-sources --wait build/${{ inputs.config }}

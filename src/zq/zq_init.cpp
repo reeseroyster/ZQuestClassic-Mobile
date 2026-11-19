@@ -1,0 +1,23 @@
+#include <stdio.h>
+
+#include "zalleg/gui.h"
+#include "init.h"
+#include "zalleg/zalleg.h"
+#include "core/zdefs.h"
+#include "core/initdata.h"
+#include "gui/jwin.h"
+#include "zq/zq_init.h"
+#include "zalleg/zsys.h"
+#include "zq/zquest.h"
+
+extern int32_t dmap_list_size;
+extern bool dmap_list_zero;
+
+extern int32_t doInit(zinitdata *zinit);
+
+int32_t onInit()
+{
+    dmap_list_size=MAXDMAPS;
+    dmap_list_zero=true;
+    return doInit(&zinit, false);
+}

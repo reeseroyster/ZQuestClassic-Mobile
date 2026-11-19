@@ -1,0 +1,248 @@
+import json
+import os
+import sys
+import uuid
+import zlib
+
+from http import HTTPStatus
+from pathlib import Path
+
+import boto3
+
+from flask import Flask, flash, redirect, request, url_for
+from werkzeug.exceptions import HTTPException
+
+script_dir = Path(os.path.dirname(os.path.realpath(__file__)))
+root_dir = script_dir.parent
+
+sys.path.append(str((root_dir / 'scripts').absolute()))
+import database
+
+# An uploaded replay may not exceed this size as sent (before decompression).
+MAX_UPLOAD_BYTES = 30_000_000
+
+app = Flask(__name__)
+# Rejects larger requests before reading them, rather than buffering them all in memory.
+app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_BYTES
+app.config.from_prefixed_env()
+
+data_dir = Path(app.config['DATA_DIR'])
+replays_dir = data_dir / 'replays'
+replays_dir.mkdir(exist_ok=True)
+
+
+# An uploaded replay may not exceed this size once decompressed.
+MAX_REPLAY_BYTES = 300_000_000
+
+
+def decompress_gzip_bounded(data: bytes, max_size: int) -> bytes:
+    """Decompress gzip data, aborting if the output would exceed max_size.
+
+    Unlike gzip.decompress(), this never buffers more than ~max_size bytes, so a
+    small "gzip bomb" payload can't exhaust memory before the size check runs.
+    """
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    out = decompressor.decompress(data, max_size + 1)
+    if decompressor.unconsumed_tail or len(out) > max_size:
+        raise ValueError('decompressed payload too large')
+    out += decompressor.flush()
+    if len(out) > max_size:
+        raise ValueError('decompressed payload too large')
+    return out
+
+
+def is_valid_uuid(val):
+    # Only the canonical form (what ZC writes), else the same replay could be uploaded under
+    # many keys (uuid.UUID also accepts braces, "urn:uuid:", no hyphens, upper case...).
+    try:
+        return str(uuid.UUID(str(val))) == val
+    except ValueError:
+        return False
+
+
+def connect_s3():
+    session = boto3.session.Session()
+    return session.client(
+        's3',
+        region_name=app.config['S3_REGION'],
+        endpoint_url=app.config['S3_URL'],
+        aws_access_key_id=app.config['S3_ACCESS_KEY'],
+        aws_secret_access_key=app.config['S3_SECRET_ACCESS_KEY'],
+    )
+
+
+def parse_replay(replay_text: str) -> tuple[dict[str, str], list[str]]:
+    """Returns tuple: meta, steps. Raises ValueError if malformed."""
+    meta = {}
+    steps = []
+    done_with_meta = False
+
+    for line in replay_text.splitlines():
+        if not line:
+            continue
+        if not line.startswith('M'):
+            done_with_meta = True
+        if done_with_meta:
+            steps.append(line)
+        else:
+            # Not stripped: a meta line may have an empty value ("M qst_title ").
+            parts = line.split(' ', 2)
+            if len(parts) != 3:
+                raise ValueError(f'invalid meta line: {line[:100]}')
+            meta[parts[1]] = parts[2]
+
+    return meta, steps
+
+
+s3 = connect_s3() if app.config.get('PRODUCTION') else None
+db = database.Database(data_dir / 'database')
+
+qst_keys_by_hash = db.get_qst_keys_by_hash()
+quest_list = []
+for qst_hash in qst_keys_by_hash.keys():
+    quest_list.append({'hash': qst_hash})
+print(f'found {len(quest_list)} quests')
+
+replay_guid_to_path = {}
+for path in replays_dir.rglob('*.zplay'):
+    replay_guid_to_path[path.stem] = path
+print(f'found {len(replay_guid_to_path)} replays')
+
+
+@app.route('/api/v1/quests', methods=['GET'])
+def quests():
+    return quest_list
+
+
+@app.route('/api/v1/replays/<uuid>', methods=['PUT'])
+def replays(uuid):
+    # Old clients auto-uploaded replays without user consent (fixed in
+    # 8940060885); they predate this header, so requiring it locks them all out.
+    if not request.headers.get('ZC-Version'):
+        return {
+            'error': 'missing ZC-Version header (please update ZC)'
+        }, HTTPStatus.BAD_REQUEST
+
+    # Log the attempted upload size up front (and flushed), so that if a large
+    # payload starves the box of memory we can still correlate it in the logs.
+    content_encoding = request.headers.get('Content-Encoding', '').lower()
+    print(
+        f'replay upload attempt: uuid={uuid} ip={request.remote_addr} '
+        f'content_length={request.content_length} '
+        f'encoding={content_encoding or "none"}',
+        flush=True,
+    )
+
+    # Larger payloads are rejected by MAX_CONTENT_LENGTH.
+    raw_data = request.data
+
+    if content_encoding == 'gzip':
+        try:
+            raw_data = decompress_gzip_bounded(raw_data, MAX_REPLAY_BYTES)
+        except Exception as e:
+            return {
+                'error': f'Failed to decompress gzip payload: {str(e)}'
+            }, HTTPStatus.BAD_REQUEST
+    elif content_encoding:
+        return {
+            'error': f'Unsupported content encoding payload: {content_encoding}'
+        }, HTTPStatus.BAD_REQUEST
+
+    print(
+        f'replay upload decoded: uuid={uuid} bytes={len(raw_data)}',
+        flush=True,
+    )
+
+    try:
+        data = raw_data.decode('utf-8')
+    except UnicodeDecodeError:
+        return {'error': 'Payload is not valid utf-8 text'}, HTTPStatus.BAD_REQUEST
+
+    if not data.startswith('M'):
+        return {'error': 'invalid replay'}, HTTPStatus.BAD_REQUEST
+
+    # No larger than 300 MB.
+    if len(data) > MAX_REPLAY_BYTES:
+        return {
+            'error': 'too large, max is 300 MB'
+        }, HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+
+    try:
+        meta, steps = parse_replay(data)
+    except ValueError as e:
+        return {'error': f'invalid replay: {e}'}, HTTPStatus.BAD_REQUEST
+
+    qst_hash = meta.get('qst_hash')
+    uuid_from_replay = meta.get('uuid')
+
+    if not qst_hash or not uuid_from_replay or 'length' not in meta:
+        return {'error': 'replay is too old'}, HTTPStatus.BAD_REQUEST
+
+    if uuid_from_replay != uuid:
+        return {
+            'error': 'replay uuid does not match uuid from url'
+        }, HTTPStatus.BAD_REQUEST
+
+    if not qst_hash.isalnum():
+        return {'error': 'invalid qst_hash'}, HTTPStatus.BAD_REQUEST
+
+    if not is_valid_uuid(uuid):
+        return {'error': 'invalid uuid'}, HTTPStatus.BAD_REQUEST
+
+    # Split-replay segments (from scripts/split_replay.py) start from a .sav
+    # snapshot that never gets uploaded alongside the replay, so they can
+    # never actually be replayed.
+    if 'sav' in meta:
+        return {
+            'error': 'replay requires a save file to run (split replay segment)'
+        }, HTTPStatus.BAD_REQUEST
+
+    try:
+        length = int(meta['length'])
+    except ValueError:
+        return {'error': 'invalid length'}, HTTPStatus.BAD_REQUEST
+    if length != len(steps):
+        return {'error': 'invalid length'}, HTTPStatus.BAD_REQUEST
+
+    if qst_hash not in qst_keys_by_hash:
+        return {'error': 'unknown qst'}, HTTPStatus.BAD_REQUEST
+
+    key = f'{qst_hash}/{uuid}.zplay'
+    path = replays_dir / key
+    status = HTTPStatus.CREATED
+    if path.exists():
+        status = HTTPStatus.OK
+        existing_meta, existing_steps = parse_replay(path.read_text('utf-8'))
+        if int(existing_meta['length']) > length:
+            return {'error': 'replay is older than current'}, HTTPStatus.CONFLICT
+        # Replays are append-only.
+        if steps[: len(existing_steps)] != existing_steps:
+            return {'error': 'replay is different than current'}, HTTPStatus.CONFLICT
+
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(data)
+    if s3:
+        s3.upload_file(path, app.config['S3_BUCKET'], key)
+
+    return {'key': key}, status
+
+
+@app.errorhandler(HTTPException)
+def handle_exception(e):
+    """Return JSON instead of HTML for HTTP errors."""
+    response = e.get_response()
+    response.data = json.dumps(
+        {
+            'code': e.code,
+            'name': e.name,
+            'description': e.description,
+            # What the client logs.
+            'error': e.description,
+        }
+    )
+    response.content_type = 'application/json'
+    return response
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0')

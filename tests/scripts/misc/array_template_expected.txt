@@ -1,0 +1,314 @@
+stderr:
+
+Compiling 'array_template.zs'
+Pass 1: Parsing
+Pass 2: Preprocessing
+Pass 3: Registration
+Pass 4: Analyzing Code
+Pass 5: Checking code paths
+Pass 6: Generating object code
+Pass 7: Assembling
+Success!
+Compile finished with exit code '0' (success)
+
+stdout:
+
+{
+  "success": true,
+  "diagnostics": [],
+  "metadata": {
+    "currentFileSymbols": 28,
+    "symbols": 50,
+    "identifiers": 88,
+    "elided": true
+  }
+}
+
+zasm:
+
+QUIT; void run() Body
+PUSHARGSV 0 0.0013; void run() Body Start
+SETR D4 SP2
+ALLOCATEMEMV D2 3 0
+PUSHR D2
+WRITEPODARRAY D2 {1,2,3}
+POP D2
+STORE_OBJECT D2 0.0012
+ALLOCATEMEMV D2 3 0
+PUSHR D2
+WRITEPODARRAY D2 {4,5,6}
+POP D2
+STORE_OBJECT D2 0.0011
+ALLOCATEMEMV D2 3 0
+PUSHR D2
+WRITEPODARRAY D2 {7,8,9}
+POP D2
+STORE_OBJECT D2 0.0010
+ALLOCATEMEMV D2 3 0.0009
+PUSHR D2
+SETR D0 D2
+PUSHR D0
+LOAD D2 0.0012
+POP D0
+WRITEPODARRAYVR 0 D2 0.0009
+PUSHR D0
+LOAD D2 0.0011
+POP D0
+WRITEPODARRAYVR 1 D2 0.0009
+PUSHR D0
+LOAD D2 0.0010
+POP D0
+WRITEPODARRAYVR 2 D2 0.0009
+POP D2
+STORE_OBJECT D2 0.0009
+PUSHR D4
+LOAD D2 0.0009; UsrFunc[void print(int[][])] Params Start
+PUSHR D2; UsrFunc[void print(int[][])] Params End
+CALLFUNC 0.0273; UsrFunc[void print(int[][])] Call
+POP D4
+ALLOCATEMEMV D2 3 0.0009
+PUSHR D2
+SETR D0 D2
+PUSHR D0
+ALLOCATEMEMV D2 3 0
+PUSHR D2
+WRITEPODARRAY D2 {1,2,3}
+POP D2
+POP D0
+WRITEPODARRAYVR 0 D2 0.0009
+PUSHR D0
+ALLOCATEMEMV D2 3 0
+PUSHR D2
+WRITEPODARRAY D2 {4,5,6}
+POP D2
+POP D0
+WRITEPODARRAYVR 1 D2 0.0009
+PUSHR D0
+ALLOCATEMEMV D2 3 0
+PUSHR D2
+WRITEPODARRAY D2 {7,8,9}
+POP D2
+POP D0
+WRITEPODARRAYVR 2 D2 0.0009
+POP D2
+STORE_OBJECT D2 0.0008
+PUSHR D4
+LOAD D2 0.0008; UsrFunc[void print(int[][])] Params Start
+PUSHR D2; UsrFunc[void print(int[][])] Params End
+CALLFUNC 0.0273; UsrFunc[void print(int[][])] Call
+POP D4
+ALLOCATEMEMV D2 0 0
+STORE_OBJECT D2 0.0007
+LOAD D2 0.0009; for(each) #1 ArrDecl
+STORE_OBJECT D2 0.0005
+STOREV 0 0.0006; for(each) #1 IndxDecl
+STOREV 0 0.0004; for(each) #1 ValDecl
+LOAD D0 0.0005; for(each) #1 EndArrayCheck
+ARRAYSIZE D0
+LOAD D3 0.0006
+COMPARER D3 D2
+GOTOCMP 95 >=; for(each) #1 to Else
+READPODARRAYR D2 D3; for(each) #1 Next Index
+STORE_OBJECT D2 0.0004
+ADDV D3 1
+STORE D3 0.0006
+PUSHR D4; for(each) #1 Body Start
+LOAD D2 0.0007; UsrFunc[void arraycat(int[], int[])] Params Start
+PUSHR D2
+LOAD D2 0.0004
+PUSHR D2; UsrFunc[void arraycat(int[], int[])] Params End
+CALLFUNC 0.0178; UsrFunc[void arraycat(int[], int[])] Call
+POP D4; for(each) #1 Body End
+GOTO 78; for(each) #1 End
+REF_REMOVE 0.0005
+REF_REMOVE 0.0004
+PUSHR D4
+LOAD D2 0.0007; UsrFunc[void print(int[])] Params Start
+PUSHR D2; UsrFunc[void print(int[])] Params End
+CALLFUNC 0.0259; UsrFunc[void print(int[])] Call
+POP D4
+STOREV -1 0.0006; loop() #1 ValDecl
+PUSHR D4; loop() #1 Body Start
+LOAD D2 0.0007; UsrFunc[void append(int[], int)] Params Start
+PUSHR D2
+LOAD D2 0.0006
+PUSHR D2; UsrFunc[void append(int[], int)] Params End
+CALLFUNC 0.0230; UsrFunc[void append(int[], int)] Call
+POP D4; loop() #1 Body End
+LOAD D3 0.0006; loop() #1 Incr
+ADDV D3 -1
+STORE D3 0.0006
+COMPAREV D3 -9.9999; loop() #1 Test
+GOTOCMP 103 >=; >= start, keep looping
+POPARGS D5 0
+PUSHR D4
+LOAD D2 0.0007; UsrFunc[void print(int[])] Params Start
+PUSHR D2; UsrFunc[void print(int[])] Params End
+CALLFUNC 0.0259; UsrFunc[void print(int[])] Call
+POP D4
+ALLOCATEMEMV D2 3 0
+PUSHR D2
+WRITEPODARRAY D2 {10,11,12}
+POP D2
+STORE_OBJECT D2 0.0006
+PUSHR D4
+LOAD D2 0.0009; UsrFunc[void append(int[][], int[])] Params Start
+PUSHR D2
+LOAD D2 0.0006
+PUSHR D2; UsrFunc[void append(int[][], int[])] Params End
+CALLFUNC 0.0243; UsrFunc[void append(int[][], int[])] Call
+PEEK D4
+LOAD D2 0.0009; UsrFunc[void print(int[][])] Params Start
+PUSHR D2; UsrFunc[void print(int[][])] Params End
+CALLFUNC 0.0273; UsrFunc[void print(int[][])] Call
+POP D4
+ALLOCATEMEMV D2 3 0
+PUSHR D2
+WRITEPODARRAY D2 {1,2,3}
+POP D2
+STORE_OBJECT D2 0.0005
+LOAD D2 0.0005
+STORE_OBJECT D2 0.0004
+LOAD_INTERNAL_ARRAY_REF D2 @SCREEN_NPCS REFSCREEN
+STORE_OBJECT D2 0.0003
+LOAD D2 0.0003
+STORE_OBJECT D2 0.0002
+ALLOCATEMEMV D2 4 0.0010
+PUSHR D2
+WRITEPODARRAY D2 {1,0,0.0002,99}
+SETR D0 D2
+PUSHR D0
+LOAD D2 0.0003
+PUSHR D2
+POP D0
+READPODARRAYV D2 0
+POP D0
+WRITEPODARRAYVR 1 D2 0
+POP D2
+STORE_OBJECT D2 0.0001
+LOAD D2 0.0001
+STORE_OBJECT D2 0
+REF_REMOVE 0.0005
+REF_REMOVE 0.0004
+REF_REMOVE 0.0007
+REF_REMOVE 0.0001
+REF_REMOVE 0
+REF_REMOVE 0.0003
+REF_REMOVE 0.0002
+REF_REMOVE 0.0012
+REF_REMOVE 0.0011
+REF_REMOVE 0.0010
+REF_REMOVE 0.0006
+REF_REMOVE 0.0009
+REF_REMOVE 0.0008
+POPARGS D5 0.0013
+RETURNFUNC; void run() Body End
+PUSHARGSV 0 0.0004; Func[void arraycat(int[], int[])] Body Start
+SETR D4 SP2
+MARK_TYPE_STACK 0.0009 0.0005
+REF_INC 0.0005
+MARK_TYPE_STACK 0.0009 0.0004
+REF_INC 0.0004
+LOAD D2 0.0005; InlineFunc[int SizeOfArray(untyped[])] Params
+ARRAYSIZE D2; InlineFunc[int SizeOfArray(untyped[])] Body
+STORE D2 0.0003
+LOAD D2 0.0005; InlineFunc[void ResizeArray(untyped[], int)] Params Start
+PUSHR D2
+LOAD D2 0.0003
+PUSHR D2
+LOAD D2 0.0004; InlineFunc[int SizeOfArray(untyped[])] Params
+ARRAYSIZE D2; InlineFunc[int SizeOfArray(untyped[])] Body
+POP D3
+ADDR D2 D3
+SETR D3 D2; InlineFunc[void ResizeArray(untyped[], int)] Params End
+POP D2; InlineFunc[void ResizeArray(untyped[], int)] Body Start
+RESIZEARRAYR D2 D3; InlineFunc[void ResizeArray(untyped[], int)] Body End
+LOAD D2 0.0004; for(each) #2 ArrDecl
+STORE_OBJECT D2 0.0001
+STOREV 0 0.0002; for(each) #2 IndxDecl
+STOREV 0 0; for(each) #2 ValDecl
+LOAD D0 0.0001; for(each) #2 EndArrayCheck
+ARRAYSIZE D0
+LOAD D3 0.0002
+COMPARER D3 D2
+GOTOCMP 225 >=; for(each) #2 to Else
+READPODARRAYR D2 D3; for(each) #2 Next Index
+STORE D2 0
+ADDV D3 1
+STORE D3 0.0002
+LOAD D2 0; for(each) #2 Body Start
+PUSHR D2
+LOAD D2 0.0005
+PUSHR D2
+LOAD D2 0.0003
+PUSHR D2
+ADDV D2 1
+STORE D2 0.0003
+POP D2
+SETR D3 D2
+POP D0
+POP D2
+WRITEPODARRAYRR D3 D2 0; for(each) #2 Body End
+GOTO 202; for(each) #2 End
+REF_REMOVE 0.0001
+REF_REMOVE 0.0005
+REF_REMOVE 0.0004
+POPARGS D5 0.0006
+RETURNFUNC; Func[void arraycat(int[], int[])] Body End
+SETR D4 SP2; Func[void append(int[], int)] Body Start
+MARK_TYPE_STACK 0.0009 0.0001
+REF_INC 0.0001
+LOAD D2 0.0001; InlineFunc[bool ArrayPushBack(int[], int)] Params Start
+PUSHR D2
+LOAD D2 0
+PUSHR D2; InlineFunc[bool ArrayPushBack(int[], int)] Params End
+PUSHV -1; InlineFunc[bool ArrayPushBack(int[], int)] Body Start
+ARRAYPUSH 0
+POPARGS D5 0.0003; InlineFunc[bool ArrayPushBack(int[], int)] Body End
+REF_REMOVE 0.0001
+POPARGS D5 0.0002
+RETURNFUNC; Func[void append(int[], int)] Body End
+SETR D4 SP2; Func[void append(int[][], int[])] Body Start
+MARK_TYPE_STACK 0.0009 0.0001
+REF_INC 0.0001
+MARK_TYPE_STACK 0.0009 0
+REF_INC 0
+LOAD D2 0.0001; InlineFunc[bool ArrayPushBack(int[][], int[])] Params Start
+PUSHR D2
+LOAD D2 0
+PUSHR D2; InlineFunc[bool ArrayPushBack(int[][], int[])] Params End
+PUSHV -1; InlineFunc[bool ArrayPushBack(int[][], int[])] Body Start
+ARRAYPUSH 0.0009
+POPARGS D5 0.0003; InlineFunc[bool ArrayPushBack(int[][], int[])] Body End
+REF_REMOVE 0.0001
+REF_REMOVE 0
+POPARGS D5 0.0002
+RETURNFUNC; Func[void append(int[][], int[])] Body End
+SETR D4 SP2; Func[void print(int[])] Body Start
+MARK_TYPE_STACK 0.0009 0
+REF_INC 0
+ALLOCATEMEMV D2 12 0; InlineFunc[void printf(char32[], ...untyped[])] Params Start
+WRITEPODSTRING D2 "Arr[]: %ad\n"
+PUSHR D2
+LOAD D2 0
+PUSHVARGR D2
+MARK_TYPE_VARG 0.0009; InlineFunc[void printf(char32[], ...untyped[])] Params End
+PRINTFVARG; InlineFunc[void printf(char32[], ...untyped[])] Body Start
+POP D5; InlineFunc[void printf(char32[], ...untyped[])] Body End
+REF_REMOVE 0
+POP D5
+RETURNFUNC; Func[void print(int[])] Body End
+SETR D4 SP2; Func[void print(int[][])] Body Start
+MARK_TYPE_STACK 0.0009 0
+REF_INC 0
+ALLOCATEMEMV D2 15 0; InlineFunc[void printf(char32[], ...untyped[])] Params Start
+WRITEPODSTRING D2 "Arr[][]: %aad\n"
+PUSHR D2
+LOAD D2 0
+PUSHVARGR D2
+MARK_TYPE_VARG 0.0009; InlineFunc[void printf(char32[], ...untyped[])] Params End
+PRINTFVARG; InlineFunc[void printf(char32[], ...untyped[])] Body Start
+POP D5; InlineFunc[void printf(char32[], ...untyped[])] Body End
+REF_REMOVE 0
+POP D5
+RETURNFUNC; Func[void print(int[][])] Body End

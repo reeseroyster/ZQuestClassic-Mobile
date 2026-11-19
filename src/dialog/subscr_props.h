@@ -1,0 +1,101 @@
+#ifndef ZC_DIALOG_SUBSCR_PROPS_H_
+#define ZC_DIALOG_SUBSCR_PROPS_H_
+
+#include <gui/dialog.h>
+#include <gui/checkbox.h>
+#include <gui/text_field.h>
+#include <gui/window.h>
+#include <gui/label.h>
+#include <gui/frame.h>
+#include <gui/button.h>
+#include <gui/list.h>
+#include <gui/tabpanel.h>
+#include <zq/gui/misc_color_sel.h>
+#include <zq/gui/misc_cset_sel.h>
+#include <zq/gui/seltile_swatch.h>
+#include <initializer_list>
+#include <string>
+#include <string_view>
+#include "subscr.h"
+
+bool call_subscrprop_dialog(SubscrWidget* widg, int32_t obj_ind);
+
+extern const GUI::ListData list_pgmode;
+
+class SubscrPropDialog: public GUI::Dialog<SubscrPropDialog>
+{
+public:
+	enum class message
+	{
+		REFR_INFO, OK, CANCEL, REFR_SELECTABLE
+	};
+
+	SubscrPropDialog(SubscrWidget* widg, int32_t obj_ind);
+	
+	std::shared_ptr<GUI::Widget> GEN_INITD(int ind);
+	std::shared_ptr<GUI::Widget> view() override;
+	bool handleMessage(const GUI::DialogMessage<message>& msg);
+
+protected:
+	std::shared_ptr<GUI::Window> window;
+	std::shared_ptr<GUI::MiscColorSel> col_sel[6];
+	std::shared_ptr<GUI::MiscCSetSel> cs_sel[3];
+	std::shared_ptr<GUI::SelTileSwatch> tswatches[2];
+	std::shared_ptr<GUI::DropDownList> ddls[2];
+	std::shared_ptr<GUI::TextField> fonttf;
+	std::shared_ptr<GUI::Label> labels[6];
+	std::shared_ptr<GUI::TextField> tfs[3];
+	std::shared_ptr<GUI::Checkbox> cbs[4];
+	
+	std::shared_ptr<GUI::Grid> selgs[2];
+	std::shared_ptr<GUI::Frame> selframes[3];
+	std::shared_ptr<GUI::TabRef> seltabs[1];
+	std::shared_ptr<GUI::TextField> seltfs[1];
+	std::shared_ptr<GUI::Button> selbtns[1];
+	
+	std::shared_ptr<GUI::TextField> condtfs[5];
+	std::shared_ptr<GUI::DropDownList> condddls[1];
+	
+	std::shared_ptr<GUI::List> req_item_list, req_not_item_list,
+		req_floor_list, req_level_list, req_dmap_list, req_map_list, req_screen_list;
+		
+	std::shared_ptr<GUI::Button> reqfloor_btn_del, reqfloor_btn_add,
+		reqlevel_btn_del, reqlevel_btn_add,
+		reqdmap_btn_del, reqdmap_btn_add,
+		reqmap_btn_del, reqmap_btn_add,
+		reqscreen_btn_del, reqscreen_btn_add;
+	
+	std::shared_ptr<GUI::Checkbox> def_eqp_cboxes[4];
+	
+	std::shared_ptr<GUI::SelTileSwatch> gauge_tswatches[4];
+	std::shared_ptr<GUI::Widget> gauge_gw[8];
+	SubscrWidget* subref;
+	SubscrWidget* local_subref;
+	int32_t index;
+	byte set_default_btnslot;
+	byte start_default_btnslot;
+	optional<byte> req_dmap_floor, req_screen;
+	optional<word> req_dmap_level, req_dmap, req_map;
+	
+	zasm_meta local_gen_meta;
+	
+	GUI::ListData list_font, list_shadtype, list_aligns, list_buttons, list_items,
+		list_counters, list_counters2, list_itemclass, list_genscr, list_sfx, list_dmaps,
+		list_costinds, list_items_no_none, list_reqitems, list_reqnotitems, list_items_no_none_equipment_only,
+		list_buttons_none, list_reqfloors, list_reqlevels, list_reqdmaps, list_reqmaps, list_reqscreens;
+	
+	void updateSelectable();
+	void updateAttr();
+	void updatePreview();
+	void updateColors();
+	void updateConditions();
+	void update_dmap_floor(int val, bool update_tf = true);
+	void update_dmap_level(int val, bool update_tf = true);
+	void update_req_dmap(int val, bool update_ddl = true);
+	void update_req_map(int val, bool update_tf = true);
+	void update_req_screen(int val, bool update_tf = true);
+	void update_wh();
+	void refr_info();
+};
+
+#endif

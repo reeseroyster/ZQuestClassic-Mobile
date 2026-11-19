@@ -1,0 +1,1132 @@
+#include "components/scc/scc.h"
+#include "test_runner/test_runner.h"
+
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+struct ExpectedCommand
+{
+	int code;
+	int num_args;
+	std::vector<zfix> args;
+};
+
+struct AsciiParserTestCase
+{
+	std::string description;
+	std::string input;
+
+	std::vector<ParsedMsgStr::SegmentType> expected_segment_types;
+	std::vector<std::string_view> expected_literals;
+	std::vector<ExpectedCommand> expected_commands;
+	std::vector<std::string> expected_warnings;
+};
+
+std::vector<AsciiParserTestCase> get_ascii_parser_test_cases()
+{
+	using TC = AsciiParserTestCase;
+	using Cmd = ExpectedCommand;
+
+	auto Invalid = ParsedMsgStr::SegmentType::Invalid;
+	auto Literal = ParsedMsgStr::SegmentType::Literal;
+	auto Command = ParsedMsgStr::SegmentType::Command;
+
+	return {
+		TC{
+			"Empty string",
+			"",
+			/*segments*/ {},
+			/*literals*/ {},
+			/*commands*/ {},
+			/*warnings*/ {}
+		},
+		TC{
+			"Literal only",
+			"Hello, world! ^.^",
+			/*segments*/ {Literal},
+			/*literals*/ {"Hello, world! ^.^"},
+			/*commands*/ {},
+			/*warnings*/ {}
+		},
+		TC{
+			"Literal only with whitespace",
+			"    Hello,     world! ^.^     ",
+			/*segments*/ {Literal},
+			/*literals*/ {R"(    Hello,     world! ^.^     )"},
+			/*commands*/ {},
+			/*warnings*/ {}
+		},
+		TC{
+			"Simple command with 6 args",
+			R"(\18\1\2\3\4\5\6\)",
+			/*segments*/ {Command},
+			/*literals*/ {},
+			/*commands*/ {Cmd{MSGC_WARP, 6, {1, 2, 3, 4, 5, 6}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Simple command with 6 args, but bad terminator",
+			R"(\18\1\2\3\4\5\6)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\18\1\2\3\4\5\6)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Expected slash (followed by either space or end of string) at end of command: \18\1\2\3\4\5\6)"}
+		},
+		TC{
+			"Simple command using text name",
+			R"(\Speed\1\)",
+			/*segments*/ {Command},
+			/*literals*/ {},
+			/*commands*/ {Cmd{MSGC_SPEED, 1, {1}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Simple command using text name",
+			R"(\GoIfCounter%\1\2\3\)",
+			/*segments*/ {Command},
+			/*literals*/ {},
+			/*commands*/ {Cmd{MSGC_GOTOIFCTRPC, 3, {1, 2, 3}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Simple command using text name (case insensitive)",
+			R"(\SPEED\1\)",
+			/*segments*/ {Command},
+			/*literals*/ {},
+			/*commands*/ {Cmd{MSGC_SPEED, 1, {1}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Simple command using unknown text name",
+			R"(\BadCommand\1\2\3\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\BadCommand\1\2\3\)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Ignoring unknown command: \BadCommand\1\2\3\)"}
+		},
+		TC{
+			"Simple command using unknown text name (two in a row)",
+			R"(\BadCommand\1\2\3\ \BadCommand\1\2\3\)",
+			/*segments*/ {Invalid, Invalid},
+			/*literals*/ {R"(\BadCommand\1\2\3\ )", R"(\BadCommand\1\2\3\)"},
+			/*commands*/ {},
+			/*warnings*/ {
+				R"(Ignoring unknown command: \BadCommand\1\2\3\)",
+				R"(Ignoring unknown command: \BadCommand\1\2\3\)",
+			}
+		},
+		TC{
+			"Literal newline turns into newline command",
+			"Hello, world!\n^.^",
+			/*segments*/ {Literal, Command, Literal},
+			/*literals*/ {"Hello, world!", "^.^"},
+			/*commands*/ {Cmd{MSGC_NEWLINE}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Command newline turns into newline command",
+			"Hello, world!\\Newline\\ ^.^",
+			/*segments*/ {Literal, Command, Literal},
+			/*literals*/ {"Hello, world!", "^.^"},
+			/*commands*/ {Cmd{MSGC_NEWLINE}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Mixed literal and command",
+			R"(FIGHT \18\1\2\3\4\5\6\ BAG)",
+			/*segments*/ {Literal, Command, Literal},
+			/*literals*/ {"FIGHT ", "BAG"},
+			/*commands*/ {Cmd{MSGC_WARP, 6, {1, 2, 3, 4, 5, 6}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Command followed by a space literal",
+			R"(\10\1\2\  )", // Note the two spaces
+			/*segments*/ {Command, Literal},
+			/*literals*/ {" "}, // The second space
+			/*commands*/ {Cmd{10, 2, {1, 2}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Command followed by escaped slash",
+			R"(\10\1\2\ \\)",
+			/*segments*/ {Command, Literal},
+			/*literals*/ {R"(\)"},
+			/*commands*/ {Cmd{10, 2, {1, 2}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Command followed by escaped slash and text",
+			R"(\10\1\2\ \\More)",
+			/*segments*/ {Command, Literal, Literal},
+			/*literals*/ {R"(\)", "More"},
+			/*commands*/ {Cmd{10, 2, {1, 2}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Escaped backslash in middle of literal",
+			R"(Hello \\ world)",
+			/*segments*/ {Literal, Literal},
+			/*literals*/ {R"(Hello \)", R"( world)"},
+			/*commands*/ {},
+			/*warnings*/ {}
+		},
+		TC{
+			"Escaped backslash at start, end, and multiple",
+			R"(\\Hello\\\\world\\)",
+			/*segments*/ {Literal, Literal, Literal, Literal},
+			/*literals*/ {R"(\)", R"(Hello\)", R"(\)", R"(world\)"},
+			/*commands*/ {},
+			/*warnings*/ {}
+		},
+		TC{
+			"Escaped backslash adjacent to commands",
+			R"(Literal\\ \\\10\1\2\ \19\1\2\3\4\ \\More)",
+			/*segments*/ {Literal, Literal, Command, Command, Literal, Literal},
+			/*literals*/ {R"(Literal\)", R"( \)", R"(\)", R"(More)"},
+			/*commands*/ {Cmd{MSGC_CTRUP, 2, {1, 2}}, Cmd{MSGC_SETSCREEND, 4, {1, 2, 3, 4}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Escaped backslash adjacent to invalid commands",
+			R"(Literal\\ \\\10\1\2\ \19\1\2\3\4\\More)",
+			/*segments*/ {Literal, Literal, Command, Invalid, Invalid},
+			/*literals*/ {R"(Literal\)", R"( \)", R"(\19\1\2\3\4\)", R"(\More)"},
+			/*commands*/ {Cmd{MSGC_CTRUP, 2, {1, 2}}},
+			/*warnings*/ {
+				R"(Expected slash (followed by either space or end of string) at end of command: \19\1\2\3\4\)",
+				R"(Ignoring unknown command: \More)"
+			}
+		},
+		TC{
+			"Negative command code is ignored and produces warning",
+			R"(Try me: \-2\10\20\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(Try me: \-2\10\20\)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Ignoring unknown command: \-2\10\20\)"}
+		},
+		TC{
+			"Negative arguments",
+			R"(\18\-10\2\-30\4\-50\6\)",
+			/*segments*/ {Command},
+			/*literals*/ {},
+			/*commands*/ {Cmd{MSGC_WARP, 6, {-10, 2, -30, 4, -50, 6}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Command with space",
+			R"(\1\1\2\ )",
+			/*segments*/ {Command},
+			/*literals*/ {},
+			/*commands*/ {Cmd{MSGC_COLOUR, 2, {1, 2}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Command at EOS",
+			R"(\1\1\2\ )",
+			/*segments*/ {Command},
+			/*literals*/ {},
+			/*commands*/ {Cmd{MSGC_COLOUR, 2, {1, 2}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Two commands",
+			R"(\1\1\2\ \1\1\2\)",
+			/*segments*/ {Command, Command},
+			/*literals*/ {},
+			/*commands*/ {Cmd{MSGC_COLOUR, 2, {1, 2}}, Cmd{MSGC_COLOUR, 2, {1, 2}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Command and literal",
+			R"(\10\1\2\ More)",
+			/*segments*/ {Command, Literal},
+			/*literals*/ {"More"},
+			/*commands*/ {Cmd{10, 2, {1, 2}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Literal and command",
+			R"(Hello \10\1\2\)",
+			/*segments*/ {Literal, Command},
+			/*literals*/ {"Hello "},
+			/*commands*/ {Cmd{10, 2, {1, 2}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Literal, command, literal",
+			R"(Hello \10\1\2\ World)",
+			/*segments*/ {Literal, Command, Literal},
+			/*literals*/ {"Hello ", "World"},
+			/*commands*/ {Cmd{10, 2, {1, 2}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Escaped slash literal (split-literal logic)",
+			R"(Hello \\ \10\1\2\ World)",
+			/*segments*/ {Literal, Literal, Command, Literal},
+			/*literals*/ {"Hello \\", " ", "World"},
+			/*commands*/ {Cmd{10, 2, {1, 2}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Error: Missing terminator slash",
+			R"(\10\1\2More)",
+			/*segments*/ {Invalid, Literal},
+			/*literals*/ { R"(\10\1\2)", R"(More)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Expected slash (followed by either space or end of string) at end of command: \10\1\2)"}
+		},
+		TC{
+			"Error: Invalid terminator (no space/EOS)",
+			R"(\10\1\2\More)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\10\1\2\More)",},
+			/*commands*/ {},
+			/*warnings*/ {R"(Expected slash (followed by either space or end of string) at end of command: \10\1\2\More)"}
+		},
+		TC{
+			"Error: Missing arg",
+			R"(\10\1\)", // Fails: MSGC_CTRUP expects 2 args, then terminator
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\10\1\)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Expected 2 args, but got 1 for command: \10\1\)"}
+		},
+		TC{
+			"Error: Malformed command (bad code)",
+			R"(\Hello)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\Hello)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Ignoring unknown command: \Hello)"}
+		},
+		TC{
+			"Negative args",
+			R"(\10\-10\20\)",
+			/*segments*/ {Command},
+			/*literals*/ {},
+			/*commands*/ {Cmd{10, 2, {-10, 20}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Error: bad terminator in second command followed by another bad command",
+			R"(\10\1\2\ \20\1\2\3\4\\More)",
+			/*segments*/ {Command, Invalid, Invalid},
+			/*literals*/ {R"(\20\1\2\3\4\)", R"(\More)"},
+			/*commands*/ {Cmd{10, 2, {1, 2}}},
+			/*warnings*/ {
+				R"(Expected slash (followed by either space or end of string) at end of command: \20\1\2\3\4\)",
+				R"(Ignoring unknown command: \More)"
+			}
+		},
+		TC{
+			"Previous test case but valid and with an escaped slash",
+			R"(\10\1\2\ \19\1\2\3\4\ \\More)",
+			/*segments*/ {Command, Command, Literal, Literal},
+			/*literals*/ {"\\", "More"},
+			/*commands*/ {Cmd{10, 2, {1, 2}}, Cmd{19, 4, {1, 2, 3, 4}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Escaped slash at end of string",
+			R"(Hello\\)",
+			/*segments*/ {Literal},
+			/*literals*/ {R"(Hello\)"},
+			/*commands*/ {},
+			/*warnings*/ {}
+		},
+		TC{
+			"Command followed by escaped slash",
+			R"(\22\ \\More)",
+			/*segments*/ {Command, Literal, Literal},
+			/*literals*/ {"\\", "More"},
+			/*commands*/ {Cmd{MSGC_NAME, 0, {}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Error: Command with 0 args, invalid terminator",
+			R"(\23\More)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\23\More)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Expected slash (followed by either space or end of string) at end of command: \23\More)"}
+		},
+		TC{
+			"Error: unknown command",
+			R"(\99\1\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\99\1\)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Ignoring unknown command: \99\1\)"}
+		},
+		TC{
+			"Error: unknown command",
+			R"(\0Hello)",
+			/*segments*/ {Invalid, Literal},
+			/*literals*/ {R"(\0)", R"(Hello)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Ignoring unknown command: \0)"}
+		},
+		TC{
+			"Error: unknown command",
+			R"(\999Hello)",
+			/*segments*/ {Invalid, Literal},
+			/*literals*/ {R"(\999)", R"(Hello)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Ignoring unknown command: \999)"}
+		},
+		TC{
+			"Error: incomplete arg",
+			R"(\1\)", // MSGC_COLOUR expects 2 args
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\1\)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Expected 2 args, but got 0 for command: \1\)"}
+		},
+		TC{
+			"Incomplete args (reaches end of string, no slash terminator)",
+			R"(\3\1\2)", // MSGC_GOTOIFSCREEND expects 3 args
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\3\1\2)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Expected slash (followed by either space or end of string) at end of command: \3\1\2)"}
+		},
+		TC{
+			"Malformed arg (non-digit)",
+			R"(\1\1\FIGHT\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\1\1\FIGHT\)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Found non-numeric argument for command: \1\1\FIGHT\)"}
+		},
+		TC{
+			"Malformed arg (just \\, then EOS)",
+			R"(\128\1\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\128\1\)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Expected 5 args, but got 1 for command: \128\1\)"}
+		},
+		TC{
+			"Variable args: only required args",
+			R"(\RunFrozenGenericScript\5\1\)",
+			/*segments*/ {Command},
+			/*literals*/ {},
+			/*commands*/ {Cmd{MSGC_RUN_FRZ_GENSCR, 2, {5, 1}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Variable args: some optional args",
+			R"(\RunFrozenGenericScript\5\0\11.250\22\)",
+			/*segments*/ {Command},
+			/*literals*/ {},
+			/*commands*/ {Cmd{MSGC_RUN_FRZ_GENSCR, 4, {5, 0, 11.25_zf, 22}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Variable args: max optional args",
+			R"(\RunFrozenGenericScript\1\0\2\3\4.1\5\6\7\8\9\)",
+			/*segments*/ {Command},
+			/*literals*/ {},
+			/*commands*/ {Cmd{MSGC_RUN_FRZ_GENSCR, 10, {1, 0, 2, 3, 4.1_zf, 5, 6, 7, 8, 9}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Error: Variable args, too few args",
+			R"(\RunFrozenGenericScript\5\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\RunFrozenGenericScript\5\)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Expected between 2 and 10 args, but got 1 for command: \RunFrozenGenericScript\5\)"}
+		},
+		TC{
+			"Error: Variable args, too many args",
+			R"(\RunFrozenGenericScript\1\0\2\3\4\5\6\7\8\9\10\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\RunFrozenGenericScript\1\0\2\3\4\5\6\7\8\9\10\)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Expected between 2 and 10 args, but got 11 for command: \RunFrozenGenericScript\1\0\2\3\4\5\6\7\8\9\10\)"}
+		},
+		TC{
+			"Decimal args: negative testing",
+			R"(\RunFrozenGenericScript\5\0\-1.5\-0.5\-214748.3648\214748.3647\)",
+			/*segments*/ {Command},
+			/*literals*/ {},
+			/*commands*/ {Cmd{MSGC_RUN_FRZ_GENSCR, 6, {5, 0, -1.5_zf, -0.5_zf, MIN_SCC_ARG, MAX_SCC_ARG}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Trailing \\",
+			R"(Hello\)",
+			/*segments*/ {Literal, Invalid},
+			/*literals*/ {R"(Hello)", R"(\)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Unexpected trailing slash (expected either a command or another slash))"}
+		},
+		TC{
+			"Command code overflow",
+			R"(\214749)", // MAX_SCC_ARG + 1
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\214749)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Ignoring unknown command: \214749)" }
+		},
+		TC{
+			"Command code underflow",
+			R"(\-214749)", // MIN_SCC_ARG - 1
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\-214749)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Ignoring unknown command: \-214749)" }
+		},
+		TC{
+			"Command decimal invalid",
+			R"(\130.25\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\130.25\)",},
+			/*commands*/ {},
+			/*warnings*/ {R"(Expected integer command, found 130.25 instead)"}
+		},
+		TC{
+			"Command decimal invalid (warning preserves source text)",
+			R"(\1.0\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\1.0\)",},
+			/*commands*/ {},
+			/*warnings*/ {R"(Expected integer command, found 1.0 instead)"}
+		},
+		TC{
+			"Argument overflow",
+			R"(\129\214749\2\3\4\5\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\129\214749\2\3\4\5\)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Found argument that was too big for command: \129\214749\2\3\4\5\ (max value is 214748.3647))"}
+		},
+		TC{
+			"Argument underflow",
+			R"(\129\-214749\2\3\4\5\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\129\-214749\2\3\4\5\)",},
+			/*commands*/ {},
+			/*warnings*/ {R"(Found argument that was too small for command: \129\-214749\2\3\4\5\ (min value is -214748.3648))"}
+		},
+		TC{
+			"Argument decimal overflow",
+			R"(\136\1\0\214748.3648\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\136\1\0\214748.3648\)",},
+			/*commands*/ {},
+			/*warnings*/ {R"(Found argument that was too big for command: \136\1\0\214748.3648\ (max value is 214748.3647))"}
+		},
+		TC{
+			"Argument decimal underflow",
+			R"(\136\1\0\-214748.3649\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\136\1\0\-214748.3649\)",},
+			/*commands*/ {},
+			/*warnings*/ {R"(Found argument that was too small for command: \136\1\0\-214748.3649\ (min value is -214748.3648))"}
+		},
+		TC{
+			"Argument decimal overflow, largest decimal part",
+			R"(\136\1\0\214748.9999\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\136\1\0\214748.9999\)",},
+			/*commands*/ {},
+			/*warnings*/ {R"(Found argument that was too big for command: \136\1\0\214748.9999\ (max value is 214748.3647))"}
+		},
+		TC{
+			"Argument decimal underflow, largest decimal part",
+			R"(\136\1\0\-214748.9999\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\136\1\0\-214748.9999\)",},
+			/*commands*/ {},
+			/*warnings*/ {R"(Found argument that was too small for command: \136\1\0\-214748.9999\ (min value is -214748.3648))"}
+		},
+		TC{
+			"Argument hanging decimal",
+			R"(\136\1\0\50.\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\136\1\0\50.\)",},
+			/*commands*/ {},
+			/*warnings*/ {R"(Found argument with hanging decimal place: \136\1\0\50.\ (at least 1 digit after the decimal is required))"}
+		},
+		TC{
+			"Argument too many decimal places",
+			R"(\136\1\0\-123.123456789\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\136\1\0\-123.123456789\)",},
+			/*commands*/ {},
+			/*warnings*/ {R"(Found argument with too many decimal places for command: \136\1\0\-123.123456789\ (max is 4 decimal places))"}
+		},
+		TC{
+			"Argument double decimal",
+			R"(\136\1\0\1.00.2\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\136\1\0\1.00.2\)",},
+			/*commands*/ {},
+			/*warnings*/ {R"(Found non-numeric argument for command: \136\1\0\1.00.2\)"}
+		},
+		TC{
+			"Argument double decimal (hanging)",
+			R"(\136\1\0\50..2\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\136\1\0\50..2\)",},
+			/*commands*/ {},
+			/*warnings*/ {R"(Found non-numeric argument for command: \136\1\0\50..2\)"}
+		},
+		TC{
+			"Argument invalid decimal",
+			R"(\1\1.1\2\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\1\1.1\2\)",},
+			/*commands*/ {},
+			/*warnings*/ {R"(Found argument with decimal places that does not allow decimal places: \1\1.1\2\ (argument #0))"}
+		},
+		TC{
+			"Arguments invalid decimal",
+			R"(\1\1.1\2.2\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(\1\1.1\2.2\)",},
+			/*commands*/ {},
+			/*warnings*/ {R"(Found arguments with decimal places that do not allow decimal places: \1\1.1\2.2\ (arguments #0, #1))"}
+		},
+		TC{
+			"Crazy string from tests/replays/misc/pkmn.qst",
+			R"(\2\0\ \16\140\ \128\5\6\8\12\0\ \129\0\2\2\1\1\ FIGHT   \129\1\3\3\0\0\ BAG\25\ \129\2\0\0\3\3\ POKeMON \129\3\1\1\2\2\ RUN\130\ \131\0\4\ \131\1\0\ \131\2\0\ \131\3\0\)",
+			/*segments*/ {Command, Command, Command, Command, Literal, Command, Literal, Command, Command, Literal, Command, Literal, Command, Command, Command, Command, Command},
+			/*literals*/ {R"(FIGHT   )", R"(BAG)", R"(POKeMON )", R"(RUN)"},
+			/*commands*/ {
+				Cmd{2,   1, {0}},
+				Cmd{16, 1, {140}},
+				Cmd{128, 5, {5, 6, 8, 12, 0}},
+				Cmd{129, 5, {0, 2, 2, 1, 1}},
+				// "FIGHT   "
+				Cmd{129, 5, {1, 3, 3, 0, 0}},
+				// "BAG"
+				Cmd{25,  0, {}},
+				Cmd{129, 5, {2, 0, 0, 3, 3}},
+				// "POKeMON "
+				Cmd{129, 5, {3, 1, 1, 2, 2}},
+				// "RUN"
+				Cmd{130, 0, {}},
+				Cmd{131, 2, {0, 4}},
+				Cmd{131, 2, {1, 0}},
+				Cmd{131, 2, {2, 0}},
+				Cmd{131, 2, {3, 0}},
+			},
+			/*warnings*/ {}
+		},
+		TC{
+			"Escaped { and }",
+			R"(Hello \{world\})",
+			/*segments*/ {Literal, Literal, Literal},
+			/*literals*/ {"Hello ", "{world", "}"},
+			/*commands*/ {},
+			/*warnings*/ {}
+		},
+		// The plan is to extend SCCs considerably to support expressions inside curly braces.
+		// https://discord.com/channels/876899628556091432/1277878877057978460/1360390301713170783
+		TC{
+			"Disallow unescaped { and }",
+			R"(Hello {world})",
+			/*segments*/ {Literal, Invalid},
+			/*literals*/ {R"(Hello )", R"({world})"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Error: { and } characters must be escaped: \{ and \})"}
+		},
+		TC{
+			"Disallow unescaped { with no closing }",
+			R"(Hello {world)",
+			/*segments*/ {Literal, Invalid},
+			/*literals*/ {R"(Hello )", R"({world)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Error: { and } characters must be escaped: \{ and \})"}
+		},
+		TC{
+			"Error: { and } inside commands",
+			R"(Hello \Color\{world}\)",
+			/*segments*/ {Invalid},
+			/*literals*/ {R"(Hello \Color\{world}\)"},
+			/*commands*/ {},
+			/*warnings*/ {R"(Ignoring unknown command: \Color\{world}\)"}
+		},
+	};
+}
+
+static std::stringstream cur;
+
+struct LegacyRoundTripTestCase
+{
+	std::string description;
+	// The ascii encoding to parse, convert to the legacy binary encoding, and parse again.
+	std::string input;
+
+	// Expected after the round trip (values the legacy encoding cannot represent are lossy).
+	std::vector<ExpectedCommand> expected_commands;
+	// Expected from serialize_legacy. Parsing (in both encodings) must not warn.
+	std::vector<std::string> expected_serialize_warnings;
+};
+
+std::vector<LegacyRoundTripTestCase> get_legacy_round_trip_test_cases()
+{
+	using TC = LegacyRoundTripTestCase;
+	using Cmd = ExpectedCommand;
+
+	return {
+		TC{
+			"Single-byte args",
+			R"(\18\1\2\3\4\5\6\)",
+			/*commands*/ {Cmd{MSGC_WARP, 6, {1, 2, 3, 4, 5, 6}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Args at the one-byte/three-byte encoding boundary",
+			R"(\Speed\253\ \Speed\254\)",
+			/*commands*/ {Cmd{MSGC_SPEED, 1, {253}}, Cmd{MSGC_SPEED, 1, {254}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Three-byte arg",
+			R"(\Speed\300\)",
+			/*commands*/ {Cmd{MSGC_SPEED, 1, {300}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Largest arg the legacy encoding can represent",
+			R"(\Speed\65023\)",
+			/*commands*/ {Cmd{MSGC_SPEED, 1, {65023}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Arg too big for the legacy encoding",
+			R"(\Speed\65024\)",
+			/*commands*/ {Cmd{MSGC_SPEED, 1, {65023}}},
+			/*warnings*/ {"Clamped argument 65024 of command Speed to 65023, the largest value the legacy encoding can represent"}
+		},
+		TC{
+			"Arg at MAX_SCC_ARG",
+			R"(\CounterSet\1\214748\)",
+			/*commands*/ {Cmd{MSGC_CTRSET, 2, {1, 65023}}},
+			/*warnings*/ {"Clamped argument 214748 of command CounterSet to 65023, the largest value the legacy encoding can represent"}
+		},
+		TC{
+			"Negative arg",
+			R"(\CounterAdd\1\-5\)",
+			/*commands*/ {Cmd{MSGC_CTRUP, 2, {1, 65023}}},
+			/*warnings*/ {"Clamped argument -5 of command CounterAdd to 65023, the largest value the legacy encoding can represent"}
+		},
+		TC{
+			"Optional trailing args are dropped",
+			R"(\RunFrozenGenericScript\5\1\2\3\)",
+			/*commands*/ {Cmd{MSGC_RUN_FRZ_GENSCR, 2, {5, 1}}},
+			/*warnings*/ {"Dropped 2 optional trailing argument(s) of command RunFrozenGenericScript, which the legacy encoding cannot represent"}
+		},
+		TC{
+			"Command mixed with literals",
+			R"(Hi \Speed\300\ there)",
+			/*commands*/ {Cmd{MSGC_SPEED, 1, {300}}},
+			/*warnings*/ {}
+		},
+		TC{
+			"Decimal args lose their decimal places",
+			R"(\SetCurrentScreenD\0\26.5\)",
+			/*commands*/ {Cmd{MSGC_SETCURRENTSCREEND, 2, {0, 26}}},
+			/*warnings*/ {"Dropped the decimal places of argument 26.5 of command SetCurrentScreenD, which the legacy encoding cannot represent"}
+		},
+	};
+}
+
+template <typename T>
+void print_vec(const std::vector<T>& vec) {
+	cur << "{ ";
+	for (size_t i = 0; i < vec.size(); ++i) {
+		if constexpr (std::is_same_v<T, std::string_view> || std::is_same_v<T, std::string>) {
+			cur << "R\"(" << vec[i] << ")\"";
+		} else {
+			cur << (int)vec[i];
+		}
+		if (i < vec.size() - 1) cur << ", ";
+	}
+	cur << " }";
+}
+
+void print_cmd(const StringCommand& cmd) {
+	cur << "{ code: " << (int)cmd.code 
+			<< ", num_args: " << (int)cmd.num_args 
+			<< ", args: [ ";
+	for (int i = 0; i < cmd.num_args; ++i) {
+		cur << cmd.args[i].str_trim() << (i == cmd.num_args - 1 ? "" : ", ");
+	}
+	cur << " ] }";
+}
+
+void print_cmd(const ExpectedCommand& cmd) {
+	cur << "{ code: " << (int)cmd.code 
+			<< ", num_args: " << (int)cmd.num_args 
+			<< ", args: [ ";
+	for (size_t i = 0; i < cmd.args.size(); ++i) {
+		cur << cmd.args[i].str_trim() << (i == cmd.args.size() - 1 ? "" : ", ");
+	}
+	cur << " ] }";
+}
+
+// --- ANSI Color Codes for legible output ---
+#if defined(_WIN32)
+// Windows doesn't support ANSI codes in cmd.exe by default
+#define RESET ""
+#define RED ""
+#define GREEN ""
+#define YELLOW ""
+#define BLUE ""
+#else
+#define RESET "\033[0m"
+#define RED "\033[31m"
+#define GREEN "\033[32m"
+#define YELLOW "\033[33m"
+#define BLUE "\033[34m"
+#endif
+
+static bool assert_expectations(const AsciiParserTestCase& tc, const value_and_warnings<ParsedMsgStr>& actual, std::string context = "")
+{
+	auto& [parsed_msg, warnings] = actual;
+	bool passed = true;
+
+	// Check segment types
+	if (parsed_msg.segment_types != tc.expected_segment_types) {
+		passed = false;
+		cur << RED << "  [FAIL] " << RESET << context << "Segment types mismatch.\n";
+		cur << "    Expected: "; print_vec(tc.expected_segment_types); cur << "\n";
+		cur << "    Actual  : "; print_vec(parsed_msg.segment_types); cur << "\n";
+	}
+
+	// Check literals
+	if (parsed_msg.literals != tc.expected_literals) {
+		passed = false;
+		cur << RED << "  [FAIL] " << RESET << context << "Literals mismatch.\n";
+		cur << "    Expected: "; print_vec(tc.expected_literals); cur << "\n";
+		cur << "    Actual  : "; print_vec(parsed_msg.literals); cur << "\n";
+	}
+
+	// Check commands
+	if (parsed_msg.commands.size() != tc.expected_commands.size()) {
+		passed = false;
+		cur << RED << "  [FAIL] " << RESET << context << "Command count mismatch.\n";
+		cur << "    Expected: " << tc.expected_commands.size() << "\n";
+		cur << "    Actual  : " << parsed_msg.commands.size() << "\n";
+	} else {
+		for (size_t i = 0; i < parsed_msg.commands.size(); ++i) {
+			const auto& actual_cmd = parsed_msg.commands[i];
+			const auto& expected_cmd = tc.expected_commands[i];
+			bool cmd_ok = true;
+
+			if (actual_cmd.code != expected_cmd.code) cmd_ok = false;
+			if (actual_cmd.num_args != expected_cmd.num_args) cmd_ok = false;
+
+			// Compare args
+			if (cmd_ok) { // Only check args if basics are right
+				if (static_cast<size_t>(actual_cmd.num_args) != expected_cmd.args.size()) {
+					cur << YELLOW << "  [NOTE] " << RESET << context << "Test case definition mismatch: "
+							<< "expected num_args (" << expected_cmd.num_args
+							<< ") != size of expected_args vector ("
+							<< expected_cmd.args.size() << ")\n";
+					cmd_ok = false;
+				} else {
+					for (int j = 0; j < actual_cmd.num_args; ++j) {
+						if (actual_cmd.args[j] != expected_cmd.args[j]) {
+							cmd_ok = false;
+							break;
+						}
+					}
+				}
+			}
+
+			if (!cmd_ok) {
+				passed = false;
+				cur << RED << "  [FAIL] " << RESET << context << "Command " << i << " mismatch.\n";
+				cur << "    Expected: "; print_cmd(expected_cmd); cur << "\n";
+				cur << "    Actual  : "; print_cmd(actual_cmd); cur << "\n";
+			}
+		}
+	}
+
+	// Check warnings
+	if (warnings != tc.expected_warnings) {
+		passed = false;
+		cur << RED << "  [FAIL] " << RESET << context << "warnings mismatch.\n";
+		cur << "    Expected: "; print_vec(tc.expected_warnings); cur << "\n";
+		cur << "    Actual  : "; print_vec(warnings); cur << "\n";
+	}
+
+	return passed;
+}
+
+static bool assert_commands(const std::vector<ExpectedCommand>& expected, const std::vector<StringCommand>& actual, std::string context)
+{
+	bool passed = true;
+
+	if (actual.size() != expected.size()) {
+		passed = false;
+		cur << RED << "  [FAIL] " << RESET << context << "Command count mismatch.\n";
+		cur << "    Expected: " << expected.size() << "\n";
+		cur << "    Actual  : " << actual.size() << "\n";
+		return passed;
+	}
+
+	for (size_t i = 0; i < actual.size(); ++i) {
+		const auto& actual_cmd = actual[i];
+		const auto& expected_cmd = expected[i];
+		bool cmd_ok = actual_cmd.code == expected_cmd.code &&
+			actual_cmd.num_args == expected_cmd.num_args &&
+			static_cast<size_t>(actual_cmd.num_args) == expected_cmd.args.size();
+
+		if (cmd_ok) {
+			for (int j = 0; j < actual_cmd.num_args; ++j) {
+				if (actual_cmd.args[j] != expected_cmd.args[j]) {
+					cmd_ok = false;
+					break;
+				}
+			}
+		}
+
+		if (!cmd_ok) {
+			passed = false;
+			cur << RED << "  [FAIL] " << RESET << context << "Command " << i << " mismatch.\n";
+			cur << "    Expected: "; print_cmd(expected_cmd); cur << "\n";
+			cur << "    Actual  : "; print_cmd(actual_cmd); cur << "\n";
+		}
+	}
+
+	return passed;
+}
+
+static bool assert_warnings(const std::vector<std::string>& expected, const std::vector<std::string>& actual, std::string context)
+{
+	if (actual == expected)
+		return true;
+
+	cur << RED << "  [FAIL] " << RESET << context << "warnings mismatch.\n";
+	cur << "    Expected: "; print_vec(expected); cur << "\n";
+	cur << "    Actual  : "; print_vec(actual); cur << "\n";
+	return false;
+}
+
+struct PasteSanitizeTestCase
+{
+	std::string description;
+	std::string input;
+	std::string expected;
+};
+
+std::vector<PasteSanitizeTestCase> get_paste_sanitize_test_cases()
+{
+	using TC = PasteSanitizeTestCase;
+
+	return {
+		TC{
+			"No control characters",
+			"Hello, world!",
+			"Hello, world!"
+		},
+		TC{
+			"Newline becomes Newline command",
+			"Hello,\nworld!",
+			R"(Hello,\Newline\ world!)"
+		},
+		TC{
+			"Windows line ending",
+			"Hello,\r\nworld!",
+			R"(Hello,\Newline\ world!)"
+		},
+		TC{
+			"Lone carriage return is stripped",
+			"Hello,\rworld!",
+			"Hello,world!"
+		},
+		TC{
+			"Consecutive newlines",
+			"a\n\nb",
+			R"(a\Newline\ \Newline\ b)"
+		},
+		TC{
+			"Trailing newline",
+			"Hello\n",
+			R"(Hello\Newline\ )"
+		},
+		TC{
+			"Backslash before newline gets a separating space",
+			"Hello\\\nworld",
+			R"(Hello\ \Newline\ world)"
+		},
+	};
+}
+
+static bool run_paste_sanitize_test_case(const PasteSanitizeTestCase& tc)
+{
+	std::string actual = sanitize_pasted_msg_str_text(tc.input);
+	if (actual == tc.expected)
+		return true;
+
+	cur << RED << "  [FAIL] " << RESET << "Sanitized text mismatch.\n";
+	cur << "    Expected: R\"(" << tc.expected << ")\"\n";
+	cur << "    Actual  : R\"(" << actual << ")\"\n";
+	return false;
+}
+
+static bool run_legacy_round_trip_test_case(const LegacyRoundTripTestCase& tc)
+{
+	bool passed = true;
+
+	auto [parsed, parse_warnings] = parse_ascii_msg_str(tc.input);
+	passed &= assert_warnings({}, parse_warnings, "(parse ascii) ");
+
+	auto [binary, serialize_warnings] = parsed.serialize_legacy();
+	passed &= assert_warnings(tc.expected_serialize_warnings, serialize_warnings, "(serialize legacy) ");
+
+	auto [reparsed, reparse_warnings] = parse_legacy_binary_msg_str(binary);
+	passed &= assert_warnings({}, reparse_warnings, "(parse legacy) ");
+	passed &= assert_commands(tc.expected_commands, reparsed.commands, "(round trip) ");
+
+	return passed;
+}
+
+TestResults test_scc(bool verbose)
+{
+	auto all_test_cases = get_ascii_parser_test_cases();
+	int tests_failed = 0;
+	int test_num = 1;
+
+	for (const auto& tc : all_test_cases)
+	{
+		bool test_passed = true;
+		if (verbose)
+		{
+			std::cerr << "--- Test " << std::setw(2) << test_num << ": "
+					<< tc.description << " ---" << std::endl;
+		}
+
+		cur.clear();
+
+		auto result = parse_ascii_msg_str(tc.input);
+		if (!assert_expectations(tc, result))
+			test_passed = false;
+
+		if (test_passed)
+		{
+			std::string serialized = result.first.serialize();
+			auto result2 = parse_ascii_msg_str(serialized);
+			if (!assert_expectations(tc, result2, "(roundtrip) "))
+				test_passed = false;
+		}
+
+		if (!test_passed)
+			tests_failed++;
+
+		if (verbose)
+		{
+			std::cerr << cur.str();
+
+			if (test_passed) {
+				std::cerr << GREEN << "  [PASS]" << RESET << "\n";
+			} else {
+				std::cerr << "--- End of Test " << test_num << " ---\n";
+			}
+			std::cerr << std::endl;
+		}
+		else if (!test_passed)
+		{
+			std::cerr << "--- Test " << std::setw(2) << test_num << ": "
+					<< tc.description << " ---" << std::endl;
+			std::cerr << cur.str();
+			std::cerr << std::endl;
+		}
+
+		test_num++;
+	}
+
+	auto legacy_test_cases = get_legacy_round_trip_test_cases();
+	for (const auto& tc : legacy_test_cases)
+	{
+		if (verbose)
+		{
+			std::cerr << "--- Test " << std::setw(2) << test_num << ": "
+					<< tc.description << " ---" << std::endl;
+		}
+
+		cur.clear();
+
+		bool test_passed = run_legacy_round_trip_test_case(tc);
+		if (!test_passed)
+			tests_failed++;
+
+		if (verbose)
+		{
+			std::cerr << cur.str();
+
+			if (test_passed) {
+				std::cerr << GREEN << "  [PASS]" << RESET << "\n";
+			} else {
+				std::cerr << "--- End of Test " << test_num << " ---\n";
+			}
+			std::cerr << std::endl;
+		}
+		else if (!test_passed)
+		{
+			std::cerr << "--- Test " << std::setw(2) << test_num << ": "
+					<< tc.description << " ---" << std::endl;
+			std::cerr << cur.str();
+			std::cerr << std::endl;
+		}
+
+		test_num++;
+	}
+
+	auto paste_test_cases = get_paste_sanitize_test_cases();
+	for (const auto& tc : paste_test_cases)
+	{
+		if (verbose)
+		{
+			std::cerr << "--- Test " << std::setw(2) << test_num << ": "
+					<< tc.description << " ---" << std::endl;
+		}
+
+		cur.clear();
+
+		bool test_passed = run_paste_sanitize_test_case(tc);
+		if (!test_passed)
+			tests_failed++;
+
+		if (verbose)
+		{
+			std::cerr << cur.str();
+
+			if (test_passed) {
+				std::cerr << GREEN << "  [PASS]" << RESET << "\n";
+			} else {
+				std::cerr << "--- End of Test " << test_num << " ---\n";
+			}
+			std::cerr << std::endl;
+		}
+		else if (!test_passed)
+		{
+			std::cerr << "--- Test " << std::setw(2) << test_num << ": "
+					<< tc.description << " ---" << std::endl;
+			std::cerr << cur.str();
+			std::cerr << std::endl;
+		}
+
+		test_num++;
+	}
+
+	return TestResults{tests_failed, (int)(all_test_cases.size() + legacy_test_cases.size() + paste_test_cases.size())};
+}
+
+// TODO: make this not needed to compile...
+bool DragAspect = false;
+double aspect_ratio = 0;
+int window_min_width = 0, window_min_height = 0;

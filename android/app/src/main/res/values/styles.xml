@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ZQuest dialogs are flat panels with a hard two-pixel border: no rounding,
+         no elevation. Keep the same shape here. -->
+    <style name="Theme.ZQuestMobile" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/zc_background</item>
+        <item name="android:colorBackground">@color/zc_background</item>
+        <item name="android:colorAccent">@color/zc_green</item>
+        <item name="android:colorPrimary">@color/zc_panel</item>
+        <item name="android:colorPrimaryDark">@color/zc_background</item>
+        <item name="android:textColorPrimary">@color/zc_text</item>
+        <item name="android:textColorSecondary">@color/zc_text_dim</item>
+        <item name="android:textColorHighlight">@color/zc_green</item>
+        <item name="android:statusBarColor">@color/zc_background</item>
+        <item name="android:navigationBarColor">@color/zc_background</item>
+    </style>
+</resources>

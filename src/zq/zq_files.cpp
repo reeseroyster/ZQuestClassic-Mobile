@@ -1,0 +1,1492 @@
+#include <cstring>
+#include <filesystem>
+#include <stdio.h>
+#include <system_error>
+
+#include "allegro/gui.h"
+#include "dialog/externs.h"
+#include "zalleg/files.h"
+#include "core/misctypes.h"
+#include "core/qrs.h"
+#include "core/dmap.h"
+#include "zalleg/packfile.h"
+#include "zalleg/gui.h"
+#include "base/util.h"
+#include "zq/zq_files.h"
+#include "core/zdefs.h"
+#include "dialog/alertfunc.h"
+#include "dialog/tilesetwizard.h"
+#include "dialog/pickruleset.h"
+#include "dialog/quest_browser.h"
+#include "dialog/pickruletemplate.h"
+#include "zq/zq_misc.h"
+#include "zq/zquest.h"
+#include "core/qst.h"
+#include "zalleg/zsys.h"
+#include "zq/zq_class.h"
+#include "tiles.h"
+#include "zq/zq_tiles.h"
+#include "zq/zq_custom.h"
+#include "dialog/info.h"
+#include "dialog/compilezscript.h"
+
+#ifdef __EMSCRIPTEN__
+#include "base/emscripten_utils.h"
+#endif
+
+#ifdef _MSC_VER
+#define getcwd _getcwd
+#define strupr _strupr
+#endif
+
+int32_t NewQuestFile(std::string tileset_path)
+{
+    memset(filepath,0,255);
+    memset(temppath,0,255);
+    first_save=false;
+    box_start(1, "Initializing Quest", get_zc_font(font_lfont), get_zc_font(font_pfont), false);
+    box_out("Please wait.");
+    box_eol();
+    box_out("This may take a few moments.");
+    box_eol();
+    init_quest(tileset_path);
+    saved = autosaved = true;
+	disable_saving = false;
+    box_end(false);
+    refresh(rALL);
+    return D_O_K;
+}
+
+static int32_t ruleset=0;
+int32_t d_ruleset_radio_proc(int32_t msg,DIALOG *d,int32_t c);
+int32_t d_rulesettext_proc(int32_t msg, DIALOG *d, int32_t c);
+
+static DIALOG ruleset_dlg[] =
+{
+    { jwin_win_proc,           0,     0,  230,   180,  vc(14),              vc(1),                 0,       D_EXIT,     0,             0, (void *) "New Quest", NULL, NULL },
+    { jwin_button_proc,       40,   153,   61,    21,  vc(14),              vc(1),                13,       D_EXIT,     0,             0, (void *) "OK", NULL, NULL },
+    { jwin_frame_proc,   102,   80-2-7,   128,  43,   0,       0,      0,       0,             FR_ETCHED,       0,       NULL, NULL, NULL },
+    
+    { d_dummy_proc,			    20,    71,   61,    9,  vc(14),              vc(1),                 0,       0,     0,             0,       0, NULL, NULL },
+    { d_ruleset_radio_proc,       20,    91-8,   61,    9,  vc(14),              vc(1),                 0,       0,     0,             0, (void *) "Authentic NES (8-bit)", NULL, NULL },
+    { d_ruleset_radio_proc,       20,    101-8,   61,    9,  vc(14),              vc(1),                 0,       0,     0,             0, (void *) "Fixed NES (8-bit)", NULL, NULL },
+    { d_ruleset_radio_proc,       20,   111-8,   61,    9,  vc(14),              vc(1),                 0,       0,     0,             0, (void *) "SNES (BS/16-bit)", NULL, NULL },
+    { d_ruleset_radio_proc,       20,   121-8,   61,    9,  vc(14),              vc(1),                 0,       0,     0,             0, (void *) "SNES (Enhanced)", NULL, NULL },
+    { d_rulesettext_proc,      108,   85,   0,    0,  vc(14),              vc(1),                 0,       0,     0,             0,       NULL, NULL, NULL },
+    // 9
+    { jwin_text_proc,       16,   24,  128,    8,    vc(14),  vc(1),  0,       0,          0,             0, (void *) "Please specify the ruleset template for your new quest:", NULL, NULL },
+    { jwin_text_proc,       16,   34,  128,    8,    vc(14),  vc(1),  0,       0,          0,             0, (void *) "These rules affect select sets of engine features that", NULL, NULL },
+    { jwin_text_proc,       16,   44,  128,    8,    vc(14),  vc(1),  0,       0,          0,             0, (void *) "are enabled by default, that you may later toggle on/off,", NULL, NULL },
+    { jwin_text_proc,       16,   54,  128,    8,    vc(14),  vc(1),  0,       0,          0,             0, (void *) "based on the mechanics that you wish to use in your game.", NULL, NULL },
+    { jwin_text_proc,       16,   64,  128,    8,    vc(14),  vc(1),  0,       0,          0,             0, (void *) " ", NULL, NULL },
+    // 14
+    { jwin_text_proc,       16,   28,  128,    8,    vc(14),  vc(1),  0,       0,          0,             0, (void *) "You have embarked on a new quest!", NULL, NULL },
+    { jwin_text_proc,       16,   38,  128,    8,    vc(14),  vc(1),  0,       0,          0,             0, (void *) "Please select an initial ruleset template:", NULL, NULL },
+    { jwin_text_proc,       16,   48,  128,    8,    vc(14),  vc(1),  0,       0,          0,             0, (void *) "These settings affect the features of", NULL, NULL },
+    { jwin_text_proc,       16,   58,  128,    8,    vc(14),  vc(1),  0,       0,          0,             0, (void *) "the game engine that are enabled.", NULL, NULL },
+    
+    { jwin_text_proc,       8,  130,  128,    8,    vc(14),  vc(1),  0,       0,          0,             0, (void *) "After creation, you can toggle individual Rules from the menu", NULL, NULL },
+    { jwin_text_proc,       8,  140,  128,    8,    vc(14),  vc(1),  0,       0,          0,             0, (void *) "options: 'Quest >> Options' and 'ZScript >> Quest Specific Settings'.", NULL, NULL },
+    // There's no d_timer_proc; don't be silly.
+    { d_ruleset_radio_proc,       20,   81-8,   61,    9,  vc(14),              vc(1),                 0,       D_SELECTED,     0,             0, (void *) "Modern", NULL, NULL },
+    { jwin_text_proc,       8,  130,  128,    8,    vc(14),  vc(1),  0,       0,          0,             0, (void *) "To customise, open the 'Quest >> Rules' and ", NULL, NULL },
+    { jwin_text_proc,       8,  140,  128,    8,    vc(14),  vc(1),  0,       0,          0,             0, (void *) "'ZScript >> Quest Specific Settings' dialogues.", NULL, NULL },
+    { jwin_button_proc,       93+40-4,   153,   61,    21,  vc(14),              vc(1),                13,       D_EXIT,     0,             0, (void *) "Cancel", NULL, NULL },
+    
+    { NULL,                 0,    0,    0,    0,   0,       0,       0,       0,          0,             0,       NULL,                           NULL,  NULL }
+};
+
+int32_t d_ruleset_radio_proc(int32_t msg,DIALOG *d,int32_t c)
+{
+    int32_t temp = ruleset;
+    int32_t ret = jwin_radiofont_proc(msg,d,c);
+    
+    if(ruleset_dlg[3].flags & D_SELECTED) ruleset = rulesetNONE;
+    else if(ruleset_dlg[4].flags & D_SELECTED) ruleset = rulesetNES;
+    else if(ruleset_dlg[5].flags & D_SELECTED) ruleset = rulesetFixedNES;
+    else if(ruleset_dlg[6].flags & D_SELECTED) ruleset = rulesetBSZ;
+    else if(ruleset_dlg[7].flags & D_SELECTED) ruleset = rulesetZ3;
+    else if(ruleset_dlg[20].flags & D_SELECTED) ruleset = rulesetModern;
+    
+    if(temp != ruleset)
+    {
+        return D_REDRAW;
+    }
+    
+    return ret;
+}
+
+int32_t d_rulesettext_proc(int32_t msg, DIALOG *d, int32_t)
+{
+	if(msg!=MSG_DRAW)
+		return D_O_K;
+		
+	char buf[42];
+	char buf2[42];
+	char buf3[42];
+	char buf4[42];
+	
+	switch(ruleset)
+	{
+		case rulesetNES: // Original NES
+			snprintf(buf,  sizeof(buf),  "Emulates the behaviour, the quirks,");
+			snprintf(buf2, sizeof(buf2), "bugs, and oddities found in the NES");
+			snprintf(buf3, sizeof(buf3), "game 'The Legend of Zelda'.");
+			snprintf(buf4, sizeof(buf4), "All but a few rules are off.");
+			break;
+
+		case rulesetFixedNES: // Fixed NES
+			snprintf(buf,  sizeof(buf),  "Corrects a large number of oddities");
+			snprintf(buf2, sizeof(buf2), "found in the original NES engine, ");
+			snprintf(buf3, sizeof(buf3), "such as bomb interactions. ");
+			snprintf(buf4, sizeof(buf4), "Enables all 'NES Fixes' Rules");
+			break;
+
+		case rulesetBSZ: // BS Zelda
+			snprintf(buf,  sizeof(buf),  "Adds expanded animations befitting a");
+			snprintf(buf2, sizeof(buf2), "Super Famicom era game: Expanded");
+			snprintf(buf3, sizeof(buf3), "enemy tiles, fast scrolling, new push-");
+			snprintf(buf4, sizeof(buf4), "blocks, transition wipes, etc.");
+			break;
+
+		case rulesetZ3: // Zelda 3-esque
+			snprintf(buf,  sizeof(buf),  "As 16-bit, plus diagonal movement,");
+			snprintf(buf2, sizeof(buf2), "new message strings, magic use, real");
+			snprintf(buf3, sizeof(buf3), "arrows, more sounds, drowning, ");
+			snprintf(buf4, sizeof(buf4), "modern boomerang/item interaction.");
+			break;
+
+		case rulesetModern: // 255
+			snprintf(buf,  sizeof(buf),  "Enables all new 2.55 features including");
+			snprintf(buf2, sizeof(buf2), "new Hero movement/step speed, new");
+			snprintf(buf3, sizeof(buf3), "combo animations, scripting extensions,");
+			snprintf(buf4, sizeof(buf4), "and other engine enhancements.");
+			break;
+	}
+	
+	FONT *f = font;
+	textprintf_ex(screen,f,d->x-1,d->y-11,jwin_pal[jcBOXFG],jwin_pal[jcBOX],"%s",buf);
+	textprintf_ex(screen,f,d->x-1,d->y-11+12,jwin_pal[jcBOXFG],jwin_pal[jcBOX],"%s",buf2);
+	textprintf_ex(screen,f,d->x-1,d->y-11+24,jwin_pal[jcBOXFG],jwin_pal[jcBOX],"%s",buf3);
+	textprintf_ex(screen,f,d->x-1,d->y-11+36,jwin_pal[jcBOXFG],jwin_pal[jcBOX],"%s",buf4);
+	return D_O_K;
+}
+
+void applyRuleset(int32_t newRuleset, byte *qrptr)
+{
+	ruleset = newRuleset;
+	for(int32_t i=0; i<qr_MAX; ++i)
+	{
+		switch(i)
+		{
+			case qr_PARSER_NO_LOGGING:
+			case qr_PARSER_250DIVISION:
+			case qr_PARSER_SHORT_CIRCUIT:
+			case qr_PARSER_BOOL_TRUE_DECIMAL:
+			case qr_PARSER_TRUE_INT_SIZE:
+			case qr_PARSER_BINARY_32BIT:
+			case qr_PARSER_STRINGSWITCH_INSENSITIVE:
+				//Ignore compiler options
+				break;
+			case qr_OLD_STRING_EDITOR_MARGINS:
+			case qr_STRING_FRAME_OLD_WIDTH_HEIGHT:
+				//These get their own fix in 'onStrFix()'
+				break;
+			default:
+				set_qr(i,0,qrptr);
+		}
+	}
+	onStrFix();
+	applyRuleTemplateWithConfirmation(ruletemplateFixCompat, qrptr);
+	
+	//Set on things that should ALWAYS be on.
+	static const int rALWAYS_ON[] = {
+		// Engine fixes
+		qr_DMGCOMBOLAYERFIX, qr_WARPSIGNOREARRIVALPOINT, qr_NOARRIVALPOINT, qr_CMBCYCLELAYERS,
+		qr_KILLALL, qr_ITEMBUBBLE, qr_SHIELDBUBBLE, qr_RINGAFFECTDAMAGE, qr_NEW_COMBO_ANIMATION,
+		qr_BUSHESONLAYERS1AND2, qr_CUSTOMCOMBOSLAYERS1AND2, qr_CUSTOMCOMBOS_EVERY_LAYER,
+		qr_HOOKSHOTLAYERFIX, qr_EPILEPSY, qr_FIXSCRIPTSDURINGSCROLLING, qr_ALWAYS_DEALLOCATE_ARRAYS,
+		qr_ITEMSCRIPTSKEEPRUNNING, qr_FIXDRUNKINPUTS, qr_BITMAP_AND_FILESYSTEM_PATHS_ALWAYS_RELATIVE,
+		qr_SMARTER_WATER, qr_LESS_AWFUL_SIDESPIKES, qr_SWITCHES_AFFECT_MOVINGBLOCKS,
+		// Script Logging
+		qr_SCRIPTERRLOG, qr_LOG, qr_TRACESCRIPTIDS,
+		// Misc Engine stuff (not really related to any particular ruleset, so, always on)
+		qr_PASSIVE_SUBSCRIPT_RUNS_DURING_ACTIVE_SUBSCRIPT, qr_PASSIVE_SUBSCRIPT_RUNS_WHEN_GAME_IS_FROZEN,
+		qr_COMBOSCRIPTS_LAYER_0, qr_ONDEATH_RUNS_AFTER_DEATH_ANIM, qr_FFCSCROLL, qr_GREATER_MAX_TIME,
+		qr_WEAPONS_EXTRA_DEATH_FRAME, qr_USE_EX1_EX2_INVENTORYSWAP, qr_CLEARINITDONSCRIPTCHANGE,
+		qr_SCRIPT_WEAPONS_UNIQUE_SPRITES, qr_WRITING_NPC_WEAPON_UNIQUE_SPRITES,
+		qr_WRITE_ENTRYPOINTS_AFFECTS_HEROCLASS, qr_SMARTER_SMART_SCROLL,
+		qr_LIFTED_WEAPONS_RUN_SCRIPTS, qr_BOMB_BOOMS_CLEAR_SCRIPTS,
+		qr_PASSIVE_ITEM_SCRIPT_ONLY_HIGHEST, qr_QUAKE_STUNS_LEEVERS,
+		qr_CAN_PLACE_GANON, qr_CAN_PLACE_TRAPS, qr_PERMANENT_WHISTLE_SECRETS,
+		qr_BOMB_BOOMS_CLEAR_SCRIPTS, qr_HERO_DIVE_UNDER_LAYER_1,
+		qr_STEP_IS_FLOAT,
+	};
+	static const int r_FIXES[] = {
+		qr_FREEFORM, qr_SAFEENEMYFADE, qr_ITEMSONEDGES, qr_HERODUNGEONPOSFIX, qr_RLFIX,
+		qr_NOLEVEL3FIX, qr_BOMBHOLDFIX, qr_HOLDNOSTOPMUSIC, qr_CAVEEXITNOSTOPMUSIC,
+		qr_OVERWORLDTUNIC, qr_SWORDWANDFLIPFIX, /*qr_WPNANIMFIX,*/ qr_PUSHBLOCKCSETFIX,
+		qr_TRAPPOSFIX, qr_NOBORDER, qr_SUBSCREENOVERSPRITES,
+		qr_BOMBDARKNUTFIX, qr_OFFSETEWPNCOLLISIONFIX, qr_ITEMSINPASSAGEWAYS, qr_NOFLICKER, qr_FIREPROOFHERO2,
+		qr_NOITEMOFFSET, qr_LADDERANYWHERE, qr_TRUEFIXEDBOMBSHIELD, qr_NOTMPNORET, qr_NOFLASHDEATH, qr_BROKENSTATUES, 
+		qr_DYING_ENEMIES_IGNORE_STUN, qr_SHOP_ITEMS_VANISH, qr_EXPANDEDLTM, qr_CORRECTED_EW_BRANG_ANIM,
+	};
+	static const int rNES[] = {
+		qr_OLDPICKUP, qr_OLDSTYLEWARP,
+	};
+	static const int rBSZ[] = {
+		qr_TIME, qr_NOBOMBPALFLASH, qr_NEWENEMYTILES, qr_FASTDNGN, qr_SMOOTHVERTICALSCROLLING,
+		qr_COOLSCROLL, qr_BSZELDA, qr_SOLIDBLK, qr_HESITANTPUSHBLOCKS, qr_INSTABURNFLAGS,
+		qr_FADE, qr_EXPANDEDLTM, qr_UNBEATABLES_DONT_KEEP_DEAD, qr_NO_LEAVE_ONE_ENEMY_ALIVE_TRICK,
+	};
+	static const int rZ3[] = {
+		qr_DROWN, qr_HIDECARRIEDITEMS, qr_ALLOWMSGBYPASS, qr_ALLOWFASTMSG, qr_MSGDISAPPEAR,
+		qr_MSGFREEZE, qr_ENABLEMAGIC, qr_NOWANDMELEE, qr_TRUEARROWS, qr_Z3BRANG_HSHOT,
+		qr_TRANSSHADOWS, qr_SHADOWS, qr_LTTPWALK, qr_MORESOUNDS, qr_NEVERDISABLEAMMOONSUBSCREEN,
+	};
+	static const int rMODERN[] = {
+		qr_NO_SCROLL_WHILE_IN_AIR, qr_DUNGEON_DMAPS_PERM_SECRETS,
+		qr_ANGULAR_REFLECTED_WEAPONS, qr_MIRRORS_USE_WEAPON_CENTER,
+		qr_SPRITEXY_IS_FLOAT, qr_SIDEVIEWLADDER_FACEUP,
+		qr_ITEMSHADOWS, qr_WEAPONSHADOWS,
+		qr_NEW_HERO_MOVEMENT2,
+		qr_HOLDITEMANIMATION, qr_DISABLE_4WAY_GRIDLOCK,
+		qr_NO_HOPPING, qr_NO_SOLID_SWIM,
+		qr_WATER_ON_LAYER_1, qr_WATER_ON_LAYER_2,
+		qr_SHALLOW_SENSITIVE, qr_NONHEAVY_BLOCKTRIGGER_PERM,
+		qr_CORRECTED_EW_BRANG_ANIM, qr_OVERHEAD_COMBOS_L1_L2,
+		qr_AUTOCOMBO_LAYER_1, qr_AUTOCOMBO_LAYER_2,
+		qr_AUTOCOMBO_ANY_LAYER, qr_NEW_DARKROOM,
+		qr_PUSHBLOCK_LAYER_1_2, qr_HOOKSHOTALLLAYER,
+		qr_ITEMCOMBINE_NEW_PSTR, qr_ITEMCOMBINE_CONTINUOUS,
+		qr_FAIRYDIR, qr_BLOCKS_DONT_LOCK_OTHER_LAYERS,
+		qr_CONVEYORS_L1_L2, qr_CONVEYORS_ALL_LAYERS,
+		qr_EW_FIRE_EMITS_LIGHT, qr_BLOCKS_DROWN,
+		qr_NO_STUNLOCK_IGNORE, qr_PUSHBLOCKS_FALL_IN_SIDEVIEW,
+		qr_BETTER_PLAYER_JUMP_ANIM, qr_ARMOS_GRAVE_ON_LAYERS,
+		qr_MAP_BUTTON_CLOSES_SUBSCREEN, qr_RESPAWN_POINTS_HALF_GRID,
+		qr_KEEPOLD_APPLIES_RETROACTIVELY,
+		qr_BETTER_ENGINE_AUTOROTATE, qr_MIRROR_PRISM_FFCS,
+		qr_ALLOW_JUMP_WHILE_CHARGING, qr_SCC_ITEM_COMBINES_ITEMS,
+		qr_SCC_GOTO_RESPECTS_CONTFLAG, qr_FIND_CLOSEST_BAIT,
+		qr_SMARTDROPS, qr_SMARTER_DROPS, qr_SMARTDROPS_NOTHING,
+		qr_GRASS_SENSITIVE, qr_BETTER_RAFT,
+		qr_BETTER_RAFT_2, qr_RAFT_SOUND, qr_POUNDLAYERS1AND2,
+		qr_HELD_BOMBS_EXPLODE, qr_MIRROR_PRISM_LAYERS,
+		qr_SEPARATE_BOMBABLE_TAPPING_SFX,
+	};
+	static const int r_NON_MODERN[] = {
+		qr_OLDSPRITEDRAWS, qr_CLASSIC_DRAWING_ORDER, qr_OLD_RESPAWN_POINTS,
+		qr_PAUSE_ICE_SLIDING_WHILE_ATTACKING, qr_CARRYABLE_NO_ACROSS_SCREEN,
+		qr_NO_SCROLL_WHILE_CARRYING,
+	};
+	static const int rMODERN_TMPL[] = {
+		ruletemplateFixCompat, ruletemplateNewSubscreen,
+	};
+	for(auto qr : rALWAYS_ON)
+		set_qr(qr, 1, qrptr);
+	switch(ruleset)
+	{
+		case rulesetNES: // Authentic NES
+		{
+			for(auto qr : r_NON_MODERN)
+				set_qr(qr, 1, qrptr);
+			for(auto qr : rNES)
+				set_qr(qr, 1, qrptr);
+			break;
+		}
+		case rulesetFixedNES: // Fixed NES
+		{
+			for(auto qr : r_NON_MODERN)
+				set_qr(qr, 1, qrptr);
+			for(auto qr : r_FIXES)
+				set_qr(qr, 1, qrptr);
+			break;
+		}
+		case rulesetBSZ: // BS Zelda
+		{
+			for(auto qr : r_NON_MODERN)
+				set_qr(qr, 1, qrptr);
+			for(auto qr : r_FIXES)
+				set_qr(qr, 1, qrptr);
+			for(auto qr : rBSZ)
+				set_qr(qr, 1, qrptr);
+			break;
+		}
+		case rulesetZ3: // Zelda 3-esque
+		{
+			for(auto qr : r_NON_MODERN)
+				set_qr(qr, 1, qrptr);
+			for(auto qr : r_FIXES)
+				set_qr(qr, 1, qrptr);
+			for(auto qr : rBSZ)
+				set_qr(qr, 1, qrptr);
+			for(auto qr : rZ3)
+				set_qr(qr, 1, qrptr);
+			break;
+		}
+		case rulesetModern: // Modern-style
+		{
+			for(auto qr : r_FIXES)
+				set_qr(qr, 1, qrptr);
+			for(auto qr : rBSZ)
+				set_qr(qr, 1, qrptr);
+			for(auto qr : rZ3)
+				set_qr(qr, 1, qrptr);
+			for(auto qr : r_NON_MODERN)
+				set_qr(qr, 0, qrptr);
+			for(auto qr : rMODERN)
+				set_qr(qr, 1, qrptr);
+			for(auto tmpl : rMODERN_TMPL)
+				applyRuleTemplateWithConfirmation(tmpl, qrptr);
+			break;
+		}
+	}
+}
+
+int32_t PickRuleset()
+{
+	call_ruleset_dlg(); return D_O_K;
+}
+int32_t PickRuleTemplate()
+{
+	call_ruletemplate_dlg(); return D_O_K;
+}
+
+int32_t onNew()
+{
+	if(checksave()==0)
+		return D_O_K;
+
+	restore_mouse();
+	return call_tileset_wizard() ? D_O_K : D_CLOSE;
+}
+
+int32_t onSave()
+{
+    restore_mouse();
+    
+    if (disable_saving)
+    {
+		if (alert_confirm("Saving not allowed", "This qst is in a backup folder, so it is read-only. Would you like to Save As instead?"))
+			return onSaveAs();
+
+        return D_O_K;
+    }
+    
+    if(!first_save)
+        return onSaveAs();
+    else if(OverwriteProtection)
+    {
+        InfoDialog("ZQuest","Overwriting quests is disabled. This can be changed in the options dialog.").show();
+        return D_O_K;
+    }
+    
+	if(zc_get_config("zquest","quick_compile_on_save",0))
+	{
+		if(!do_compile_and_slots(1,false))
+		{
+			InfoDialog("ZQuest","Failed compile on save! Saving quest anyway...").show();
+		}
+	}
+
+    int32_t ret = user_initiated_save_quest(filepath, filepath);
+    char name[256];
+    extract_name(filepath,name,FILENAMEALL);
+    
+    if(!ret)
+    {
+		InfoDialog("ZQuest",fmt::format("Saved {}",name)).show();
+        saved = autosaved = true;
+        first_save=true;
+        header.dirty_password=false;
+        quest_browser_record_loaded_quest(filepath);
+    }
+    else
+    {
+		InfoDialog("Error",fmt::format("Error saving {}",name)).show();
+    }
+    
+	set_last_timed_save(nullptr);
+    return D_O_K;
+}
+
+void update_recent_quest(char const* path);
+
+int32_t onSaveAs()
+{
+	static EXT_LIST list[] =
+	{
+		{ (char *)"Quest Files (*.qst)", (char *)"qst"                                     },
+		{ (char *)"Unencrypted Quest Files (*.qsu)", (char *)"qsu"                                     },
+		{ NULL,                                                  NULL                                              }
+	};
+
+#ifdef __EMSCRIPTEN__
+	std::string path;
+	if (auto result = prompt_for_new_file("Save Quest As (.qst)","qst",list,get_initial_file_dialog_folder(),true); !result)
+	{
+		return D_O_K;
+	}
+	else path = *result;
+#else
+	std::string path;
+	if (auto result = prompt_for_new_file("Save Quest As (.qst)", "qst", list, filepath, true); !result)
+	{
+		return D_O_K;
+	}
+	else path = *result;
+#endif
+
+	if (should_open_as_readonly(path))
+	{
+		InfoDialog("ZQuest", "Cannot save in a backups folder.").show();
+		return D_O_K;
+	}
+
+	// TODO: stop using temppath.
+	strcpy(temppath, path.c_str());
+
+	if(exists(temppath))
+	{
+		if(OverwriteProtection)
+		{
+			InfoDialog("ZQuest","Overwriting quests is disabled. This can be changed in the options dialog.").show();
+			return D_O_K;
+		}
+		
+		if(!alert_confirm("Confirm Overwrite",fmt::format("{} already exists. Write over existing file?", temppath)))
+			return D_O_K;
+	}
+	
+	if(zc_get_config("zquest","quick_compile_on_save",0))
+	{
+		if(!do_compile_and_slots(1,false))
+		{
+			InfoDialog("ZQuest","Failed compile on save! Saving quest anyway...").show();
+		}
+	}
+
+	int32_t ret = user_initiated_save_quest(temppath, temppath);
+	char buf[1024],name[256];
+	extract_name(temppath,name,FILENAMEALL);
+	
+	if(!ret)
+	{
+		set_zq_path(filepath, temppath);
+		update_recent_quest(temppath);
+		snprintf(buf, sizeof(buf), "ZC Editor - [%s]", get_filename(filepath));
+		set_window_title(buf);
+		InfoDialog("ZQuest",fmt::format("Saved {}",name)).show();
+		saved = autosaved = true;
+		disable_saving = false;
+		first_save=true;
+		header.dirty_password=false;
+		quest_browser_record_loaded_quest(filepath);
+	}
+	else
+	{
+		InfoDialog("Error",fmt::format("Error saving {}",name)).show();
+	}
+	
+	refresh(rMENU);
+	set_last_timed_save(nullptr);
+
+	return D_O_K;
+}
+
+int32_t open_quest(char const* path)
+{
+	std::error_code ec;
+	if (fs::equivalent("./tilesets", fs::path(path).parent_path(), ec))
+	{
+		InfoDialog("Warning",
+			"You've opened a qst in the tilesets folder - instead, you should probably use File>New so that a new file is made."
+			"\nFiles in this folder may be overwritten by the software updater.").show();
+	}
+
+	int32_t ret = load_quest(path);
+	
+	if(ret == qe_OK)
+	{
+		update_recent_quest(path);
+		saved = autosaved = true;
+		set_zq_path(filepath, path);
+		first_save=true;
+		quest_browser_record_loaded_quest(path);
+	}
+	else if(ret == qe_cancel)
+	{
+		saved = autosaved = true;
+		filepath[0]=0;
+	}
+	else
+	{
+		char name[256];
+		extract_name(path,name,FILENAMEALL);
+        InfoDialog("Error",fmt::format("Unable to load {}\n{}",name,qst_error[ret])).show();
+		filepath[0]=0;
+	}
+
+	setup_combo_animations();
+	setup_combo_animations2();
+	Map.setCurrMap(zinit.last_map);
+	Map.setCopyFFC(-1); //Do not have an initial ffc on the clipboard. 
+	Map.setCurrScr(zinit.last_screen);
+	Map.ClearCommandHistory();
+	rebuild_trans_table();
+	rebuild_string_list();
+	onDrawingModeNormal();
+	refresh(rALL);
+	set_last_timed_save(nullptr);
+	return ret;
+}
+
+int32_t customOpen(char const* path)
+{
+	restore_mouse();
+	
+	if(checksave()==0)
+		return D_O_K;
+	
+	open_quest(path);
+	return D_O_K;
+}
+char* get_qst_name(char const* def_path)
+{
+	static EXT_LIST list[] =
+	{
+		{ (char *)"Quest Files (*.qst)", (char *)"qst"                                     },
+		{ (char *)"Quest Auto-backups (*.qb?)", (char *)"qb0,qb1,qb2,qb3,qb4,qb5,qb6,qb7,qb8,qb9" },
+		{ (char *)"Quest Timed Auto-saves (*.qt?)", (char *)"qt0,qt1,qt2,qt3,qt4,qt5,qt6,qt7,qt8,qt9" },
+		{ (char *)"Uncompressed Quest Timed Auto-saves (*.qu?)", (char *)"qu0,qu1,qu2,qu3,qu4,qu5,qu6,qu7,qu8,qu9" },
+		{ (char *)"Unencrypted Quest Files (*.qsu)", (char *)"qsu"                                     },
+		{ (char *)"Quest Template Files (*.zqt)", (char *)"zqt"                                     },
+		{ (char *)"All Files (*.*)",                             NULL                                              },
+		{ NULL,                                                  NULL                                              }
+	};
+	
+#ifdef __EMSCRIPTEN__
+	return prompt_for_existing_file_compat("Load File","",list,get_initial_file_dialog_folder().c_str(),true)
+#else
+	return prompt_for_existing_file_compat("Load File","",list,def_path ? def_path : filepath,true)
+#endif
+		? temppath : nullptr;
+}
+
+bool should_open_as_readonly(std::string_view path)
+{
+	return
+		path.find("backups") != std::string::npos ||
+		path.find(".tmp/database") != std::string::npos ||
+		path.find(".tmp\\database") != std::string::npos;
+}
+
+int32_t onOpen()
+{
+	restore_mouse();
+
+	if(checksave()==0)
+		return D_O_K;
+
+	quest_browser_open();
+	return D_O_K;
+}
+
+// File > Open File: straight to the OS file picker, skipping the browser.
+int32_t onOpenFile()
+{
+	restore_mouse();
+
+	if(checksave()==0)
+		return D_O_K;
+
+	if(char* name = get_qst_name())
+		open_quest(name);
+	return D_O_K;
+}
+
+int32_t onRevert()
+{
+    if(!alert_confirm("Confirm Revert","Are you sure you want to lose all changes since last save?"))
+        return D_O_K;
+    
+    if(filepath[0]!=0)
+    {
+        int32_t ret = load_quest(filepath);
+        
+        if(!ret)
+        {
+            saved = autosaved = true;
+        }
+        else
+        {
+            char name[256];
+            extract_name(filepath,name,FILENAMEALL);
+			InfoDialog("Error",fmt::format("Unable to load {}\n{}",name,qst_error[ret])).show();
+            filepath[0]=0;
+        }
+        
+        setup_combo_animations();
+        setup_combo_animations2();
+        refresh(rALL);
+    }
+    else
+    {
+        NewQuestFile(DEFAULT_TILESET);
+        
+        if(RulesetDialog > 0)
+		{
+            PickRuleset();
+			PickRuleTemplate();
+		}
+    }
+    
+    onDrawingModeNormal();
+	set_last_timed_save(nullptr);
+    return D_O_K;
+}
+
+static DIALOG import_map_bias_dlg[] =
+{
+    // (dialog proc)     (x)   (y)   (w)   (h)   (fg)     (bg)    (key)    (flags)     (d1)           (d2)     (dp)
+    { jwin_win_proc, 80,   80-8,   160+1,  64+20+1,   vc(14),  vc(1),  0,       D_EXIT,          0,             0, (void *) "Select Import Bias", NULL, NULL },
+    { d_timer_proc,         0,    0,     0,    0,    0,       0,       0,       0,          0,          0,         NULL, NULL, NULL },
+    { jwin_button_proc,     90,   120+10,  61,   21,   vc(14),  vc(1),  13,      D_EXIT,     0,             0, (void *) "OK", NULL, NULL },
+    { jwin_button_proc,     170,  120+10,  61,   21,   vc(14),  vc(1),  27,      D_EXIT,     0,             0, (void *) "Cancel", NULL, NULL },
+    { jwin_radio_proc,      130, 104-8,   96+1,    8+1,   jwin_pal[jcBOXFG],  jwin_pal[jcBOX],  0,       0,          0,             0, (void *) "Total Copy", NULL, NULL },
+    { jwin_radio_proc,      130, 114-8,  120+1,    8+1,   jwin_pal[jcBOXFG],  jwin_pal[jcBOX],  0,       0,          0,             0, (void *) "Prefer Original", NULL, NULL },
+    { jwin_radio_proc,      130, 124-8,  104+1,    8+1,   jwin_pal[jcBOXFG],  jwin_pal[jcBOX],  0,       0,          0,             0, (void *) "Prefer Import", NULL, NULL },
+    { NULL,                 0,    0,    0,    0,   0,       0,       0,       0,          0,             0,       NULL,                           NULL,  NULL }
+};
+
+int32_t get_import_map_bias()
+{
+    import_map_bias_dlg[0].dp2=get_zc_font(font_lfont);
+    
+    for(int32_t i=0; i<3; i++)
+    {
+        import_map_bias_dlg[i+4].flags=0;
+    }
+    
+    import_map_bias_dlg[ImportMapBias+4].flags=D_SELECTED;
+    
+    large_dialog(import_map_bias_dlg);
+        
+    if(do_zqdialog(import_map_bias_dlg,2)==2)
+    {
+        for(int32_t i=0; i<3; i++)
+        {
+            if(import_map_bias_dlg[i+4].flags&D_SELECTED)
+            {
+                ImportMapBias=i;
+				zc_set_config("zquest","import_map_bias",ImportMapBias);
+                break;
+            }
+        }
+        
+        return 0;
+    }
+    
+    return -1;
+}
+
+int32_t onImport_Map()
+{
+    if(Map.getCurrMap()>=Map.getMapCount())
+        return D_O_K;
+        
+    if(get_import_map_bias()==-1)
+    {
+        return D_O_K;
+    }
+    
+    if(!prompt_for_existing_file_compat("Import Map (.map)","map",NULL,datapath,false))
+        return D_O_K;
+        
+    mark_save_dirty();
+    int32_t ret=Map.load(temppath);
+    
+    if(ret)
+    {
+        char name[256];
+        extract_name(temppath,name,FILENAMEALL);
+        InfoDialog("Error",fmt::format("Unable to load {}\n{}",name,loaderror[ret])).show();
+        
+        if(ret>1)
+            Map.clearmap(false);
+    }
+    else
+    {
+        bool willaffectlayers=false;
+        
+        for(int32_t i=0; i<MAPSCRS; i++)
+        {
+            for(int32_t j=0; !willaffectlayers && j<6; j++)
+            {
+                if(TheMaps[Map.getCurrMap()*MAPSCRS+i].layermap[j]>Map.getMapCount())
+                {
+                    willaffectlayers=true;
+                    break;
+                }
+            }
+            
+            fix_layers(&TheMaps[Map.getCurrMap()*MAPSCRS+i], false);
+        }
+        
+        if(willaffectlayers)
+        {
+            InfoDialog("Layers Changed", "One or more screens in the imported map had"
+				"layers on maps that do not exist. The map numbers of the affected"
+				" layers will be reset to 0.").show();
+        }
+    }
+    
+    refresh(rSCRMAP+rMAP+rMENU);
+    return D_O_K;
+}
+
+int32_t onExport_Map()
+{
+    if(Map.getCurrMap()>=Map.getMapCount())
+        return D_O_K;
+        
+    if(!prompt_for_new_file_compat("Export Map (.map)","map",NULL,datapath,false))
+        return D_O_K;
+        
+    int32_t ret = Map.save(temppath);
+    char name[256];
+    extract_name(temppath,name,FILENAMEALL);
+    
+    if(!ret)
+		InfoDialog("ZQuest", fmt::format("Saved {}", name)).show();
+    else
+		InfoDialog("Error", fmt::format("Error saving {}", name)).show();
+    return D_O_K;
+}
+
+
+int32_t onExport_Tilepack()
+{
+	savesometiles("Save Tile Package", 0);
+	return D_O_K;	
+}
+
+int32_t onImport_Tilepack_To()
+{
+	writesometiles_to("Load Tile Package to:", 0);
+	return D_O_K;	
+}
+
+int32_t onExport_DMaps()
+{
+
+    
+    savesomedmaps("Read DMaps",0);
+    
+    return D_O_K;
+}
+
+
+int32_t onImport_DMaps()
+{
+    if(!prompt_for_existing_file_compat("Import DMaps (.zdmap)","zdmap",NULL,datapath,false))
+        return D_O_K;
+    
+    PACKFILE *f=zalleg_pack_fopen_password(temppath,F_READ, "");
+	if(f)
+	{
+		if(!readsomedmaps(f))
+		{
+			char name[256];
+			extract_name(temppath,name,FILENAMEALL);
+			InfoDialog("Error",fmt::format("Unable to load {}",name)).show();
+		}
+		else
+		{
+			int32_t maxMap=0;
+			for(int32_t i=0; i<MAXDMAPS; i++)
+			{
+			    if(DMaps[i].map>maxMap)
+				maxMap=DMaps[i].map;
+			}
+			
+			if(maxMap>map_count)
+			{
+				if (alert_confirm("Not enough maps",
+					"The imported DMaps use more maps than are"
+					" currently available. Do you want to add"
+					"more maps or change the DMaps' settings?",
+					"&Add maps","&Modify DMaps"))
+				{
+					setMapCount2(maxMap+1);
+				}
+				else
+				{
+					for(int32_t i=0; i<MAXDMAPS; i++)
+					{
+						if(DMaps[i].map>=map_count)
+						DMaps[i].map=0;
+					}
+				}
+			}
+			
+			char name[256];
+			extract_name(temppath,name,FILENAMEALL);
+			InfoDialog("Success!",fmt::format("Loaded {}",name)).show();
+		}
+	}
+	pack_fclose(f);
+   
+    mark_save_dirty();
+
+    
+    return D_O_K;
+}
+
+int32_t onImport_Tilepack()
+{
+		if(prompt_for_existing_file_compat("Load ZTILE(.ztile)", "ztile", NULL,datapath,false))
+		{  
+			char name[256];
+			extract_name(temppath,name,FILENAMEALL);
+			PACKFILE *f=zalleg_pack_fopen_password(temppath,F_READ, "");
+			if(f)
+			{
+				if (!readtilefile(f))
+				{
+					al_trace("Could not read from .ztile packfile %s\n", name);
+					InfoDialog("ZTILE File: Error","Could not load the specified Tile.").show();
+				}
+				else
+				{
+					InfoDialog("ZTILE File: Success!","Loaded the source tiles to your tile sheets!").show();
+				}
+			}
+	
+			pack_fclose(f);
+		}
+		return D_O_K;
+}
+
+int32_t onExport_Combopack()
+{
+	savesomecombos("Save Combo Package", 0);
+	return D_O_K;
+	
+}
+
+int32_t onImport_Combopack_To()
+{
+	writesomecombos_to("Load Combo Package to:", 0);
+	return D_O_K;
+	
+}
+
+int32_t onImport_Combopack()
+{
+		loadcombopack("Load Combo Package to:", 0);
+		return D_O_K;
+}
+
+int32_t onImport_Comboaliaspack()
+{
+		if(prompt_for_existing_file_compat("Load ZALIAS(.zalias)", "zalias", NULL,datapath,false))
+		{  
+			char name[256];
+			extract_name(temppath,name,FILENAMEALL);
+			PACKFILE *f=zalleg_pack_fopen_password(temppath,F_READ, "");
+			if(f)
+			{
+				if (!readcomboaliasfile(f))
+				{
+					al_trace("Could not read from .zalias packfile %s\n", name);
+					InfoDialog("ZALIAS File: Error","Could not load the specified combo aliases.").show();
+				}
+				else
+				{
+					InfoDialog("ZALIAS File: Success!","Loaded the source combo aliases to your combo alias tables!").show();
+					mark_save_dirty();
+				}
+			}
+	
+			pack_fclose(f);
+		}
+		return D_O_K;
+}
+
+int32_t onImport_Pals()
+{
+    if(!prompt_for_existing_file_compat("Import Palettes (.zpl)","zpl",NULL,datapath,false))
+        return D_O_K;
+        
+    mark_save_dirty();
+    
+    if(!load_pals(temppath,0))
+    {
+        char name[256];
+        extract_name(temppath,name,FILENAMEALL);
+        InfoDialog("Error",fmt::format("Unable to load {}",name)).show();
+    }
+    
+    return D_O_K;
+}
+
+int32_t onExport_Pals()
+{
+    if(!prompt_for_new_file_compat("Export Palettes (.zpl)","zpl",NULL,datapath,false))
+        return D_O_K;
+        
+    char name[256];
+    extract_name(temppath,name,FILENAMEALL);
+    
+    if(save_pals(temppath))
+		InfoDialog("ZQuest", fmt::format("Saved {}", name)).show();
+    else
+		InfoDialog("Error", fmt::format("Error saving {}", name)).show();
+    return D_O_K;
+}
+
+int32_t onImport_Msgs()
+{
+    if(!prompt_for_existing_file_compat("Import String Table (.zqs)","zqs",NULL,datapath,false))
+        return D_O_K;
+        
+    mark_save_dirty();
+    
+    if(!load_msgstrs(temppath,0))
+    {
+        char name[256];
+        extract_name(temppath,name,FILENAMEALL);
+        InfoDialog("Error",fmt::format("Unable to load {}",name)).show();
+    }
+    
+    return D_O_K;
+}
+
+int32_t onExport_Msgs()
+{
+    if(!prompt_for_new_file_compat("Export String Table (.zqs)","zqs",NULL,datapath,false))
+        return D_O_K;
+        
+    char name[256];
+    extract_name(temppath,name,FILENAMEALL);
+    
+    if(save_msgstrs(temppath))
+		InfoDialog("ZQuest", fmt::format("Saved {}", name)).show();
+    else
+		InfoDialog("Error", fmt::format("Error saving {}", name)).show();
+    return D_O_K;
+}
+
+int32_t onImport_StringsTSV()
+{
+    if(!prompt_for_existing_file_compat("Import Strings (.tsv)","tsv",NULL,datapath,false))
+        return D_O_K;
+        
+    mark_save_dirty();
+    
+    if(!load_strings_tsv(temppath))
+    {
+        char name[256];
+        extract_name(temppath,name,FILENAMEALL);
+        InfoDialog("Error",fmt::format("Unable to load {}",name)).show();
+    }
+    
+    return D_O_K;
+}
+
+int32_t onExport_StringsTSV()
+{
+    if(!prompt_for_new_file_compat("Export Strings (.tsv)","tsv",NULL,datapath,false))
+        return D_O_K;
+        
+    char name[256];
+    extract_name(temppath,name,FILENAMEALL);
+    
+    if(save_strings_tsv(temppath))
+		InfoDialog("ZQuest", fmt::format("Saved {}", name)).show();
+    else
+		InfoDialog("Error", fmt::format("Error saving {}", name)).show();
+    return D_O_K;
+}
+
+
+int32_t onExport_MsgsText()
+{
+    if(!prompt_for_new_file_compat("Export Text Dump (.txt)","txt",NULL,datapath,false))
+        return D_O_K;
+        
+    char name[256];
+    extract_name(temppath,name,FILENAMEALL);
+    
+    if(save_msgstrs_text(temppath))
+		InfoDialog("ZQuest", fmt::format("Saved {}", name)).show();
+    else
+		InfoDialog("Error", fmt::format("Error saving {}", name)).show();
+    return D_O_K;
+}
+
+int32_t onImport_Combos()
+{
+	writesomecombos("Load Combo Set", 0);
+	return D_O_K;
+	
+}
+
+
+int32_t onExport_Combos()
+{
+    if(!prompt_for_new_file_compat("Export Combos (.zcombo)","zcombo",NULL,datapath,false))
+        return D_O_K;
+        
+    char name[256];
+    extract_name(temppath,name,FILENAMEALL);
+    
+    //writetilefile(f,first_tile_id,the_tile_count);
+    
+	PACKFILE *f=zalleg_pack_fopen_password(temppath,F_WRITE, "");
+	if(f)
+	{
+		writecombofile(f,0,MAXCOMBOS);
+		pack_fclose(f);
+		
+		InfoDialog("Success!",fmt::format("Saved {}",name)).show();
+	}
+	else
+		InfoDialog("Error",fmt::format("Error saving {}",name)).show();
+    
+    return D_O_K;
+}
+
+int32_t onImport_Tiles()
+{
+	int dest_page;
+	if(auto num = call_get_num("Destination Page", 0, TILE_PAGES-1))
+		dest_page = *num;
+	else return D_O_K;
+
+	if(!prompt_for_existing_file_compat("Import Tiles (.ztileset)","ztileset",NULL,datapath,false))
+		return D_O_K;
+
+	mark_save_dirty();
+	char name[256];
+	extract_name(temppath,name,FILENAMEALL);
+	PACKFILE *f=zalleg_pack_fopen_password(temppath,F_READ, "");
+	if(f)
+	{
+		if(!readtilefile_to_location(f, dest_page * TILES_PER_PAGE))
+			InfoDialog("Error",fmt::format("Unable to load {}",name)).show();
+		else
+			InfoDialog("Success!",fmt::format("Loaded {}",name)).show();
+		pack_fclose(f);
+	}
+
+	refresh(rALL);
+	return D_O_K;
+}
+
+int32_t onExport_Tiles()
+{
+	int start_page, page_count;
+	if(auto num = call_get_num("Start Page", 0, TILE_PAGES-1))
+		start_page = *num;
+	else return D_O_K;
+	if(auto num = call_get_num("Page Count", 1, TILE_PAGES - start_page))
+		page_count = *num;
+	else return D_O_K;
+
+	if(!prompt_for_new_file_compat("Export Tiles (.ztileset)","ztileset",NULL,datapath,false))
+		return D_O_K;
+
+	char name[256];
+	extract_name(temppath,name,FILENAMEALL);
+	PACKFILE *f=zalleg_pack_fopen_password(temppath,F_WRITE, "");
+	if(f)
+	{
+		writetilefile(f, start_page * TILES_PER_PAGE, page_count * TILES_PER_PAGE);
+		pack_fclose(f);
+		InfoDialog("Success!",fmt::format("Saved {}", name)).show();
+	}
+	else
+		InfoDialog("Error", fmt::format("Error saving {}", name)).show();
+
+	return D_O_K;
+}
+
+int32_t onImport_Guys()
+{
+    if(!prompt_for_existing_file_compat("Import Enemies (.guy)","guy",NULL,datapath,false))
+        return D_O_K;
+        
+    if(!load_guys(temppath))
+    {
+        char name[256];
+        extract_name(temppath,name,FILENAMEALL);
+        InfoDialog("Error",fmt::format("Unable to load {}",name)).show();
+    }
+    
+    refresh(rALL);
+    return D_O_K;
+}
+
+int32_t onExport_Guys()
+{
+    if(!prompt_for_new_file_compat("Export Enemies (.guy)","guy",NULL,datapath,false))
+        return D_O_K;
+        
+    char name[256];
+    extract_name(temppath,name,FILENAMEALL);
+    
+    if(save_guys(temppath))
+		InfoDialog("ZQuest", fmt::format("Saved {}", name)).show();
+    else
+		InfoDialog("Error", fmt::format("Error saving {}", name)).show();
+    return D_O_K;
+}
+
+
+
+
+
+bool save_combo_alias(const char *path);
+bool load_combo_alias(const char *path);
+int32_t onImport_ComboAlias()
+{
+    if(!prompt_for_existing_file_compat("Import Combo Alias (.zca)","zca",NULL,datapath,false))
+        return D_O_K;
+        
+    if(!load_combo_alias(temppath))
+    {
+        char name[256];
+        extract_name(temppath,name,FILENAMEALL);
+        InfoDialog("Error",fmt::format("Unable to load {}",name)).show();
+    }
+    
+    refresh(rALL);
+    return D_O_K;
+}
+
+int32_t onExport_ComboAlias()
+{
+    if(!prompt_for_new_file_compat("Export Combo Alias (.zca)","zca",NULL,datapath,false))
+        return D_O_K;
+        
+    char buf[256+20],buf2[256+20],name[256];
+    extract_name(temppath,name,FILENAMEALL);
+    
+    if(save_combo_alias(temppath))
+		InfoDialog("ZQuest", fmt::format("Saved {}", name)).show();
+    else
+		InfoDialog("Error", fmt::format("Error saving {}", name)).show();
+    return D_O_K;
+}
+
+int32_t onImport_ZGP()
+{
+    if(!prompt_for_existing_file_compat("Import Graphics Pack (.zgp)","zgp",NULL,datapath,false))
+        return D_O_K;
+        
+    mark_save_dirty();
+    
+    if(!load_zgp(temppath))
+    {
+        char name[256];
+        extract_name(temppath,name,FILENAMEALL);
+        InfoDialog("Error", fmt::format("Unable to load {}",name)).show();
+    }
+    
+    refresh(rALL);
+    return D_O_K;
+}
+
+int32_t onExport_ZGP()
+{
+    if(!prompt_for_new_file_compat("Export Graphics Pack (.zgp)","zgp",NULL,datapath,false))
+        return D_O_K;
+        
+    char name[256];
+    extract_name(temppath,name,FILENAMEALL);
+    
+    if(save_zgp(temppath))
+		InfoDialog("ZQuest", fmt::format("Saved {}", name)).show();
+    else
+		InfoDialog("Error", fmt::format("Error saving {}", name)).show();
+    return D_O_K;
+}
+
+//Doorsets
+int32_t readzdoorsets(PACKFILE *f, int32_t first, int32_t count, int32_t deststart)
+{
+	dword section_version=0;
+	int32_t zversion = 0;
+	int32_t zbuild = 0;
+	int32_t doorscount = 0;
+	int32_t lastset = 0;
+	int32_t firstset = 0;
+	int32_t last = 0;
+	int32_t ret = 1;
+
+	if(!p_igetl(&zversion,f))
+	{
+		return 0;
+	}
+	if(!p_igetl(&zbuild,f))
+	{
+		return 0;
+	}
+	if(!p_igetw(&section_version,f))
+	{
+		return 0;
+	}
+	if(!read_deprecated_section_cversion(f))
+	{
+		return 0;
+	}
+	if(!p_igetl(&doorscount,f))
+	{
+		return 0;
+	}
+	al_trace("doorscount is: %d\n", doorscount);
+	if(!p_igetl(&firstset,f))
+	{
+		return 0;
+	}
+	if(!p_igetl(&last,f))
+	{
+		return 0;
+	}
+	//if the params passed would be invalid:
+	if ( first < firstset || first >= door_combo_set_count ) 
+	{
+		first = firstset;
+	}
+	if ( lastset < 0 || lastset > count )
+	{
+		lastset = doorscount;
+	}
+	else
+	{
+		lastset = firstset + count;
+	}
+	//end params sanity guard
+	if ( zversion > ZELDA_VERSION )
+	{
+		al_trace("Cannot read .zdoors packfile made in ZC version (%x) in this version of ZC (%x)\n", zversion, ZELDA_VERSION);
+		return 0;
+	}
+	
+	else if ( ( section_version > V_DOORS ))
+	{
+		al_trace("Cannot read .zdoors packfile made using V_DOORS (%d)\n", section_version);
+		return 0;
+		
+	}
+	else
+	{
+		al_trace("Reading a .zdoors packfile made in ZC Version: %x, Build: %d\n", zversion, zbuild);
+	}
+	
+	//section data for doors
+	for(int32_t i=firstset+deststart; i<lastset+deststart; ++i)
+	{
+		if(i+deststart >= door_combo_set_count)
+		{
+			al_trace("Reached the current door count trying to import doorsets.\n");
+			ret = 2; break;
+		}
+		al_trace("Door readcycle %d\n", i-deststart);
+		if (read_door_entry(f, i, ZELDA_VERSION, false))
+			return 0;
+	}
+	return ret;
+}
+
+
+int32_t writezdoorsets(PACKFILE *f, int32_t first = 0, int32_t count = door_combo_set_count)
+{
+	dword section_version=V_DOORS;
+	int32_t zversion = ZELDA_VERSION;
+	int32_t zbuild = VERSION_BUILD;
+	int32_t doorscount = door_combo_set_count;
+	int32_t firstset = first;
+	int32_t lastset = count;
+	
+	if(!p_iputl(zversion,f))
+	{
+		return 0;
+	}
+	if(!p_iputl(zbuild,f))
+	{
+		return 0;
+	}
+	if(!p_iputw(section_version,f))
+	{
+		return 0;
+	}
+	if(!write_deprecated_section_cversion(section_version,f))
+	{
+		return 0;
+	}
+	if(!p_iputl(doorscount,f))
+	{
+		return 0;
+	}
+	if(!p_iputl(firstset,f))
+	{
+		return 0;
+	}
+	if(!p_iputl(lastset,f))
+	{
+		return 0;
+	}
+	//if the params passed would be invalid:
+	if ( firstset < 0 || firstset >= doorscount )
+	{
+		firstset = 0;
+	}
+	if ( lastset < 1 || lastset >= doorscount )
+	{
+		lastset = doorscount;
+	}
+	else
+	{
+		lastset = firstset + count;
+	}
+	//end params sanity guard
+	
+	for(int32_t i=firstset; i<lastset; ++i)
+	{
+		al_trace("Door writecycle %d\n", i);
+		if (write_door_entry(f, i))
+			return 0;
+	}
+	return 1;
+}
+
+
+
+
+int32_t writeonezdoorset(PACKFILE *f, int32_t index)
+{
+	dword section_version=V_DOORS;
+	int32_t zversion = ZELDA_VERSION;
+	int32_t zbuild = VERSION_BUILD;
+	int32_t doorscount = 1;
+	int32_t firstset = 0;
+	int32_t lastset = 1;
+
+	if(!p_iputl(zversion,f))
+	{
+		return 0;
+	}
+	if(!p_iputl(zbuild,f))
+	{
+		return 0;
+	}
+	if(!p_iputw(section_version,f))
+	{
+		return 0;
+	}
+	if(!write_deprecated_section_cversion(section_version,f))
+	{
+		return 0;
+	}
+	if(!p_iputl(doorscount,f))
+	{
+		return 0;
+	}
+	if(!p_iputl(firstset,f))
+	{
+		return 0;
+	}
+	if(!p_iputl(lastset,f))
+	{
+		return 0;
+	}
+	if (write_door_entry(f, index))
+		return 0;
+	return 1;
+}
+
+
+
+
+int32_t readonezdoorset(PACKFILE *f, int32_t index)
+{
+	dword section_version=0;
+	int32_t zversion = 0;
+	int32_t zbuild = 0;
+	int32_t doorscount = 0;
+	int32_t firstset = 0;
+	int32_t last = 0;
+	int32_t ret = 1;
+
+	if(!p_igetl(&zversion,f))
+	{
+		return 0;
+	}
+	if(!p_igetl(&zbuild,f))
+	{
+		return 0;
+	}
+	if(!p_igetw(&section_version,f))
+	{
+		return 0;
+	}
+	if(!read_deprecated_section_cversion(f))
+	{
+		return 0;
+	}
+	if(!p_igetl(&doorscount,f))
+	{
+		return 0;
+	}
+	al_trace("doorscount is: %d\n", doorscount);
+	if(!p_igetl(&firstset,f))
+	{
+		return 0;
+	}
+	if(!p_igetl(&last,f))
+	{
+		return 0;
+	}
+	
+	if ( zversion > ZELDA_VERSION )
+	{
+		al_trace("Cannot read .zdoors packfile made in ZC version (%x) in this version of ZC (%x)\n", zversion, ZELDA_VERSION);
+		return 0;
+	}
+	
+	else if ( ( section_version > V_DOORS ))
+	{
+		al_trace("Cannot read .zdoors packfile made using V_DOORS (%d)\n", section_version);
+		return 0;
+		
+	}
+	else
+	{
+		al_trace("Reading a .zdoors packfile made in ZC Version: %x, Build: %d\n", zversion, zbuild);
+	}
+	
+	if (read_door_entry(f, index, ZELDA_VERSION, false))
+		return 0;
+	return ret;
+}
+
+int32_t onExport_Doorset()
+{
+	do_exportdoorset("Export Doorsets", 0);
+	return D_O_K;
+}
+int32_t onImport_Doorset()
+{
+	do_importdoorset("Import Doorsets", 0);
+	return D_O_K;
+}
+
+void center_zq_files_dialogs()
+{
+    jwin_center_dialog(ruleset_dlg);
+    jwin_center_dialog(import_map_bias_dlg);
+}

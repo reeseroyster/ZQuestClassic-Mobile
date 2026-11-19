@@ -1,0 +1,217 @@
+[spurious_branches] Block #0
+
+7: LOAD            D2               5      
+8: CASTBOOLF       D2              
+	D2 = Bool(D2)
+9: COMPAREV        D2               1      
+	D2 = Bool(D2)
+10: SETMORE         D2              
+	D2 = Bool(D2)
+11: COMPAREV        D2               1      
+	D2 = Bool(D2)
+12: GOTOMORE        16              
+	D2 = Bool(D2)
+inferred D2: 1
+16: SETMORE         D2              
+	D2 = 1
+17: COMPAREV        D2               0      
+	D2 = 1
+18: GOTOCMP         20               ==     
+	D2 = 1
+19: SETV            D2               1      
+	D2 = 1
+20: RETURNFUNC     
+	D2 = 1
+	side_effects
+rewrite 12: GOTOCMP         19               >=     
+
+[reduce_comparisons] Block #0
+
+8: CASTBOOLF       D2              
+	D2 = Bool(D2)
+9: COMPAREV        D2               1      
+	D2 = Bool(D2)
+10: SETMORE         D2              
+	D2 = Bool(D2)
+11: COMPAREV        D2               1      
+	D2 = Bool(D2)
+12: GOTOCMP         19               >=     
+	D2 = Bool(D2)
+rewrite 8: 5 -> 2 commands
+8: COMPAREV        D2               0      
+9: GOTOCMP         19               !=     
+10: NOP            
+11: NOP            
+12: NOP            
+
+[reduce_comparisons] Block #1
+
+14: CASTBOOLF       D2              
+	D2 = Bool(D2)
+15: COMPAREV        D2               1      
+	D2 = Bool(D2)
+16: SETMORE         D2              
+	D2 = Bool(D2)
+17: COMPAREV        D2               0      
+	D2 = Bool(D2)
+18: GOTOCMP         20               ==     
+	D2 = Bool(D2)
+rewrite 14: 5 -> 3 commands
+14: COMPAREV        D2               0      
+15: SETCMP          D2               !=     
+16: GOTOCMP         20               ==     
+17: NOP            
+18: NOP            
+
+[spurious_branches] Block #0
+
+21: LOAD            D2               0      
+22: LOAD            D3               1      
+23: COMPARER        D3               D2     
+24: SETMORE         D2              
+	D2 = D3 >= D2
+25: COMPAREV        D2               0      
+	D2 = D3 >= D2
+26: SETTRUEI        D2              
+	D2 = D3 I< D2
+27: COMPAREV        D2               1      
+	D2 = D3 I< D2
+28: GOTOCMP         30               >=     
+	D2 = D3 I< D2
+inferred D2: 10000
+30: SETMOREI        D2              
+	D2 = 10000
+31: COMPAREV        D2               0      
+	D2 = 10000
+32: SETTRUEI        D2              
+	D2 = 0
+33: GOTO            35              
+	D2 = 0
+35: RETURNFUNC     
+	D2 = 0
+	side_effects
+rewrite 28: GOTOCMP         30               >=     
+
+[reduce_comparisons] Block #0
+
+23: COMPARER        D3               D2     
+24: SETMORE         D2              
+	D2 = D3 >= D2
+25: COMPAREV        D2               0      
+	D2 = D3 >= D2
+26: SETTRUEI        D2              
+	D2 = D3 I< D2
+27: COMPAREV        D2               1      
+	D2 = D3 I< D2
+28: GOTOCMP         30               >=     
+	D2 = D3 I< D2
+
+[reduce_comparisons] Block #0
+
+25: COMPAREV        D2               0      
+26: SETTRUEI        D2              
+	D2 = !IBool(D2)
+27: COMPAREV        D2               1      
+	D2 = !IBool(D2)
+28: GOTOCMP         30               >=     
+	D2 = !IBool(D2)
+
+[reduce_comparisons] Block #0
+
+27: COMPAREV        D2               1      
+28: GOTOCMP         30               >=     
+
+[spurious_branches] Block #0
+
+36: SETV            D3               5      
+	D3 = 5
+37: COMPAREV        D3               10     
+	D3 = 5
+38: SETLESS         D2              
+	D2 = 1
+	D3 = 5
+39: COMPAREV        D2               0      
+	D2 = 1
+	D3 = 5
+40: GOTOTRUE        43              
+	D2 = 1
+	D3 = 5
+inferred D2: 0
+43: SETV            D2               99     
+	D2 = 99
+	D3 = 5
+44: RETURNFUNC     
+	D2 = 99
+	D3 = 5
+	side_effects
+rewrite 40: GOTOCMP         43               ==     
+
+[reduce_comparisons] Block #0
+
+37: COMPAREV        D3               10     
+38: SETLESS         D2              
+	D2 = D3 <= 10
+39: COMPAREV        D2               0      
+	D2 = D3 <= 10
+40: GOTOCMP         43               ==     
+	D2 = D3 <= 10
+rewrite 37: 4 -> 3 commands
+37: COMPAREV        D3               10     
+38: SETCMP          D2               <=     
+39: GOTOCMP         43               >      
+40: NOP            
+Function run_none-0
+    0: CALLFUNC        7                            [Block 0 -> ][Function #1]
+    1: TRACER          D2
+    2: CALLFUNC        21                           [Function #2]
+    3: TRACER          D2
+    4: CALLFUNC        36                           [Function #3]
+    5: TRACER          D2
+    6: QUIT
+
+
+Function Function #1
+    7: LOAD            D2               5           [Block 0 -> 1, 3]
+    8: COMPAREV        D2               0
+    9: GOTOCMP         19               !=
+   10: NOP                                          [Block 1 -> 2, 4]
+   11: NOP
+   12: NOP
+   13: LOAD            D2               6
+   14: COMPAREV        D2               0
+   15: SETCMP          D2               !=
+   16: GOTOCMP         20               ==
+   17: NOP                                          [Block 2 -> 3]
+   18: NOP
+   19: SETV            D2               1           [Block 3 -> 4]
+   20: RETURNFUNC                                   [Block 4 -> ]
+
+
+Function Function #2
+   21: LOAD            D2               0           [Block 0 -> 1, 2]
+   22: LOAD            D3               1
+   23: COMPARER        D3               D2
+   24: SETMORE         D2
+   25: COMPAREV        D2               0
+   26: SETTRUEI        D2
+   27: COMPAREV        D2               1
+   28: GOTOCMP         30               >=
+   29: TRACEV          1                            [Block 1 -> 2]
+   30: SETMOREI        D2                           [Block 2 -> 4]
+   31: COMPAREV        D2               0
+   32: SETTRUEI        D2
+   33: GOTO            35
+   34: NOP                                          [Block 3 -> 4]
+   35: RETURNFUNC                                   [Block 4 -> ]
+
+
+Function Function #3
+   36: SETV            D3               5           [Block 0 -> 1, 2]
+   37: COMPAREV        D3               10
+   38: SETCMP          D2               <=
+   39: GOTOCMP         43               >
+   40: NOP                                          [Block 1 -> ]
+   41: TRACER          D2
+   42: QUIT
+   43: SETV            D2               99          [Block 2 -> ]
+   44: RETURNFUNC

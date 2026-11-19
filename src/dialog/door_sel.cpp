@@ -1,0 +1,151 @@
+#include "door_sel.h"
+#include "gui/builder.h"
+#include "gui/key.h"
+#include "zc_list_data.h"
+#include "zq/render.h"
+#include "zq/zq_misc.h"
+#include "zq/zquest.h"
+
+using std::string;
+using std::to_string;
+
+void mark_save_dirty();
+
+void set_dlg_active(bool active)
+{
+	pause_dlg_tint(active);
+	zq_set_screen_never_freeze(active);
+}
+#define DOORSEL_INFOBTN(inf) \
+Button(forceFitH = true, text = "?", \
+	onClick = message::REFR_INFO, \
+	onPressFunc = [=]() \
+	{ \
+		set_dlg_active(false); \
+		InfoDialog("Info",inf).show(); \
+		set_dlg_active(true); \
+	})
+
+bool call_doorseldialog()
+{
+	set_dlg_active(true);
+	Map.StartListCommand();
+	DoorSelDialog(*Map.CurrScr()).show();
+	set_dlg_active(false);
+	return true;
+}
+
+DoorSelDialog::DoorSelDialog(mapscr const& ref) :
+	list_doortypes(GUI::ZCListData::doortypes()),
+	list_doorsets(GUI::ZCListData::doorsets()),
+	screen(ref)
+{
+	door_combo_set = (old_door_combo_set = screen.door_combo_set);
+	for (int q = 0; q < 4; q++)
+		doors[q] = screen.door[q];;
+}
+
+static void redraw_to_bg_bitmap()
+{
+	// Temporarily point 'screen' to the background layer so refresh()
+	// doesn't dump opaque black map pixels onto the transparent dialog overlay.
+	BITMAP* active_dlg_bmp = screen;
+	if (zqdialog_bg_bmp) screen = zqdialog_bg_bmp;
+	refresh(rMAP | rNOCURSOR);
+	screen = active_dlg_bmp;
+}
+
+void DoorSelDialog::set_doors()
+{
+	//Recover the combos that were there previously!
+	Map.RevokeListCommand();
+	Map.StartListCommand();
+	Map.DoSetDCSCommand(door_combo_set);
+	for (int q = 0; q < 4; q++)
+		Map.DoPutDoorCommand(q,doors[q],door_combo_set!=old_door_combo_set);
+	redraw_to_bg_bitmap();
+}
+
+std::shared_ptr<GUI::Widget> DoorSelDialog::DoorDDL(byte dir)
+{
+	using namespace GUI::Builder;
+	using namespace GUI::Props;
+
+	return DropDownList(
+		data = list_doortypes,
+		selectedValue = doors[dir],
+		minwidth = 6_em,
+		onSelectFunc = [&, dir](int32_t val)
+		{
+			doors[dir] = val;
+			set_doors();
+		}
+	);
+}
+
+std::shared_ptr<GUI::Widget> DoorSelDialog::view()
+{
+	using namespace GUI::Builder;
+	using namespace GUI::Props;
+	using namespace GUI::Key;
+
+	window = Window(
+		title = "Select Door",
+		onClose = message::CANCEL,
+		Column(
+			Label(text = "Note: This only applies to 'NES Dungeon style' screens!"),
+			Column(
+				DoorDDL(up),
+				Row(DoorDDL(left), DoorDDL(right)),
+				DoorDDL(down)
+			),
+			Rows<2>(
+				Label(text = "Door Combo Set"),
+				DropDownList(
+					data = list_doorsets,
+					selectedValue = door_combo_set,
+					fitParent = true,
+					onSelectFunc = [&](int32_t val) {
+						door_combo_set = val;
+						set_doors();
+					}
+				)
+			),
+			Row(hPadding = 1_em,
+				Button(width = 90_px, text = "Ok", onClick = message::OK),
+				Button(width = 90_px, text = "Clear", onClick = message::CLEAR),
+				Button(width = 90_px, text = "Cancel", onClick = message::CANCEL)
+			)
+		)
+	);
+
+	return window;
+}
+
+bool DoorSelDialog::handleMessage(const GUI::DialogMessage<message>& msg)
+{
+	switch (msg.message)
+	{
+		case message::CLEAR:
+		{
+			for (int q = 0; q < 4; q++)
+				doors[q] = dNONE;
+			set_doors();
+			rerun_dlg = true;
+			return true;
+		}
+		case message::OK:
+		{
+			Map.FinishListCommand();
+			mark_save_dirty();
+			return true;
+		}
+		case message::CANCEL:
+		default:
+		{
+			Map.RevokeListCommand();
+			return true;
+		}
+	}
+}
+

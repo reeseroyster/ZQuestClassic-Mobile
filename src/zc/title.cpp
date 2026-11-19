@@ -1,0 +1,2495 @@
+#include <cmath>
+#include <filesystem>
+#include <stdio.h>
+#include <ctype.h>
+#include <cstring>
+#include <memory>
+#include "base/util.h"
+#include "core/hotkey.h"
+#include "zalleg/files.h"
+#include "core/fonts.h"
+#include "zalleg/render.h"
+#include "base/zapp.h"
+#include "zalleg/zalleg.h"
+#include "core/qrs.h"
+#include "zalleg/packfile.h"
+#include "core/dmap.h"
+#include "core/misctypes.h"
+
+#include "core/zdefs.h"
+#include "music_playback.h"
+#include "components/sound/zcmusic.h"
+#include "subscr.h"
+#include "zc/control_scheme.h"
+#include "zc/replay.h"
+#include "zc/replay_upload.h"
+#include "zc/zc_sys.h"
+#include "zcsfx.h"
+#include "zc/zelda.h"
+#include "zalleg/zsys.h"
+#include "core/qst.h"
+#include "tiles.h"
+#include "pal.h"
+#include "zalleg/gui.h"
+#include "zc/title.h"
+#include "zc/ffscript.h"
+#include "zc/saves.h"
+#include "zc/render.h"
+#include "dialog/info.h"
+#include "zinfo.h"
+#include "zc/zscriptversion.h"
+#include <fmt/format.h>
+
+#ifdef __EMSCRIPTEN__
+#include "base/emscripten_utils.h"
+#endif
+
+extern std::string loadlast;
+extern int32_t skipcont;
+
+enum class CursorTarget
+{
+	SaveSlot,
+	MenuAction
+};
+
+enum class TitleMenuActionType
+{
+	NewFile = 3,
+	CopyFile = 4,
+	DeleteFile = 5
+};
+
+enum class TitleMenuMode
+{
+	Normal = 0,
+	Copy = 2,
+	Delete = 3
+};
+
+struct TitleMenuState
+{
+	CursorTarget target = CursorTarget::SaveSlot;
+	int selected_save_index = 0;
+	TitleMenuActionType selected_action = TitleMenuActionType::NewFile;
+	TitleMenuMode mode = TitleMenuMode::Normal;
+
+	int get_page_start() const
+	{
+		return (selected_save_index / 3) * 3;
+	}
+
+	int get_ui_pos() const
+	{
+		if (mode != TitleMenuMode::Normal || target == CursorTarget::SaveSlot)
+			return selected_save_index - get_page_start();
+
+		return static_cast<int>(selected_action);
+	}
+
+	void move_up(int total_saves)
+	{
+		if (mode != TitleMenuMode::Normal)
+		{
+			int offset = selected_save_index - get_page_start();
+
+			if (offset > 0)
+				selected_save_index--;
+			else
+				selected_save_index = get_page_start() + 2;
+		}
+		else
+		{
+			if (target == CursorTarget::MenuAction)
+			{
+				if (selected_action == TitleMenuActionType::NewFile)
+				{
+					target = CursorTarget::SaveSlot;
+					selected_save_index = get_page_start() + 2;
+				}
+				else if (selected_action == TitleMenuActionType::CopyFile)
+					selected_action = TitleMenuActionType::NewFile;
+				else if (selected_action == TitleMenuActionType::DeleteFile)
+					selected_action = TitleMenuActionType::CopyFile;
+			}
+			else
+			{
+				int offset = selected_save_index - get_page_start();
+
+				if (offset > 0)
+					selected_save_index--;
+				else
+				{
+					target = CursorTarget::MenuAction;
+					selected_action = TitleMenuActionType::DeleteFile;
+				}
+			}
+		}
+
+		if (target == CursorTarget::SaveSlot && selected_save_index >= total_saves)
+			selected_save_index = total_saves > 0 ? total_saves - 1 : 0;
+	}
+
+	void move_down(int total_saves)
+	{
+		if (mode != TitleMenuMode::Normal)
+		{
+			int offset = selected_save_index - get_page_start();
+
+			if (offset < 2)
+				selected_save_index++;
+			else
+				selected_save_index = get_page_start();
+		}
+		else
+		{
+			if (target == CursorTarget::SaveSlot)
+			{
+				int offset = selected_save_index - get_page_start();
+
+				if (offset < 2 && selected_save_index + 1 < total_saves)
+					selected_save_index++;
+				else
+				{
+					target = CursorTarget::MenuAction;
+					selected_action = TitleMenuActionType::NewFile;
+				}
+			}
+			else
+			{
+				if (selected_action == TitleMenuActionType::NewFile)
+					selected_action = TitleMenuActionType::CopyFile;
+				else if (selected_action == TitleMenuActionType::CopyFile)
+					selected_action = TitleMenuActionType::DeleteFile;
+				else if (selected_action == TitleMenuActionType::DeleteFile)
+				{
+					target = CursorTarget::SaveSlot;
+					selected_save_index = get_page_start();
+				}
+			}
+		}
+
+		if (target == CursorTarget::SaveSlot && selected_save_index >= total_saves)
+			selected_save_index = total_saves > 0 ? total_saves - 1 : 0;
+	}
+
+	void page_left()
+	{
+		if (selected_save_index >= 3)
+			selected_save_index -= 3;
+	}
+
+	void page_right(int total_saves)
+	{
+		if (get_page_start() + 3 < total_saves)
+			selected_save_index += 3;
+	}
+
+	void validate_bounds(int total_saves)
+	{
+		if (total_saves == 0)
+			selected_save_index = 0;
+		else if (selected_save_index >= total_saves)
+			selected_save_index = total_saves - 1;
+	}
+};
+
+static void select_mode()
+{
+	textout_ex(scrollbuf,get_zc_font(font_zfont),"NEW FILE",48,152,1,0);
+	textout_ex(scrollbuf,get_zc_font(font_zfont),"COPY FILE",48,168,1,0);
+	textout_ex(scrollbuf,get_zc_font(font_zfont),"DELETE FILE",48,184,1,0);
+}
+
+static void register_mode()
+{
+	textout_ex(scrollbuf,get_zc_font(font_zfont),"NEW FILE",48,152,CSET(2)+3,0);
+}
+
+static void copy_mode()
+{
+	textout_ex(scrollbuf,get_zc_font(font_zfont),"COPY FILE",48,168,CSET(2)+3,0);
+}
+
+static void delete_mode()
+{
+	textout_ex(scrollbuf,get_zc_font(font_zfont),"DELETE FILE",48,184,CSET(2)+3,0);
+}
+
+static void framerect(BITMAP* dest, int32_t x, int32_t y, int32_t w, int32_t h, int32_t c)
+{
+	BITMAP* temp = create_bitmap_ex(8, dest->w, dest->h);
+	clear_bitmap(temp);
+	rect(temp, x, y, x+w-1, y+h-1,c);
+	rect(temp, x+1, y+1, x+w-2, y+h-2,c);
+	temp->line[y][x] = 0;
+	temp->line[y][x+w-1] = 0;
+	temp->line[y+h-1][x] = 0;
+	temp->line[y+h-1][x+w-1] = 0;
+	masked_blit(temp, dest, x, y, x, y, w, h);
+	destroy_bitmap(temp);
+}
+
+// The logo art is far larger than it ever displays (2365x865, shown at most a few
+// hundred pixels tall). Sampling it directly at that minification aliases badly - and the
+// CRT overlay pass can't use mipmaps (WebGL1 disallows them on non-power-of-two textures) -
+// so scale it once at load, with linear filtering, to a size close to the largest it shows.
+static ALLEGRO_BITMAP* prescale_logo_bitmap(ALLEGRO_BITMAP* src, int target_h = 480)
+{
+	if (!src || al_get_bitmap_height(src) <= target_h)
+		return src;
+
+	int w = al_get_bitmap_width(src) * target_h / al_get_bitmap_height(src);
+	int prev_flags = al_get_new_bitmap_flags();
+	al_set_new_bitmap_flags(ALLEGRO_CONVERT_BITMAP | ALLEGRO_MIN_LINEAR | ALLEGRO_MAG_LINEAR);
+	ALLEGRO_BITMAP* out = al_create_bitmap(w, target_h);
+	al_set_new_bitmap_flags(prev_flags);
+	if (!out)
+		return src;
+
+	ALLEGRO_STATE oldstate;
+	al_store_state(&oldstate, ALLEGRO_STATE_TARGET_BITMAP | ALLEGRO_STATE_BLENDER);
+	zc_set_target_bitmap(out);
+	al_clear_to_color(al_map_rgba(0, 0, 0, 0));
+	al_set_blender(ALLEGRO_ADD, ALLEGRO_ONE, ALLEGRO_ZERO);
+	al_draw_scaled_bitmap(src, 0, 0, al_get_bitmap_width(src), al_get_bitmap_height(src), 0, 0, w, target_h, 0);
+	al_restore_state(&oldstate);
+	al_destroy_bitmap(src);
+	return out;
+}
+
+static RenderTreeItem* get_logo()
+{
+	static std::string logo_path;
+	if (logo_path.empty())
+	{
+		if (exists("assets/logo.png"))
+			logo_path = "assets/logo.png";
+		else
+			logo_path = "assets/zc/ZC_Logo.png";
+	}
+
+	static RenderTreeItem rti_logo("logo");
+	static ALLEGRO_BITMAP* logo_bitmap = prescale_logo_bitmap(al_load_bitmap(logo_path.c_str()));
+
+	if (logo_bitmap)
+	{
+		// Display-only: no size is set, so the framework never touches the bitmap.
+		rti_logo.bitmap = logo_bitmap;
+		// Under a CRT filter, composite at the bitmap's own resolution rather than being
+		// baked into the (chunky) game-resolution layer.
+		rti_logo.fullres_overlay = true;
+		// The crawl starts below the game viewport - mask it until it enters, rather than
+		// letting it ride up over the letterbox border.
+		rti_logo.clip_to_parent = true;
+		rti_game.add_child(&rti_logo);
+	}
+
+	return &rti_logo;
+}
+
+static void selectscreen()
+{
+	FFCore.kb_typing_mode = false;
+	if (get_qr(qr_OLD_SCRIPT_VOLUME))
+	{
+		if (FFCore.coreflags & FFCORE_SCRIPTED_MIDI_VOLUME)
+		{
+			Z_scripterrlog("Trying to restore master MIDI volume to: %d\n", FFCore.usr_midi_volume);
+			midi_volume = FFCore.usr_midi_volume;
+			//master_volume(-1,FFCore.usr_midi_volume);
+		}
+		if (FFCore.coreflags & FFCORE_SCRIPTED_DIGI_VOLUME)
+		{
+			digi_volume = FFCore.usr_digi_volume;
+			//master_volume((int32_t)(FFCore.usr_digi_volume),1);
+		}
+		if (FFCore.coreflags & FFCORE_SCRIPTED_MUSIC_VOLUME)
+		{
+			emusic_volume = (int32_t)FFCore.usr_music_volume;
+		}
+		if (FFCore.coreflags & FFCORE_SCRIPTED_SFX_VOLUME)
+		{
+			sfx_volume = (int32_t)FFCore.usr_sfx_volume;
+		}
+	}
+	if ( FFCore.coreflags&FFCORE_SCRIPTED_PANSTYLE )
+	{
+		pan_style = (int32_t)FFCore.usr_panstyle;
+	}
+	FFCore.skip_ending_credits = 0;
+	init_NES_mode();
+	loadfullpal();
+	loadlvlpal(1);
+	Bwpn = Awpn = Xwpn = Ywpn = {}; //the subsreen values
+	clear_bitmap(scrollbuf);
+	
+	framerect(scrollbuf, 27, 51, 26*8-6, 20*8-6,0x03);
+	
+	textout_ex(scrollbuf,get_zc_font(font_zfont)," NAME ",80,48,1,0);
+	textout_ex(scrollbuf,get_zc_font(font_zfont)," LIFE ",152,48,1,0);
+
+	auto logo = get_logo();
+	if (logo->bitmap)
+	{
+		static float aspect_ratio = (float)al_get_bitmap_width(logo->bitmap) / al_get_bitmap_height(logo->bitmap);
+
+		int target_height = 46;
+		int target_width = target_height * aspect_ratio;
+		float scale = (float)target_height / al_get_bitmap_height(logo->bitmap);
+		int x = (framebuf->w - target_width) / 2;
+		logo->set_transform({.x = (float)x, .y = 0, .xscale = scale, .yscale = scale});
+	}
+	else
+	{
+		textout_ex(scrollbuf,get_zc_font(font_zfont),"- S E L E C T -",64,24,1,0);
+	}
+
+	select_mode();
+	RAMpal[CSET(9)+1]=NESpal(0x15);
+	RAMpal[CSET(9)+2]=NESpal(0x27);
+	RAMpal[CSET(9)+3]=NESpal(0x30);
+	RAMpal[CSET(13)+1]=NESpal(0x30);
+}
+
+static byte left_arrow_str[] = {132,0};
+static byte right_arrow_str[] = {133,0};
+
+static int sels_herotile = 237;
+static int sels_hero_cset = 0;
+
+static void list_save(gamedata_header* header, int32_t save_num, int32_t ypos)
+{
+	bool r = refreshpal;
+	byte quest = header->quest;
+
+	game->set_maxlife(header->maxlife);
+	game->set_life(header->maxlife);
+	game->set_hp_per_heart(header->hp_per_heart_container);
+
+	lifemeter(framebuf,144,ypos+((game->get_maxlife()>16*(header->hp_per_heart_container))?8:0),8,0);
+	textout_ex(framebuf,get_zc_font(font_zfont),header->name.c_str(),72,ypos+16,1,0);
+	
+	if(quest)
+		textprintf_ex(framebuf,get_zc_font(font_zfont),72,ypos+24,1,0,"%5d",header->deaths);
+
+	textprintf_ex(framebuf,get_zc_font(font_zfont),72,ypos+16,1,0,"%s",header->name.c_str());
+
+	byte temp_bytes[256];
+	{
+		byte *si = header->icon + 128;
+		byte *di = temp_bytes + 256;
+		
+		for(int i=127; i>=0; --i)
+		{
+			(*(--di)) = (*(--si)) >> 4;
+			(*(--di)) = (*si) & 15;
+		}
+	}
+
+	byte *hold = newtilebuf[0].data;
+	byte holdformat=newtilebuf[0].format;
+	newtilebuf[0].format=tf4Bit;
+	newtilebuf[0].data = temp_bytes;
+	overtile16(framebuf,(sels_herotile > 1 && quest > 0 && quest < 255 ) ? sels_herotile : 0,48,ypos+17,
+	((unsigned)sels_hero_cset < 15 && quest > 0 && quest < 255 ) ? (unsigned)sels_hero_cset < 15 :
+	(save_num%3)+10,0);               //hero
+	newtilebuf[0].format=holdformat;
+	newtilebuf[0].data = hold;
+	
+	hold = colordata;
+	colordata = header->pal;
+	loadpalset((save_num%3)+10,0);
+	colordata = hold;
+	
+	textout_ex(framebuf,get_zc_font(font_zfont),"-",136,ypos+16,1,0);
+	
+	refreshpal = r;
+}
+
+static void list_saves(int page_start)
+{
+	// Fourth Quest turns the menu red.
+	bool red = false;
+
+	// First, make sure the presently listed quests are loaded.
+	int savecnt = saves_count();
+	for(int32_t i=0; i<3; i++)
+	{
+		int j = page_start + i;
+		if (j >= savecnt)
+			continue;
+
+		if (saves_has_error(j))
+			continue;
+
+		if (auto r = saves_get_slot(j); !r)
+		{
+			enter_sys_pal();
+			InfoDialog("Error loading save file", r.error()).show();
+			exit_sys_pal();
+		}
+	}
+
+	// Check if any loaded quests is the 4th quest.
+	for(int32_t i=0; i<savecnt; i++)
+	{
+		if (!saves_is_slot_loaded(i))
+			continue;
+
+		if (auto r = saves_get_slot(i); r && r.value()->header->quest == 4)
+		{
+			red = true;
+			break;
+		}
+	}
+
+	loadpalset(0,red ? pSprite(spPILE) : 0);
+	
+	for(int32_t i=0; i<3; i++)
+	{
+		int slot = page_start + i;
+		if (!saves_is_slot_loaded(slot))
+			continue;
+
+		save_t* save;
+		if (auto r = saves_get_slot(slot); !r)
+			continue;
+		else 
+			save = r.value();
+
+		list_save(save->header, slot, i * 24 + 56);
+	}
+	
+	// Draw the arrows above the lifemeter!
+	if(savecnt>3)
+	{
+		if (page_start >= 3)
+			textout_ex(framebuf, get_zc_font(font_zfont), (char *)left_arrow_str, 96, 60, 3, 0);
+			
+		if (page_start + 3 < savecnt)
+			textout_ex(framebuf, get_zc_font(font_zfont), (char *)right_arrow_str, 176, 60, 3, 0);
+			
+		textprintf_ex(framebuf, get_zc_font(font_zfont), 112, 60, 3, 0, "%2d - %-2d", page_start + 1, page_start + 3);
+	}
+}
+
+static void draw_cursor(int32_t pos,int32_t mode)
+{
+	int32_t cs = (mode==3)?13:9;
+	if(pos<3)
+		overtile8(framebuf,0,40,pos*24+77,cs,0);
+	else
+		overtile8(framebuf,0,40,(pos-3)*16+153,cs,0);
+}
+
+static bool register_name(TitleMenuState& state)
+{
+	int s = saves_count();
+
+	int32_t NameEntryMode2=NameEntryMode;
+
+	gamedata* new_game = new gamedata();
+	new_game->set_maxlife(3*16);
+	new_game->set_life(3*16);
+	new_game->set_maxbombs(8);
+	new_game->set_continue_dmap(0);
+	new_game->set_continue_scrn(0xFF);
+
+	// Navigate to the correct page for the new slot.
+	state.selected_save_index = s;
+	int page_start = state.get_page_start();
+
+//  clear_bitmap(framebuf);
+	rectfill(framebuf,32,56,223,151,0);
+	list_saves(page_start);
+	blit(framebuf,scrollbuf,0,0,0,0,framebuf->w,framebuf->h);
+	
+	int32_t pos=s%3;
+	int32_t y=((NameEntryMode2>0)?0:(pos*24))+72;
+	int32_t x=0;
+	int32_t spos=0;
+	char name[9];
+	
+	memset(name,0,9);
+	register_mode();
+	clear_keybuf();
+	SystemKeys=(NameEntryMode2>0);
+	refreshpal=true;
+	bool done=false;
+	bool cancel=false;
+
+	if (!load_qstpath.empty()) {
+		new_game->header.qstpath = load_qstpath;
+	}
+	else if (!only_qstpath.empty())
+	{
+		new_game->header.qstpath = only_qstpath;
+	}
+	
+	int32_t letter_grid_x=(NameEntryMode2==2)?34:44;
+	int32_t letter_grid_y=120;
+	int32_t letter_grid_offset=(NameEntryMode2==2)?10:8;
+	int32_t letter_grid_width=(NameEntryMode2==2)?16:11;
+	int32_t letter_grid_height=(NameEntryMode2==2)?6:4;
+	int32_t letter_grid_spacing=(NameEntryMode2==2)?12:16;
+	
+	const char *simple_grid="ABCDEFGHIJKLMNOPQRSTUVWXYZ-.,!'&.0123456789 ";
+	const char *complete_grid=" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~ ";
+	
+	if(NameEntryMode2>0)
+	{
+		//int32_t pos=file%3;
+		BITMAP *info = create_bitmap_ex(8,168,32);
+		clear_bitmap(info);
+		blit(framebuf,info,40,pos*24+70,0,0,168,26);
+		rectfill(info,40,0,168,1,0);
+		rectfill(info,0,24,39,25,0);
+		rectfill(info,0,0,7,15,0);
+		rectfill(framebuf,40,64,216,192,0);
+		rectfill(framebuf,96,60,183,67,0);
+		
+		int32_t i=pos*24+70;
+		
+		do
+		{
+			blit(info,framebuf,0,0,40,i,168,32);
+			advanceframe(true);
+			i-=pos+pos;
+		}
+		while(pos && i>=70);
+		
+		clear_bitmap(framebuf);
+		framerect(framebuf, 27, 51, 26*8-6, 8*8-6,0x03);
+		textout_ex(framebuf,get_zc_font(font_zfont)," NAME ",80,48,1,0);
+		textout_ex(framebuf,get_zc_font(font_zfont)," LIFE ",152,48,1,0);
+		
+		blit(info,framebuf,0,0,40,70,168,32);
+		destroy_bitmap(info);
+		
+		framerect(framebuf, letter_grid_x-letter_grid_offset+3, letter_grid_y-letter_grid_offset+3,
+			((NameEntryMode2==2)?26:23)*8-6, ((NameEntryMode2==2)?11:9)*8-6,0x03);
+		
+		if(NameEntryMode2==1)
+		{
+			textout_ex(framebuf,get_zc_font(font_zfont),"A B C D E F G H I J K",letter_grid_x,letter_grid_y,1,-1);
+			textout_ex(framebuf,get_zc_font(font_zfont),"L M N O P Q R S T U V",letter_grid_x,letter_grid_y+16,1,-1);
+			textout_ex(framebuf,get_zc_font(font_zfont),"W X Y Z - . , ! ' & .",letter_grid_x,letter_grid_y+32,1,-1);
+			textout_ex(framebuf,get_zc_font(font_zfont),"0 1 2 3 4 5 6 7 8 9  ",letter_grid_x,letter_grid_y+48,1,-1);
+		}
+		else
+		{
+			textout_ex(framebuf,get_zc_font(font_zfont),"   \"  $  &  (  *  ,  .",letter_grid_x,   letter_grid_y,   1,-1);
+			textout_ex(framebuf,get_zc_font(font_zfont), "!  #  %  '  )  +  -  /",letter_grid_x+12,letter_grid_y,   1,-1);
+			textout_ex(framebuf,get_zc_font(font_zfont),"0  2  4  6  8  :  <  >", letter_grid_x,   letter_grid_y+12,1,-1);
+			textout_ex(framebuf,get_zc_font(font_zfont), "1  3  5  7  9  ;  =  ?",letter_grid_x+12,letter_grid_y+12,1,-1);
+			textout_ex(framebuf,get_zc_font(font_zfont),"@  B  D  F  H  J  L  N", letter_grid_x,   letter_grid_y+24,1,-1);
+			textout_ex(framebuf,get_zc_font(font_zfont), "A  C  E  G  I  K  M  O",letter_grid_x+12,letter_grid_y+24,1,-1);
+			textout_ex(framebuf,get_zc_font(font_zfont),"P  R  T  V  X  Z  \\  ^",letter_grid_x,   letter_grid_y+36,1,-1);
+			textout_ex(framebuf,get_zc_font(font_zfont), "Q  S  U  W  Y  [  ]  _",letter_grid_x+12,letter_grid_y+36,1,-1);
+			textout_ex(framebuf,get_zc_font(font_zfont),"`  b  d  f  h  j  l  n", letter_grid_x,   letter_grid_y+48,1,-1);
+			textout_ex(framebuf,get_zc_font(font_zfont), "a  c  e  g  i  k  m  o",letter_grid_x+12,letter_grid_y+48,1,-1);
+			textout_ex(framebuf,get_zc_font(font_zfont),"p  r  t  v  x  z  |  ~", letter_grid_x,   letter_grid_y+60,1,-1);
+			textout_ex(framebuf,get_zc_font(font_zfont), "q  s  u  w  y  {  }",   letter_grid_x+12,letter_grid_y+60,1,-1);
+		}
+		
+		advanceframe(true);
+		blit(framebuf,scrollbuf,0,0,0,0,framebuf->w,framebuf->h);
+		
+	}
+	
+	int32_t grid_x=0;
+	int32_t grid_y=0;
+	bool keyboard_mode = false;
+
+	do
+	{
+		if(NameEntryMode2>0)
+		{
+			spos = grid_y * letter_grid_width + grid_x;
+			load_control_state();
+
+			while (keypressed())
+			{
+				int32_t k = readkey();
+				int32_t ch = k & 0xFF;
+				int32_t scancode = k >> 8;
+
+				if (scancode == KEY_TAB)
+				{
+					keyboard_mode = !keyboard_mode;
+					sfx(WAV_CHIME);
+				}
+				else if (keyboard_mode)
+				{
+					if (isprint(ch))
+					{
+						if (NameEntryMode2 == 1 && ch >= 'a' && ch <= 'z')
+							ch = toupper(ch);
+
+						const char* grid = (NameEntryMode2 == 2) ? complete_grid : simple_grid;
+						const char* ptr = strchr(grid, ch);
+
+						if (ptr)
+						{
+							int32_t idx = ptr - grid;
+							grid_y = idx / letter_grid_width;
+							grid_x = idx % letter_grid_width;
+
+							name[zc_min(x, 7)] = ch;
+
+							if (x < 8)
+								++x;
+
+							sfx(WAV_PLACE);
+						}
+					}
+					else
+					{
+						switch (scancode)
+						{
+						case KEY_LEFT:
+							if (x > 0)
+							{
+								if (x == 8)
+									x = 6;
+								else
+									--x;
+
+								sfx(WAV_CHIME);
+							}
+							break;
+
+						case KEY_RIGHT:
+							if (x < 8 && name[zc_min(x, 7)])
+							{
+								++x;
+								sfx(WAV_CHIME);
+							}
+							break;
+
+						case KEY_BACKSPACE:
+							if (x > 0)
+							{
+								--x;
+
+								for (int32_t i = zc_min(x, 7); i < 8; i++)
+									name[i] = name[i + 1];
+
+								sfx(WAV_OUCH);
+							}
+							break;
+
+						case KEY_ENTER:
+						case KEY_ENTER_PAD:
+						{
+							done = true;
+							int32_t ltrs = 0;
+
+							for (int32_t i = 0; i < 8; i++)
+								if (name[i] != ' ' && name[i] != 0)
+									++ltrs;
+
+							if (!ltrs)
+								cancel = true;
+						}
+						break;
+
+						case KEY_DEL:
+							for (int32_t i = zc_min(x, 7); i < 8; i++)
+								name[i] = name[i + 1];
+
+							sfx(WAV_OUCH);
+							break;
+
+						case KEY_ESC:
+							// For web ?open mode, don't allow quitting.
+							if (load_qstpath.empty())
+							{
+								x = -1;
+								done = true;
+	
+								while (key[KEY_ESC])
+								{
+									poll_keyboard();
+									rest(1);
+								}
+							}
+							break;
+						}
+					}
+				}
+			}
+
+			if (!keyboard_mode)
+			{
+				if (getInput(btnLeft, INPUT_PRESS))
+				{
+					--grid_x;
+
+					if (grid_x < 0)
+					{
+						grid_x = letter_grid_width - 1;
+						--grid_y;
+						
+						if (grid_y < 0)
+							grid_y = letter_grid_height - 1;
+					}
+
+					sfx(WAV_CHIME);
+				}
+				else if (getInput(btnRight, INPUT_PRESS))
+				{
+					++grid_x;
+
+					if (grid_x >= letter_grid_width)
+					{
+						grid_x = 0;
+						++grid_y;
+						
+						if (grid_y >= letter_grid_height)
+							grid_y = 0;
+					}
+
+					sfx(WAV_CHIME);
+				}
+				else if (getInput(btnUp, INPUT_PRESS))
+				{
+					--grid_y;
+
+					if (grid_y < 0)
+						grid_y = letter_grid_height - 1;
+
+					sfx(WAV_CHIME);
+				}
+				else if (getInput(btnDown, INPUT_PRESS))
+				{
+					++grid_y;
+
+					if (grid_y >= letter_grid_height)
+						grid_y = 0;
+
+					sfx(WAV_CHIME);
+				}
+				else if (getInput(btnB, INPUT_PRESS))
+				{
+					if (x > 0)
+					{
+						--x;
+						
+						for (int32_t i = zc_min(x, 7); i < 8; i++)
+							name[i] = name[i + 1];
+							
+						sfx(WAV_OUCH);
+					}
+				}
+				else if (getInput(btnA, INPUT_PRESS))
+				{
+					name[zc_min(x, 7)] = (NameEntryMode2 == 2) ? complete_grid[spos] : simple_grid[spos];
+					++x;
+
+					if (x >= 8)
+						x = 0;
+
+					sfx(WAV_PLACE);
+				}
+				else if (getInput(btnS, INPUT_PRESS))
+				{
+					done = true;
+					int32_t ltrs = 0;
+
+					for (int32_t i = 0; i < 8; i++)
+						if (name[i] != ' ' && name[i] != 0)
+							++ltrs;
+
+					if (!ltrs)
+						cancel = true;
+
+					// For web ?open mode, don't allow quitting.
+					if (cancel && !load_qstpath.empty())
+						done = cancel = false;
+				}
+			}
+		}
+		else
+		{
+#ifdef __EMSCRIPTEN__
+			// Allow gamepad to submit name.
+			poll_joystick();
+			load_control_state();
+			if(getInput(btnS, INPUT_PRESS))
+			{
+				done = true;
+				break;
+			}
+#endif
+
+			if(keypressed())
+			{
+				int32_t k=readkey();
+				
+				if(isprint(k&255))
+				{
+					name[zc_min(x,7)]=k&0xFF;
+					
+					if(x<8)
+					{
+						++x;
+					}
+					
+					sfx(WAV_PLACE);
+				}
+				else
+				{
+					switch(k>>8)
+					{
+					case KEY_LEFT:
+						if(x>0)
+						{
+							if(x==8)
+							{
+								x=6;
+							}
+							else
+							{
+								--x;
+							}
+							
+							sfx(WAV_CHIME);
+						}
+						
+						break;
+						
+					case KEY_RIGHT:
+						if(x<8 && name[zc_min(x,7)])
+						{
+							++x;
+							sfx(WAV_CHIME);
+						}
+						
+						break;
+						
+					case KEY_ENTER:
+					case KEY_ENTER_PAD:
+					{
+						done=true;
+						int32_t ltrs=0;
+						
+						for(int32_t i=0; i<8; i++)
+						{
+							if(name[i]!=' ' && name[i]!=0)
+							{
+								++ltrs;
+							}
+						}
+						
+						if(!ltrs)
+						{
+							cancel=true;
+						}
+					}
+					break;
+					
+					case KEY_BACKSPACE:
+						if(x>0)
+						{
+							--x;
+							
+							for(int32_t i=zc_min(x,7); i<8; i++)
+							{
+								name[i]=name[i+1];
+							}
+							
+							sfx(WAV_OUCH);
+						}
+						
+						break;
+						
+					case KEY_DEL:
+						for(int32_t i=zc_min(x,7); i<8; i++)
+						{
+							name[i]=name[i+1];
+						}
+						
+						sfx(WAV_OUCH);
+						break;
+						
+					case KEY_ESC:
+						x=-1;
+						done=true;
+						
+						while(key[KEY_ESC])
+						{
+							poll_keyboard();
+							/* do nothing */
+							rest(1);
+						}
+						
+						break;
+					}
+				}
+			}
+		}
+
+		new_game->set_name(name);
+		blit(scrollbuf,framebuf,0,0,0,0,framebuf->w,framebuf->h);
+		list_save(&new_game->header, s, 56+((NameEntryMode2>0)?0:(pos*24)));
+
+		// Show instructions.
+		if (NameEntryMode2 > 0)
+		{
+			FONT* f = get_zc_font(font_z3smallfont);
+			int32_t inst_y = letter_grid_y + ((NameEntryMode2 == 2) ? 80 : 72);
+
+			int left_col_x = 24;
+			int right_col_x = 140;
+
+			// Insert
+			textout_ex(framebuf, f, "Insert", left_col_x, inst_y, 3, -1);
+			std::string a_btn_right = fmt::format(": A (key {})", get_keystr(active_control_scheme->keys[btnA]));
+			textout_ex(framebuf, f, a_btn_right.c_str(), left_col_x + text_length(f, "Insert"), inst_y, 1, -1);
+
+			// Backspace
+			textout_ex(framebuf, f, "Backspace", left_col_x, inst_y + 12, 3, -1);
+			std::string b_btn_right = fmt::format(": B (key {})", get_keystr(active_control_scheme->keys[btnB]));
+			textout_ex(framebuf, f, b_btn_right.c_str(), left_col_x + text_length(f, "Backspace"), inst_y + 12, 1, -1);
+
+			// Confirm
+			textout_ex(framebuf, f, "Confirm", right_col_x, inst_y, 3, -1);
+			std::string start_btn_right = fmt::format(": Start (key {})", get_keystr(active_control_scheme->keys[btnS]));
+			textout_ex(framebuf, f, start_btn_right.c_str(), right_col_x + text_length(f, "Confirm"), inst_y, 1, -1);
+
+			// Keyboard mode
+			int tab_color = keyboard_mode ? (CSET(2) + 3) : 3;
+			textout_ex(framebuf, f, "Keyboard mode", right_col_x, inst_y + 12, tab_color, -1);
+			textout_ex(framebuf, f, ": Tab", right_col_x + text_length(f, "Keyboard mode"), inst_y + 12, 1, -1);
+		}
+		
+		int32_t x2=letter_grid_x + grid_x*letter_grid_spacing;
+		int32_t y2=letter_grid_y + grid_y*letter_grid_spacing;
+		
+		if(global_frame&8)
+		{
+			int32_t tx=(zc_min(x,7)<<3)+72;
+			
+			for(int32_t dy=0; dy<8; dy++)
+			{
+				for(int32_t dx=0; dx<8; dx++)
+				{
+					if(framebuf->line[y+dy][tx+dx]==0)
+					{
+						framebuf->line[y+dy][tx+dx]=CSET(9)+1;
+					}
+					
+					if(NameEntryMode2>0)
+					{
+						if(framebuf->line[y2+dy][x2+dx]==0)
+						{
+							framebuf->line[y2+dy][x2+dx]=CSET(9)+1;
+						}
+					}
+				}
+			}
+		}
+		
+		draw_cursor((NameEntryMode2>0)?0:pos,0);
+		advanceframe(true);
+		/*
+		  if(getInput(btnB, INPUT_PRESS))
+		  {
+		  x=-1;
+		  done=true;
+		  }
+		  */
+	}
+	while(!done && !Quit);
+	
+	if(x<0 || cancel)
+	{
+		done=false;
+	}
+	
+	if(done)
+	{
+		new_game->set_quest(0);
+		new_game->set_timevalid(1);
+		game->header.qstpath.clear();
+
+		// Gives away ownership of `new_game`. If it fails, `save_t::unload` deletes for us.
+		if (auto r = saves_create_slot(new_game); !r)
+		{
+			done = false;
+			new_game = nullptr;
+			ringcolor(false);
+
+			// Could have been canceled in the file dialog, in which case there is no error message.
+			if (!r.error().empty())
+			{
+				enter_sys_pal();
+				InfoDialog("Error creating save file", r.error()).show();
+				exit_sys_pal();
+			}
+		}
+	}
+
+	if (!done)
+	{
+		delete new_game;
+		new_game = nullptr;
+
+		// Revert the menu back to standard selection mode.
+		state.target = CursorTarget::MenuAction;
+		state.selected_action = TitleMenuActionType::NewFile;
+		state.validate_bounds(saves_count());
+	}
+	else
+	{
+		// Select the successfully created save slot.
+		state.target = CursorTarget::SaveSlot;
+		state.selected_save_index = saves_count() - 1;
+	}
+
+	SystemKeys=true;
+	if (load_qstpath.empty() || !done)
+	{
+		selectscreen();
+		list_saves(state.get_page_start());
+		select_mode();
+	}
+	return done && new_game != nullptr;
+}
+
+static bool copy_file(int32_t file)
+{
+	int savecnt = saves_count();
+	if (file >= savecnt)
+		return false;
+
+	std::string err;
+	if (!saves_copy(file, err))
+	{
+		enter_sys_pal();
+		InfoDialog("Error copying save", err).show();
+		exit_sys_pal();
+		return false;
+	}
+
+	sfx(WAV_SCALE);
+	select_mode();
+	return true;
+}
+
+static bool delete_save(int32_t file)
+{
+	int savecnt = saves_count();
+
+	if (file < savecnt)
+	{
+		std::string err;
+		if (!saves_delete(file, err))
+		{
+			enter_sys_pal();
+			InfoDialog("Error deleting save", err).show();
+			exit_sys_pal();
+			return false;
+		}
+
+		sfx(WAV_OUCH);
+		select_mode();
+		return true;
+	}
+
+	return false;
+}
+
+/** game mode stuff **/
+
+DIALOG gamemode_dlg[] =
+{
+	// (dialog proc)      (x)   (y)   (w)   (h)   (fg)     (bg)     (key)    (flags)     (d1)           (d2)     (dp)                            (dp2)  (dp3)
+	{ jwin_win_proc,       40,   44,  240,  180,   0,       0,       0,       D_EXIT,     0,             0, (void *) "Select Custom Quest", NULL,  NULL },
+	// 1
+	{ jwin_button_proc,   205,   76,   61,   21,   0,       0,       'b',     D_EXIT,     0,             0, (void *) "&Browse",             NULL,  NULL },
+	{ jwin_textbox_proc,   55,   78,  140,   16,   0,       0,       0,       0,          0,             0,       NULL,                           NULL,  NULL },
+	{ jwin_text_proc,      76,  106,   64,    8,   vc(0),   vc(11),  0,       0,          0,             0, (void *) "Info:",               NULL,  NULL },
+	{ jwin_textbox_proc,   76,  118,  168,   60,   0,       0,       0,       0,          0,             0,       NULL,                           NULL,  NULL },
+	// 5
+	{ jwin_button_proc,    90,  191,   61,   21,   0,       0,       'k',     D_EXIT,     0,             0, (void *) "O&K",                 NULL,  NULL },
+	{ jwin_button_proc,   170,  191,   61,   21,   0,       0,       27,      D_EXIT,     0,             0, (void *) "Cancel",              NULL,  NULL },
+	{ d_timer_proc,         0,    0,     0,    0,    0,       0,       0,       0,          0,          0,         NULL, NULL, NULL },
+	{ NULL,                 0,    0,    0,    0,   0,       0,       0,       0,          0,             0,       NULL,                           NULL,  NULL }
+};
+
+
+static int32_t get_quest_info(zquestheader *header,char *str)
+{
+	if(strlen(get_filename(qstpath)) == 0)
+	{
+		str[0]=0;
+		return 0;
+	}
+
+	int32_t error;
+	PACKFILE* f = open_quest_file(&error, qstpath, false);
+
+	if (!f)
+	{
+		strcpy(str,"Error: Unable to open file");
+		return 0;
+	}
+
+	int32_t ret = readheader(f, header);
+	pack_fclose(f);
+	clear_quest_tmpfile();
+
+	switch(ret)
+	{
+		case 0:
+			break;
+			
+		case qe_invalid:
+			strcpy(str,"Error: Invalid quest file");
+			return 0;
+			
+		case qe_version:
+			strcpy(str,"Error: Invalid version");
+			return 0;
+			
+		case qe_obsolete:
+			strcpy(str,"Error: Obsolete version");
+			return 0;
+			
+		case qe_silenterr:
+			return 0;
+	}
+	
+	strcpy(str,"Title:\n");
+	strcat(str,header->title);
+	strcat(str,"\n\nAuthor:\n");
+	strcat(str,header->author);
+
+	return 1;
+}
+
+bool prompt_for_quest_path(std::string current_qstpath)
+{
+	if (!only_qstpath.empty())
+	{
+		strcpy(qstpath, only_qstpath.c_str());
+		return true;
+	}
+
+	zquestheader h;
+	char infostr[200];
+	infostr[0] = '\0';
+	int32_t ret=0; 
+	int32_t focus_obj = 1; //Fixes the issue where the button tied to the enter key is stuck on 'browse'.
+
+	bool jump_to_file_select = false;
+	if (current_qstpath.empty())
+	{
+		snprintf(qstpath, 2048, "%s", qstdir);
+		jump_to_file_select = true;
+	}
+	else if (util::is_relative_path(current_qstpath))
+	{
+		// TODO: make `qstpath` use type fs::path
+		auto qstpath_fs = fs::path(qstdir) / fs::path(current_qstpath);
+		snprintf(qstpath, 2048, "%s", qstpath_fs.string().c_str());
+	}
+	else
+	{
+		snprintf(qstpath, 2048, "%s", current_qstpath.c_str());
+	}
+	char relpath[2048];
+	relativize_path(relpath, qstpath);
+	
+	gamemode_dlg[0].dp2 = get_zc_font(font_lfont);
+	gamemode_dlg[2].dp = relpath;
+	
+	if (!current_qstpath.empty() && get_quest_info(&h,infostr)==0)
+	{
+		gamemode_dlg[4].dp = infostr;
+		gamemode_dlg[5].flags = D_DISABLED;
+	}
+	else
+	{
+		gamemode_dlg[4].dp = infostr;
+		gamemode_dlg[5].flags = D_EXIT;
+	}
+	
+	gamemode_dlg[2].d1 = gamemode_dlg[4].d1 = 0;
+	gamemode_dlg[2].d2 = gamemode_dlg[4].d2 = 0;
+	enter_sys_pal();
+	
+	clear_keybuf();
+	
+	large_dialog(gamemode_dlg);
+   
+	bool chose_quest = false;
+	while(jump_to_file_select || (ret=do_zqdialog(gamemode_dlg,focus_obj))==1)
+	{
+		jump_to_file_select = false;
+
+		static EXT_LIST list[] =
+		{
+			{ (char *)"ZC Quests (*.qst)", (char *)"qst" },
+			{ NULL,                        NULL }
+		};
+		
+		if (auto result = prompt_for_existing_file("Load Quest", "", list, qstpath))
+		{
+			strcpy(qstpath, result->c_str());
+			chose_quest = true;
+			gamemode_dlg[2].dp = get_filename(qstpath);
+			
+			if(get_quest_info(&h,infostr)==0)
+			{
+				gamemode_dlg[4].dp = infostr;
+				gamemode_dlg[5].flags = D_DISABLED;
+				focus_obj = 1;
+			}
+			else
+			{
+				gamemode_dlg[4].dp = infostr;
+				gamemode_dlg[5].flags = D_EXIT;
+				focus_obj = 5;
+			}
+			
+			gamemode_dlg[2].d1 = gamemode_dlg[4].d1 = 0;
+			gamemode_dlg[2].d2 = gamemode_dlg[4].d2 = 0;
+		}
+		else if (current_qstpath.empty())
+		{
+			break;
+		}
+	}
+
+	exit_sys_pal();
+	key[KEY_ESC]=0;
+
+	chose_quest = ret == 5 && chose_quest;
+	if (chose_quest)
+	{
+		// Try to make relative to qstdir.
+		// TODO: this is copied from saves_do_first_time_stuff
+		std::string rel_dir = (fs::current_path() / fs::path(qstdir)).string();
+		auto maybe_rel_qstpath = util::is_subpath_of(rel_dir, qstpath) ? fs::relative(qstpath, rel_dir) : qstpath;
+		strcpy(qstpath, maybe_rel_qstpath.string().c_str());
+	}
+
+	return chose_quest;
+}
+
+static int32_t game_details(save_t* save)
+{
+	if (!save)
+		return 0;
+
+	const auto header = save->header;
+
+	if (header->quest==0)
+		return 0;
+
+	int32_t pos=save->index%3;
+	BITMAP *info = create_bitmap_ex(8,168,32);
+	clear_bitmap(info);
+	blit(framebuf,info,40,pos*24+70,0,0,168,26);
+	rectfill(info,40,0,168,1,0);
+	rectfill(info,0,24,39,25,0);
+	rectfill(info,0,0,7,15,0);
+	rectfill(framebuf,40,64,216,192,0);
+	rectfill(framebuf,96,60,183,67,0);
+	
+	int32_t i=pos*24+70;
+	
+	do
+	{
+		blit(info,framebuf,0,0,40,i,168,32);
+		advanceframe(true);
+		i-=pos+pos;
+	}
+	while(pos && i>=70);
+	
+	destroy_bitmap(info);
+	
+	textout_ex(framebuf,get_zc_font(font_zfont),"GAME TYPE",40,104,3,0);
+	textout_ex(framebuf,get_zc_font(font_zfont),"QUEST",40,112,3,0);
+	textout_ex(framebuf,get_zc_font(font_zfont),"STATUS",40,120,3,0);
+
+	if (!save->path.empty())
+		textout_centre_ex(framebuf,get_zc_font(font_z3smallfont),save->path.filename().string().c_str(),125,132,1,0);
+
+	if(header->quest<0xFF)
+	{
+		textout_ex(framebuf,get_zc_font(font_zfont),"Normal Game",120,104,1,0);
+		textprintf_ex(framebuf,get_zc_font(font_zfont),120,112,1,0,"%s Quest",
+					  ordinal(header->quest));
+	}
+	else
+	{
+		textout_ex(framebuf,get_zc_font(font_zfont),"Custom Quest",120,104,1,0);
+		textprintf_ex(framebuf,get_zc_font(font_zfont),120,112,1,0,"%s",
+					  get_filename(header->qstpath.c_str()));
+	}
+	
+	if(!header->has_played)
+		textout_ex(framebuf,get_zc_font(font_zfont),"Not Started",120,120,1,0);
+	else if(!header->time_valid)
+		textout_ex(framebuf,get_zc_font(font_zfont),"Time Unknown",120,120,1,0);
+	else
+		textout_ex(framebuf,get_zc_font(font_zfont),time_str_med(header->time),120,120,1,0);
+		
+	if(header->did_cheat)
+		textout_ex(framebuf,get_zc_font(font_zfont),"Used Cheats",120,128,1,0);
+		
+	textout_ex(framebuf,get_zc_font(font_zfont),"START: PLAY GAME",56,152,1,0);
+	textout_ex(framebuf,get_zc_font(font_zfont),"    B: CANCEL",56,168,1,0);
+	
+	if(!header->has_played)
+		textout_ex(framebuf,get_zc_font(font_zfont),"    A: CUSTOM QUEST",56,184,1,0);
+		
+	while(!Quit)
+	{
+		advanceframe(true);
+		load_control_state();
+		
+		if(getInput(btnB, INPUT_PRESS))
+		{
+			blit(scrollbuf,framebuf,0,0,0,0,framebuf->w,framebuf->h);
+			return 0;
+		}
+		
+		if(getInput(btnS, INPUT_PRESS))
+		{
+			blit(framebuf,scrollbuf,0,0,0,0,framebuf->w,framebuf->h);
+			return 1;
+		}
+
+		// TODO: consider allowing qst file to be reconfigured, in case it is moved.
+		if(getInput(btnA, INPUT_PRESS) && !header->has_played)
+		{
+			if (prompt_for_quest_path(save->header->qstpath))
+			{
+				if (auto r = saves_update_slot(save, qstpath); !r)
+				{
+					enter_sys_pal();
+					InfoDialog("Error updating save", r.error()).show();
+					exit_sys_pal();
+				}
+				selectscreen();
+				break;
+			}
+		}
+	}
+	
+	return 0;
+}
+
+int32_t saveslot = -1;
+
+save_t* get_unset_save_slot()
+{
+	if (auto r = saves_get_slot(saveslot); r && r.value()->header->quest && r.value()->header->has_played)
+		return r.value();
+
+	return nullptr;
+}
+
+static int last_slot_index;
+static void select_game(bool skip = false)
+{
+	if(standalone_mode || skip)
+		return;
+
+	TitleMenuState state;
+
+	if (saves_count() == 0)
+	{
+		state.target = CursorTarget::MenuAction;
+		state.selected_action = TitleMenuActionType::NewFile;
+	}
+	else
+	{
+		state.target = CursorTarget::SaveSlot;
+		state.selected_save_index = last_slot_index;
+		state.validate_bounds(saves_count());
+	}
+
+	saves_unselect();
+	selectscreen();
+
+	saveslot = state.target == CursorTarget::SaveSlot ? state.selected_save_index : -1;
+
+	bool done=false;
+	refreshpal=true;
+	do
+	{
+		if(!load_qstpath.empty())
+		{
+			if (register_name(state))
+			{
+				saveslot = saves_count()-1;
+				if (auto r = saves_select(saveslot); !r)
+				{
+					enter_sys_pal();
+					InfoDialog("Error loading save", r.error()).show();
+					exit_sys_pal();
+					continue;
+				}
+				else
+				{
+					loadlast = saves_current_path();
+				}
+
+				break;
+			}
+			else
+			{
+				load_qstpath = "";
+			}
+		}
+
+		if (keypressed())
+		{
+			int32_t k=readkey()>>8;
+			if (k == KEY_ESC && state.mode != TitleMenuMode::Normal)
+			{
+				state.mode = TitleMenuMode::Normal;
+				select_mode();
+				while(key[KEY_ESC])
+				{
+					poll_keyboard();
+					/* do nothing */
+					rest(1);
+				}
+			}
+		}
+		disabledKeys[KEY_ESC] = state.mode != TitleMenuMode::Normal;
+
+		ensure_default_sfx();
+		blit(scrollbuf,framebuf,0,0,0,0,framebuf->w,framebuf->h);
+		list_saves(state.get_page_start());
+		draw_cursor(state.get_ui_pos(), static_cast<int32_t>(state.mode));
+		advanceframe(true);
+		load_control_state();
+
+		saveslot = state.target == CursorTarget::SaveSlot ? state.selected_save_index : -1;
+		
+		if (getInput(btnS, INPUT_PRESS))
+		{
+			if (state.target == CursorTarget::MenuAction)
+			{
+				if (state.selected_action == TitleMenuActionType::NewFile)
+				{
+					// The on-screen pad holds keys for a moment; wait for release so the
+					// name entry screen does not see this same press and cancel itself.
+					for (int i = 0; i < 80 && getInput(btnS); ++i)
+						rest(10);
+
+					if (!register_name(state))
+					{
+						state.target = CursorTarget::MenuAction;
+						state.selected_action = TitleMenuActionType::NewFile;
+					}
+					else
+					{
+						state.target = CursorTarget::SaveSlot;
+						state.selected_save_index = saves_count() - 1;
+					}
+
+					refreshpal = true;
+				}
+				else if (state.selected_action == TitleMenuActionType::CopyFile)
+				{
+					if (saves_count() > 0)
+					{
+						state.mode = TitleMenuMode::Copy;
+						state.target = CursorTarget::SaveSlot;
+						state.selected_save_index = state.get_page_start();
+						copy_mode();
+					}
+
+					refreshpal = true;
+				}
+				else if (state.selected_action == TitleMenuActionType::DeleteFile)
+				{
+					if (saves_count() > 0)
+					{
+						state.mode = TitleMenuMode::Delete;
+						state.target = CursorTarget::SaveSlot;
+						state.selected_save_index = state.get_page_start();
+						delete_mode();
+					}
+
+					refreshpal = true;
+				}
+			}
+			else if (state.target == CursorTarget::SaveSlot && saveslot < saves_count())
+			{
+				if (state.mode == TitleMenuMode::Normal)
+				{
+					if (auto r = saves_select(saveslot); !r)
+					{
+						enter_sys_pal();
+						InfoDialog("Error loading save file", r.error()).show();
+						exit_sys_pal();
+					}
+					else
+					{
+						loadlast = saves_current_path();
+
+						if (r.value()->header->quest)
+							done = true;
+					}
+				}
+				else if (state.mode == TitleMenuMode::Copy)
+				{
+					if (copy_file(saveslot))
+					{
+						state.mode = TitleMenuMode::Normal;
+						state.target = CursorTarget::SaveSlot;
+						state.selected_save_index = saves_count() - 1;
+						refreshpal = true;
+					}
+				}
+				else if (state.mode == TitleMenuMode::Delete)
+				{
+					if (delete_save(saveslot))
+					{
+						state.mode = TitleMenuMode::Normal;
+						state.validate_bounds(saves_count());
+						refreshpal = true;
+					}
+
+					state.target = CursorTarget::MenuAction;
+					state.selected_action = TitleMenuActionType::DeleteFile;
+				}
+			}
+		}
+
+		if(getInput(btnUp, INPUT_PRESS))
+		{
+			state.move_up(saves_count());
+			sfx(WAV_CHIME);
+		}
+
+		if(getInput(btnDown, INPUT_PRESS))
+		{
+			state.move_down(saves_count());
+			sfx(WAV_CHIME);
+		}
+
+		if (getInput(btnLeft, INPUT_PRESS) && state.get_page_start() > 2)
+		{
+			state.page_left();
+			sfx(WAV_CHIME);
+			refreshpal=true;
+		}
+
+		if (getInput(btnRight, INPUT_PRESS) && state.get_page_start() + 3 < saves_count())
+		{
+			state.page_right(saves_count());
+			sfx(WAV_CHIME);
+			refreshpal=true;
+		}
+
+		if (getInput(btnB, INPUT_PRESS) && state.mode != TitleMenuMode::Normal)
+		{
+			if (state.mode == TitleMenuMode::Copy)
+				state.selected_action = TitleMenuActionType::CopyFile;
+
+			if (state.mode == TitleMenuMode::Delete)
+				state.selected_action = TitleMenuActionType::DeleteFile;
+
+			state.mode = TitleMenuMode::Normal;
+			state.target = CursorTarget::MenuAction;
+			select_mode();
+		}
+
+		if (getInput(btnA, INPUT_PRESS) && state.mode == TitleMenuMode::Normal && state.target == CursorTarget::SaveSlot && saveslot < saves_count())
+		{
+			if (auto r = saves_get_slot(saveslot); !r)
+			{
+				enter_sys_pal();
+				InfoDialog("Error loading save", r.error()).show();
+				exit_sys_pal();
+			}
+			else
+			{
+				save_t* save = r.value();
+
+				if (game_details(save) && saves_select(save))
+				{
+					loadlast = saves_current_path();
+
+					if (save->header->quest)
+						done = true;
+				}
+			}
+		}
+	}
+	while(!Quit && !done);
+
+	disabledKeys[KEY_ESC] = false;
+	saveslot = -1;
+}
+
+static void actual_titlescreen()
+{
+	if (is_headless())
+		return;
+
+	int starting_volume = 0;
+	if (exists("assets/title_music.mp3"))
+	{
+		try_zcmusic("assets/title_music.mp3", "", 0, 0, starting_volume = get_emusic_volume());
+	}
+	else
+	{
+		try_zcmusic("assets/zc/ZC_Forever_HD.mp3", "", 0, 0, starting_volume = get_emusic_volume() * 0.7);
+	}
+
+	loadfullpal();
+
+	// Deep blue (#072aab): the background the logo crawls over (the framebuf clears below).
+	RAMpal[vc(1)].r = 0x07;
+	RAMpal[vc(1)].g = 0x2A;
+	RAMpal[vc(1)].b = 0xAB;
+
+	// The select screen normally loads these, but that happens after this screen - and with
+	// no sounds loaded, the chimes here (sword impact, skipping with a keypress) are muted.
+	ensure_default_sfx();
+
+	auto logo = get_logo();
+	if (logo->bitmap)
+	{
+		static float aspect_ratio = (float)al_get_bitmap_width(logo->bitmap) / al_get_bitmap_height(logo->bitmap);
+		int target_height = 46;
+		int target_width = target_height * aspect_ratio;
+		float scale = (float)target_height / al_get_bitmap_height(logo->bitmap);
+		int x = (framebuf->w - target_width) / 2;
+		logo->set_transform({.x = (float)x, .y = 0, .xscale = scale, .yscale = scale});
+	}
+
+	// Sword intro: the logo crawls up without its sword, then the sword thrusts in from the left
+	// and slots home through the letters - a sfx plays (rising woosh into a metallic tick), and a
+	// white flash on impact. If a custom assets/logo.png is present, the plain crawl is used
+	// instead.
+	static ALLEGRO_BITMAP* logo_nosword;
+	static ALLEGRO_BITMAP* logo_sword;
+	static bool sword_assets_attempted;
+	static RenderTreeItem rti_sword("logo_sword");
+	static RenderTreeItem rti_flash("title_flash");
+	static ZCSFX sword_sfx;
+	bool sword_intro = logo->bitmap != nullptr && !exists("assets/logo.png");
+	if (sword_intro && !sword_assets_attempted)
+	{
+		sword_assets_attempted = true;
+		logo_nosword = prescale_logo_bitmap(al_load_bitmap("assets/zc/ZC_Logo_NoSword.png"));
+		logo_sword = prescale_logo_bitmap(al_load_bitmap("assets/zc/ZC_Logo_Sword.png"));
+		try
+		{
+			// The woosh's peak and impact tick sit at 260ms, matching the 16-frame
+			// thrust it is started alongside.
+			sword_sfx.load_file("assets/zc/ZC_Sword_Woosh.wav");
+		}
+		catch (std::exception const& e)
+		{
+			// Not fatal - the thrust falls back to a stock sound.
+			al_trace("title: could not load the sword woosh: %s\n", e.what());
+		}
+	}
+	sword_intro = sword_intro && logo_nosword && logo_sword;
+
+	ALLEGRO_BITMAP* logo_full = logo->bitmap;
+	if (sword_intro)
+	{
+		logo->bitmap = logo_nosword;
+
+		rti_sword.bitmap = logo_sword;
+		rti_sword.visible = false;
+		rti_sword.fullres_overlay = true;
+		// Thrusts in from off screen left - keep it masked until it crosses into the viewport.
+		rti_sword.clip_to_parent = true;
+		// Behind the base logo, so the blade passes under the letters.
+		rti_game.add_child_before(&rti_sword, logo);
+
+		if (!rti_flash.bitmap)
+		{
+			set_bitmap_create_flags(true);
+			rti_flash.bitmap = create_a5_bitmap(16, 16);
+			clear_a5_bmp(al_map_rgba(0, 0, 0, 0), rti_flash.bitmap);
+			al_set_new_bitmap_flags(0);
+		}
+		rti_flash.freeze = true;
+		rti_flash.visible = false;
+		// A child of the game layer sized to exactly cover it, so the flash stays inside
+		// the game area - and composites through the CRT overlay pass like the sword, so
+		// under a filter it takes the tube's shape. The fade is baked into the bitmap's
+		// color each frame rather than using `tint`, because the zc renderer reassigns
+		// the game layer's children's tints every frame.
+		rti_flash.fullres_overlay = true;
+		rti_game.add_child(&rti_flash);
+		rti_flash.set_size(16, 16);
+		rti_flash.set_transform({.x = 0, .y = 0,
+			.xscale = (float)rti_game.width / 16, .yscale = (float)rti_game.height / 16});
+	}
+
+	double starting_y = rti_game.height + 46;
+	double final_y = (double)(rti_game.height - 46) / 2;
+
+	bool show_text = false;
+	int duration = 150;
+	const int sword_frames = 16;
+	const int flash_frames = 12;
+	const int sword_hit = duration + sword_frames;
+	int counter = 0;
+	while (!Quit)
+	{
+		if (keypressed() || button_pressed() || CHECK_SHIFT || CHECK_CTRL_CMD || CHECK_ALT)
+		{
+			sfx(WAV_CHIME);
+			clear_keybuf();
+			break;
+		}
+
+		double ratio = std::min(1.0, (double)counter / duration);
+
+		auto t = logo->get_transform();
+		t.y = starting_y + (final_y - starting_y) * ratio;
+		logo->set_transform(t);
+
+		if (sword_intro && counter >= duration && counter <= sword_hit + flash_frames)
+		{
+			auto lt = logo->get_transform();
+			if (counter < sword_hit)
+			{
+				// Thrust in from off screen left. The woosh starts with the motion and
+				// crescendos into the hit; its baked-in impact tick lands at the swap below.
+				if (counter == duration)
+				{
+					if (sound_was_installed && !sword_sfx.is_invalid())
+						sword_sfx.play(128, false);
+					else
+						sfx(WAV_SWORD);
+				}
+				double r = (double)(counter - duration + 1) / sword_frames;
+				float logo_w = al_get_bitmap_width(logo->bitmap) * lt.xscale;
+				float from_x = -logo_w;
+				rti_sword.visible = true;
+				rti_sword.set_transform({.x = (float)(from_x + (lt.x - from_x) * r),
+					.y = lt.y, .xscale = lt.xscale, .yscale = lt.yscale});
+			}
+			else if (counter == sword_hit)
+			{
+				// Slotted home: swap in the complete logo and light it up.
+				logo->bitmap = logo_full;
+				rti_sword.visible = false;
+				rti_flash.visible = true;
+			}
+			if (counter >= sword_hit)
+			{
+				double fade = 1.0 - (double)(counter - sword_hit) / flash_frames;
+				clear_a5_bmp(al_premul_rgba_f(1, 1, 1, 0.85 * std::max(0.0, fade)), rti_flash.bitmap);
+				rti_flash.visible = fade > 0;
+			}
+		}
+
+		if (!show_text)
+		{
+			int pos = zcmusic_get_curpos(zcmusic);
+			if (pos >= 0)
+			{
+				show_text = pos >= 59000;
+			}
+			else
+			{
+				// For if music is not playing.
+				show_text = counter == duration;
+			}
+		}
+
+		// Deep blue rather than black - the logo crawl reads much better against it.
+		clear_to_color(framebuf, vc(1));
+		if (show_text)
+		{
+			int w = text_length(get_zc_font(font_zfont), "PRESS ANYTHING TO START");
+			textout_ex(framebuf,get_zc_font(font_zfont),"PRESS ANYTHING TO START",(framebuf->w - w)/2,framebuf->h - 20,WHITE,-1);
+		}
+
+		if (counter <= sword_hit + flash_frames)
+			counter++;
+		advanceframe(true);
+	}
+
+	if (sword_intro)
+	{
+		// However the loop ended (impact, skip, quit), leave the logo fully assembled.
+		logo->bitmap = logo_full;
+		rti_sword.visible = false;
+		rti_sword.remove();
+		rti_flash.visible = false;
+		rti_flash.remove();
+		if (sword_sfx.is_playing())
+			sword_sfx.stop();  // skipped mid-thrust
+	}
+
+	clear_to_color(framebuf, vc(1));
+
+	starting_y = logo->get_transform().y;
+	final_y = 0;
+	duration = 30;
+	counter = 0;
+	while (!Quit && counter <= duration)
+	{
+		double ratio = (double)counter / duration;
+		zcmusic_set_volume(zcmusic, starting_volume - starting_volume * std::sqrt(ratio));
+
+		auto t = logo->get_transform();
+		t.y = starting_y + (final_y - starting_y) * ratio;
+		logo->set_transform(t);
+
+		counter++;
+		advanceframe(true);
+	}
+
+	zcmusic_stop(zcmusic);
+}
+
+static void prompt_for_uploading_replays()
+{
+#ifdef HAS_CURL
+	bool replay_upload_prompt = zc_get_config("zeldadx", "replay_upload_prompt", 0);
+	if (!replay_upload_auto_enabled() && !replay_upload_prompt)
+	{
+		enter_sys_pal();
+		if (alert_confirm("Upload replays",
+			"Would you like to periodically upload replays of your gameplay to the developers?"
+			"\nThis helps development by preventing bugs and simplifying bug reports."))
+		{
+			zc_set_config("zeldadx", "replay_new_saves", true);
+			zc_set_config("zeldadx", "replay_upload", true);
+		}
+		exit_sys_pal();
+	}
+	if (!replay_upload_prompt)
+		zc_set_config("zeldadx", "replay_upload_prompt", 1);
+#endif
+}
+
+std::optional<StandaloneQuitChoice> standalone_quit_choice_for_test;
+
+// Standalone mode has no file select screen to return to after the game is quit, so this asks
+// whether to close the program or load the save again. It runs from titlescreen() after any
+// replay has stopped, so like the title and file select screens, it is never in a replay.
+static StandaloneQuitChoice standalone_quit_screen()
+{
+	if (standalone_quit_choice_for_test)
+		return *standalone_quit_choice_for_test;
+
+	const char* rows[] = { "QUIT TO DESKTOP", "LOAD LAST SAVE" };
+	const int32_t num_rows = 2;
+	// Styled like the continue screen.
+	int32_t text_color = SaveScreenSettings[SAVESC_TEXT_CONTINUE_COLOUR] > 0 ? SaveScreenSettings[SAVESC_TEXT_CONTINUE_COLOUR] : QMisc.colors.msgtext;
+	int32_t flash_color = SaveScreenSettings[SAVESC_TEXT_CONTINUE_FLASH] > 0 ? SaveScreenSettings[SAVESC_TEXT_CONTINUE_FLASH] : QMisc.colors.caption;
+
+	kill_sfx();
+	music_stop();
+	clear_bitmap(screen);
+	clear_info_bmp();
+	loadfullpal();
+
+	clear_to_color(framebuf, SaveScreenSettings[SAVESC_BACKGROUND]);
+	for (int32_t i = 0; i < num_rows; i++)
+		textout_ex(framebuf, get_zc_font(font_zfont), rows[i], 88, 72 + i*24, text_color, -1);
+
+	// Don't take the press that picked an option on the previous screen.
+	load_control_state();
+	getInput(btnS, INPUT_PRESS | INPUT_IGNORE_DISABLE);
+	getInput(btnA, INPUT_PRESS | INPUT_IGNORE_DISABLE);
+
+	int32_t pos = 0;
+	int32_t f = -1;
+	bool done = false;
+	do
+	{
+		load_control_state();
+
+		if (f == -1)
+		{
+			if (getInput(btnUp, INPUT_PRESS | INPUT_IGNORE_DISABLE))
+			{
+				sfx(SaveScreenSettings[SAVESC_CUR_SOUND]);
+				pos = (pos + num_rows - 1) % num_rows;
+			}
+
+			if (getInput(btnDown, INPUT_PRESS | INPUT_IGNORE_DISABLE))
+			{
+				sfx(SaveScreenSettings[SAVESC_CUR_SOUND]);
+				pos = (pos + 1) % num_rows;
+			}
+
+			if (getInput(btnS, INPUT_PRESS | INPUT_IGNORE_DISABLE) || getInput(btnA, INPUT_PRESS | INPUT_IGNORE_DISABLE))
+				++f;
+		}
+
+		// Flash the picked row, as the continue screen does.
+		if (f >= 0)
+		{
+			if (++f == 65)
+				done = true;
+
+			if (!(f&3))
+				textout_ex(framebuf, get_zc_font(font_zfont), rows[pos], 88, 72 + pos*24, (f&4) ? flash_color : text_color, -1);
+		}
+
+		rectfill(framebuf, 72, 72, 79, 79 + (num_rows-1)*24, SaveScreenSettings[SAVESC_BACKGROUND]);
+		overtile8(framebuf, SaveScreenSettings[SAVESC_USETILE], 72, 72 + pos*24, SaveScreenSettings[SAVESC_CURSOR_CSET], SaveScreenSettings[SAVESC_CUR_FLIP]);
+		advanceframe(true);
+	}
+	while (!Quit && !done);
+
+	clear_bitmap(framebuf);
+	advanceframe(true);
+
+	return done && pos == 1 ? StandaloneQuitChoice::LoadLastSave : StandaloneQuitChoice::QuitToDesktop;
+}
+
+void titlescreen(int32_t lsave)
+{
+	int32_t q=Quit;
+	
+	Quit=0;
+	Playing=Paused=GameLoaded=false;
+	FFCore.kb_typing_mode = false;
+	FFCore.skip_ending_credits = 0;
+
+	clear_keybuf();
+
+	if(q==qCONT)
+	{
+		cont_game();
+		return;
+	}
+
+	if (q == qRELOAD)
+	{
+		zcmusic_stop(zcmusic);
+		init_game();
+		return;
+	}
+
+	// Standalone mode has a single save slot and no file select screen, so every
+	// visit here (first launch, loading the last save after quitting, no-continue-screen
+	// deaths) loads that slot.
+	if (standalone_mode)
+		lsave = 1;
+
+	bool should_show_titlescreen = !SkipTitle && load_qstpath.empty() && lsave == 0 && !Quit;
+
+	// Quit from the continue screen, a save menu or a script - only once a game has been loaded.
+	bool quit_game = (q == qQUIT || q == qSAVE) && saves_current_selection() != -1;
+
+	if (saves_current_selection() != -1)
+	{
+		last_slot_index = saves_current_selection();
+		saves_unload(saves_current_selection());
+		should_show_titlescreen = false;
+	}
+
+	if (replay_is_active())
+		replay_quit();
+
+	updateShowBottomPixels();
+
+	// Dying without a continue screen (qGAMEOVER) skips this and loads the last save, as it
+	// always has.
+	if (standalone_mode && quit_game)
+	{
+		StandaloneQuitChoice choice = standalone_quit_screen();
+		// The program was closed or reset while the screen was up.
+		if (Quit)
+			return;
+
+		if (choice == StandaloneQuitChoice::QuitToDesktop)
+		{
+			Quit = qEXIT;
+			return;
+		}
+	}
+
+	if (should_show_titlescreen)
+	{
+		actual_titlescreen();
+	}
+
+	if(!Quit)
+	{
+		if(lsave<1)
+		{
+			if(slot_arg)
+			{
+				int slot = slot_arg2 - 1;
+				if (auto r = saves_select(slot); !r)
+					Z_error_fatal("Cannot load slot %d, error %s:", slot, r.error().c_str());
+				slot_arg = 0;
+			}
+			else
+			{
+				select_game(q==qRELOAD);
+			}
+		}
+		else
+		{
+			int slot = lsave - 1;
+			if (auto r = saves_select(slot); !r)
+				Z_error_fatal("Cannot load slot %d, error %s:", slot, r.error().c_str());
+		}
+	}
+
+	if(!Quit)
+	{
+		if (!game->get_hasplayed())
+			prompt_for_uploading_replays();
+		zcmusic_stop(zcmusic);
+		init_game();
+	}
+}
+
+extern volatile bool android_request_quickload;
+#ifdef __ANDROID__
+extern int android_game_bottom_px;
+#endif
+void game_over(int32_t type)
+{
+	FFCore.kb_typing_mode = false; 
+	FFCore.skip_ending_credits = 0;
+	kill_sfx();
+	music_stop();
+	clear_bitmap(screen);
+	clear_info_bmp();
+	loadfullpal();
+	
+	
+	if(Quit==qGAMEOVER)
+		jukebox(SaveScreenSettings[SAVESC_MIDI] + MIDIOFFSET_ZSCRIPT);
+		
+	Quit=0;
+	
+	clear_to_color(framebuf,SaveScreenSettings[SAVESC_BACKGROUND]);
+	
+	//Setting the colour via the array isn't working. Perhaps misc colours need to be assigned to the array in init.
+	textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_CONTINUE],88,72,( SaveScreenSettings[SAVESC_TEXT_CONTINUE_COLOUR] > 0 ? SaveScreenSettings[SAVESC_TEXT_CONTINUE_COLOUR] : QMisc.colors.msgtext) ,-1);
+	//WTF! Setting this in zq Init() didn't work?! -Z
+	if(!type)
+	{
+		textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_SAVE],88,96,( SaveScreenSettings[SAVESC_TEXT_SAVE_COLOUR] > 0 ? SaveScreenSettings[SAVESC_TEXT_SAVE_COLOUR] : QMisc.colors.msgtext),-1);
+		textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_RETRY],88,120,( SaveScreenSettings[SAVESC_TEXT_RETRY_COLOUR] > 0 ? SaveScreenSettings[SAVESC_TEXT_RETRY_COLOUR] : QMisc.colors.msgtext),-1);
+	}
+	else
+		textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_RETRY],88,96,( SaveScreenSettings[SAVESC_TEXT_RETRY_COLOUR] > 0 ? SaveScreenSettings[SAVESC_TEXT_RETRY_COLOUR] : QMisc.colors.msgtext),-1);
+		
+	int32_t pos = 0;
+	int32_t f=-1;
+	int32_t htile = SaveScreenSettings[SAVESC_USETILE];
+	int32_t curcset = SaveScreenSettings[SAVESC_CURSOR_CSET];
+	bool done=false;
+
+	// Old replay versions step frames from the input polls below, before the
+	// menu loop presents anything - and their recorded gfx hashes saw the menu
+	// as just composed. Mirror it into the presented bitmap so those frames
+	// hash (and snapshot) the menu instead of the stale last-presented image.
+	blit(framebuf, presentbuf, 0, 0, 0, 0, presentbuf->w, presentbuf->h);
+
+	if (replay_version_check(7))
+	{
+		zc_readrawkey(active_control_scheme->keys[btnS], true);
+	}
+	else
+	{
+		do {
+			load_control_state();
+		}
+		while (getInput(btnS, INPUT_PRESS | INPUT_IGNORE_DISABLE));
+	}
+	
+	do
+	{
+		load_control_state();
+		
+#ifdef __ANDROID__
+		// Android cog Quick Load must work even on the death screen. This modal
+		// loop never returns to the main dispatch, so honor the request here and
+		// bail out (Quit stays 0) - the main loop then applies the save state.
+		if (android_request_quickload)
+			break;
+#endif
+		if(f==-1)
+		{
+			if (getInput(btnUp, INPUT_PRESS | INPUT_IGNORE_DISABLE))
+			{
+				sfx(SaveScreenSettings[SAVESC_CUR_SOUND]);
+				pos=(pos==0)?2:pos-1;
+				
+				if(type)
+				{
+					if(pos==1) pos--;
+				}
+			}
+
+			if (getInput(btnDown, INPUT_PRESS | INPUT_IGNORE_DISABLE))
+			{
+				sfx(SaveScreenSettings[SAVESC_CUR_SOUND]);
+				pos=(pos+1)%3;
+				
+				if(type)
+				{
+					if(pos==1) pos++;
+				}
+			}
+
+			if (getInput(btnS, INPUT_PRESS | INPUT_IGNORE_DISABLE)) ++f;
+		}
+		
+		if(f>=0)
+		{
+			if(++f == 65)
+				done=true;
+				
+			if(!(f&3))
+			{
+				bool flash = (f&4)!=0;
+				
+				switch(pos)
+				{
+				case 0:
+					textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_CONTINUE],88,72,(flash ? ( SaveScreenSettings[SAVESC_TEXT_CONTINUE_FLASH] > 0 ? SaveScreenSettings[SAVESC_TEXT_CONTINUE_FLASH]
+						: QMisc.colors.caption) : (SaveScreenSettings[SAVESC_TEXT_CONTINUE_COLOUR] > 0 ? 
+							SaveScreenSettings[SAVESC_TEXT_CONTINUE_COLOUR] : QMisc.colors.msgtext)),-1);
+					break;
+					
+				case 1:
+					textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_SAVE],88,96,(flash ? ( SaveScreenSettings[SAVESC_TEXT_SAVE_FLASH] > 0 ? SaveScreenSettings[SAVESC_TEXT_SAVE_FLASH]
+						: QMisc.colors.caption) : (SaveScreenSettings[SAVESC_TEXT_SAVE_COLOUR] > 0 ? 
+							SaveScreenSettings[SAVESC_TEXT_SAVE_COLOUR] : QMisc.colors.msgtext)),-1);
+					break;
+					
+				case 2:
+					if(!type)
+						textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_RETRY],88,120,(flash ? ( SaveScreenSettings[SAVESC_TEXT_RETRY_FLASH] > 0 ? SaveScreenSettings[SAVESC_TEXT_RETRY_FLASH]
+							: QMisc.colors.caption) : (SaveScreenSettings[SAVESC_TEXT_RETRY_COLOUR] > 0 ? 
+								SaveScreenSettings[SAVESC_TEXT_RETRY_COLOUR] : QMisc.colors.msgtext)),-1);
+					else textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_RETRY],88,96,(flash ? ( SaveScreenSettings[SAVESC_TEXT_RETRY_FLASH] > 0 ? SaveScreenSettings[SAVESC_TEXT_RETRY_FLASH]
+						: QMisc.colors.caption) : (SaveScreenSettings[SAVESC_TEXT_RETRY_COLOUR] > 0 ? 
+							SaveScreenSettings[SAVESC_TEXT_RETRY_COLOUR] : QMisc.colors.msgtext)),-1);
+					
+					break;
+				}
+			}
+		}
+		
+		rectfill(framebuf,72,72,79,127,SaveScreenSettings[SAVESC_BACKGROUND]);
+		overtile8(framebuf,htile,72,pos*(type?12:24)+72,curcset,SaveScreenSettings[SAVESC_CUR_FLIP]);
+		advanceframe(true);
+	}
+	while(!Quit && !done);
+
+	if (replay_is_debug())
+		replay_step_comment("game_over selection made");
+	
+	reset_all_combo_animations();
+	clear_bitmap(framebuf);
+	advanceframe(true);
+	
+	if(done)
+	{
+		// This is always the last step before a game save replay is stopped. On replay_continue,
+		// the frame_count is set to this step's frame + 1 to continue the recording–so this comment
+		// is super important.
+		replay_step_comment("game_over");
+
+		if(pos)
+		{
+			Quit=qQUIT;
+		}
+		else
+		{
+			Quit=qCONT;
+		}
+		
+		// Save and quit.
+		if (pos == 1)
+		{
+			//run save scripts
+			FFCore.runOnSaveEngine();
+			// reset palette before drawing the file select.
+			doClearTint();
+			
+			game->save_objects(ZScriptVersion::gc_arrays());
+			saves_write();
+			replay_step_comment("save game"); // TODO: not actually needed now. Could remove.
+		}
+
+		// Anything but Continue.
+		if (pos != 0)
+		{
+			if (replay_get_mode() == ReplayMode::Record) replay_save();
+		}
+	}
+}
+
+void save_game(bool savepoint)
+{
+	//run save scripts
+	FFCore.runOnSaveEngine();
+	if(savepoint)
+	{
+		game->set_continue_scrn(Hero.current_screen >= 0x80 ? home_screen : Hero.current_screen);
+		game->set_continue_dmap(cur_dmap);
+		lastentrance_dmap = cur_dmap;
+		lastentrance = game->get_continue_scrn();
+	}
+	
+	game->save_objects(ZScriptVersion::gc_arrays());
+	
+	flushItemCache();
+	
+	saves_write();
+	if (replay_get_mode() == ReplayMode::Record) replay_save();
+}
+
+bool save_game(bool savepoint, int32_t type)
+{
+	kill_sfx();
+	//music_stop();
+	clear_bitmap(screen);
+	clear_info_bmp();
+	loadfullpal();
+	
+	int32_t htile = SaveScreenSettings[SAVESC_USETILE];
+	int32_t curcset = SaveScreenSettings[SAVESC_CURSOR_CSET];
+	bool done=false;
+	bool didsaved=false;
+	FFCore.kb_typing_mode = false;
+	do
+	{
+		int32_t pos = 0;
+		int32_t f=-1;
+		bool done2=false;
+		clear_to_color(framebuf,SaveScreenSettings[SAVESC_BACKGROUND]);
+		
+		if(type)
+		{
+		//Migrate this to use SaveScreenColours[SAVESC_TEXT] and set that to a default
+		//of QMisc.colors.msgtext when loading the quest in the loadquest function
+		//for quests with a version < 0x254! -Z
+			textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_SAVEQUIT],88,72,( SaveScreenSettings[SAVESC_TEXT_SAVEQUIT_COLOUR] > 0 ? SaveScreenSettings[SAVESC_TEXT_SAVEQUIT_COLOUR] : QMisc.colors.msgtext),-1);
+		}
+		else
+		{
+			textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_SAVE2],88,72,( SaveScreenSettings[SAVESC_TEXT_SAVE2_COLOUR] > 0 ? SaveScreenSettings[SAVESC_TEXT_SAVE2_COLOUR] : QMisc.colors.msgtext),-1);
+		}
+		
+		textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_DONTSAVE],88,96,( SaveScreenSettings[SAVESC_TEXT_DONTSAVE_COLOUR] > 0 ? SaveScreenSettings[SAVESC_TEXT_DONTSAVE_COLOUR] : QMisc.colors.msgtext),-1);
+		textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_QUIT],88,120,( SaveScreenSettings[SAVESC_TEXT_QUIT_COLOUR] > 0 ? SaveScreenSettings[SAVESC_TEXT_QUIT_COLOUR] : QMisc.colors.msgtext),-1);
+		
+		//eat inputs
+		getInput(btnUp, INPUT_PRESS);
+		getInput(btnDown, INPUT_PRESS);
+		getInput(btnS, INPUT_PRESS);
+		do
+		{
+			load_control_state();
+			
+			if(f==-1)
+			{
+				if (getInput(btnUp, INPUT_PRESS | INPUT_IGNORE_DISABLE))
+				{
+					sfx(SaveScreenSettings[SAVESC_CUR_SOUND]);
+					pos=(pos==0)?2:pos-1;
+				}
+
+				if (getInput(btnDown, INPUT_PRESS | INPUT_IGNORE_DISABLE))
+				{
+					sfx(SaveScreenSettings[SAVESC_CUR_SOUND]);
+					pos=(pos+1)%3;
+				}
+
+				if (getInput(btnS, INPUT_PRESS | INPUT_IGNORE_DISABLE)) ++f;
+			}
+			
+			if(f>=0)
+			{
+				if(++f == 65)
+					done2=true;
+					
+				if(!(f&3))
+				{
+					bool flash = (f&4)!=0;
+					
+					switch(pos)
+					{
+					case 0:
+						if(type)
+							textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_SAVEQUIT],88,72,(flash ? ( SaveScreenSettings[SAVESC_TEXT_SAVEQUIT_FLASH] > 0 ? SaveScreenSettings[SAVESC_TEXT_SAVEQUIT_FLASH]
+								: QMisc.colors.caption) : (SaveScreenSettings[SAVESC_TEXT_SAVEQUIT_COLOUR] > 0 ? 
+									SaveScreenSettings[SAVESC_TEXT_SAVEQUIT_COLOUR] : QMisc.colors.msgtext)),-1);
+						else textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_SAVE2],88,72,(flash ? ( SaveScreenSettings[SAVESC_TEXT_SAVE2_FLASH] > 0 ? SaveScreenSettings[SAVESC_TEXT_SAVE2_FLASH]
+								: QMisc.colors.caption) : (SaveScreenSettings[SAVESC_TEXT_SAVE2_COLOUR] > 0 ? 
+									SaveScreenSettings[SAVESC_TEXT_SAVE2_COLOUR] : QMisc.colors.msgtext)),-1);
+						
+						break;
+						
+					case 1:
+						textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_DONTSAVE],88,96,(flash ? ( SaveScreenSettings[SAVESC_TEXT_DONTSAVE_FLASH] > 0 ? SaveScreenSettings[SAVESC_TEXT_DONTSAVE_FLASH]
+							: QMisc.colors.caption) : (SaveScreenSettings[SAVESC_TEXT_DONTSAVE_COLOUR] > 0 ? 
+								SaveScreenSettings[SAVESC_TEXT_DONTSAVE_COLOUR] : QMisc.colors.msgtext)),-1);
+						break;
+						
+					case 2:
+						textout_ex(framebuf,get_zc_font(font_zfont),SaveScreenText[SAVESC_QUIT],88,120,(flash ? ( SaveScreenSettings[SAVESC_TEXT_QUIT_FLASH] > 0 ? SaveScreenSettings[SAVESC_TEXT_QUIT_FLASH]
+							: QMisc.colors.caption) : (SaveScreenSettings[SAVESC_TEXT_QUIT_COLOUR] > 0 ? 
+								SaveScreenSettings[SAVESC_TEXT_QUIT_COLOUR] : QMisc.colors.msgtext)),-1);
+						break;
+					}
+				}
+			}
+			
+			rectfill(framebuf,72,72,79,127,SaveScreenSettings[SAVESC_BACKGROUND]);
+			overtile8(framebuf,htile,72,pos*24+72,curcset,SaveScreenSettings[SAVESC_CUR_FLIP]);
+			advanceframe(true);
+		}
+		while(!Quit && !done2);
+
+		clear_bitmap(framebuf);
+		
+		if(done2)
+		{
+			//Quit = (pos==2) ? qQUIT : 0;
+			if(pos==1||pos==0) done=true;
+			
+			if(pos==0)
+			{
+				//run save scripts
+				FFCore.runOnSaveEngine();
+				if(savepoint)
+				{
+					game->set_continue_scrn(Hero.current_screen >= 0x80 ? home_screen : Hero.current_screen);
+					game->set_continue_dmap(cur_dmap);
+					lastentrance_dmap = cur_dmap;
+					lastentrance = game->get_continue_scrn();
+				}
+				
+				game->save_objects(ZScriptVersion::gc_arrays());
+				saves_write();
+				if (replay_get_mode() == ReplayMode::Record) replay_save();
+				didsaved=true;
+				
+				if(type)
+				{
+					Quit = qQUIT;
+					done=true;
+					skipcont=1;
+				}
+			}
+			
+			if(pos==2)
+			{
+				clear_to_color(framebuf,SaveScreenSettings[SAVESC_BACKGROUND]);
+				textout_ex(framebuf,get_zc_font(font_zfont),"ARE YOU SURE?",88,72,( SaveScreenSettings[SAVESC_TEXT_QUIT_COLOUR] > 0 ? SaveScreenSettings[SAVESC_TEXT_QUIT_COLOUR] : QMisc.colors.msgtext),-1);
+				textout_ex(framebuf,get_zc_font(font_zfont),"YES",88,96,( SaveScreenSettings[SAVESC_TEXT_QUIT_COLOUR] > 0 ? SaveScreenSettings[SAVESC_TEXT_QUIT_COLOUR] : QMisc.colors.msgtext),-1);
+				textout_ex(framebuf,get_zc_font(font_zfont),"NO",88,120,( SaveScreenSettings[SAVESC_TEXT_QUIT_COLOUR] > 0 ? SaveScreenSettings[SAVESC_TEXT_QUIT_COLOUR] : QMisc.colors.msgtext),-1);
+				int32_t pos2=0;
+				int32_t g=-1;
+				bool done3=false;
+				
+				//eat inputs
+				getInput(btnUp, INPUT_PRESS);
+				getInput(btnDown, INPUT_PRESS);
+				getInput(btnS, INPUT_PRESS);
+				do
+				{
+					load_control_state();
+					
+					if(g==-1)
+					{
+						if (getInput(btnUp, INPUT_PRESS | INPUT_IGNORE_DISABLE))
+						{
+							sfx(WAV_CHINK);
+							pos2=(pos2==0)?1:pos2-1;
+						}
+
+						if (getInput(btnDown, INPUT_PRESS | INPUT_IGNORE_DISABLE))
+						{
+							sfx(WAV_CHINK);
+							pos2=(pos2+1)%2;
+						}
+
+						if (getInput(btnS, INPUT_PRESS | INPUT_IGNORE_DISABLE)) ++g;
+					}
+					
+					if(g>=0)
+					{
+						if(++g == 65)
+							done3=true;
+							
+						if(!(g&3))
+						{
+							bool flash = (g&4)!=0;
+							
+							switch(pos2)
+							{
+							case 0:
+								textout_ex(framebuf,get_zc_font(font_zfont),"YES",88,96,(flash ? ( SaveScreenSettings[SAVESC_TEXT_QUIT_FLASH] > 0 ? SaveScreenSettings[SAVESC_TEXT_QUIT_FLASH]
+									: QMisc.colors.caption) : (SaveScreenSettings[SAVESC_TEXT_QUIT_COLOUR] > 0 ? 
+										SaveScreenSettings[SAVESC_TEXT_QUIT_COLOUR] : QMisc.colors.msgtext)),-1);
+								break;
+								
+							case 1:
+								textout_ex(framebuf,get_zc_font(font_zfont),"NO",88,120,(flash ? ( SaveScreenSettings[SAVESC_TEXT_QUIT_FLASH] > 0 ? SaveScreenSettings[SAVESC_TEXT_QUIT_FLASH]
+									: QMisc.colors.caption) : (SaveScreenSettings[SAVESC_TEXT_QUIT_COLOUR] > 0 ? 
+										SaveScreenSettings[SAVESC_TEXT_QUIT_COLOUR] : QMisc.colors.msgtext)),-1);
+								break;
+								//case 2: textout_ex(framebuf,get_zc_font(font_zfont),"QUIT",88,120,c,-1);   break;
+							}
+						}
+					}
+					
+					
+					rectfill(framebuf,72,72,79,127,0);
+					puttile8(framebuf,htile,72,pos2*24+96,1,0);
+					advanceframe(true);
+				}
+				while(!Quit && !done3);
+				
+				clear_bitmap(framebuf);
+				
+				if(pos2==0)
+				{
+					Quit = qQUIT;
+					done=true;
+					skipcont=1;
+				}
+			}
+		}
+	}
+	while(!Quit && !done);
+	
+	ringcolor(false);
+	loadlvlpal(DMaps[cur_dmap].color);
+	
+	if(darkroom)
+	{
+		if(get_qr(qr_FADE))
+		{
+			interpolatedfade();
+		}
+		else
+		{
+			loadfadepal((DMaps[cur_dmap].color)*pdLEVEL+poFADE3);
+		}
+	}
+	
+	return didsaved;
+}

@@ -1,0 +1,117 @@
+{
+	"name": "zquest-lsp",
+	"publisher": "cjamcl",
+	"description": "ZScript scripting language for ZQuest Classic",
+	"author": "Connor Clark",
+	"license": "MIT",
+	"version": "1.0.14",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/ZQuestClassic/ZQuestClassic.git"
+	},
+	"categories": [],
+	"keywords": [
+		"multi-root ready"
+	],
+	"engines": {
+		"vscode": "^1.75.0"
+	},
+	"main": "./client/out/extension",
+	"contributes": {
+		"languages": [
+			{
+				"id": "zscript",
+				"aliases": [
+					"ZScript",
+					"ZQuest Classic Scripting Language"
+				],
+				"extensions": [
+					".zs",
+					".zh",
+					".z"
+				],
+				"configuration": "./language-configuration.json"
+			}
+		],
+		"grammars": [
+			{
+				"language": "zscript",
+				"scopeName": "source.zscript",
+				"path": "./syntaxes/zscript.tmLanguage.json"
+			}
+		],
+		"configuration": {
+			"type": "object",
+			"title": "ZScript extension",
+			"properties": {
+				"zscript.installationFolder": {
+					"scope": "window",
+					"type": "string",
+					"default": "",
+					"description": "ZQuest Classic folder - where `zscript.exe` or `zscript` resides. On Mac, you can use the path to the .app bundle instead"
+				},
+				"zscript.printCompilerOutput": {
+					"scope": "window",
+					"type": "boolean",
+					"default": false,
+					"description": "Prints the output of the compiler to the Output window"
+				},
+				"zscript.ignoreConstAssert": {
+					"scope": "window",
+					"type": "boolean",
+					"default": false,
+					"description": "Ignores 'CONST_ASSERT' statement errors"
+				},
+				"zscript.defaultIncludePaths": {
+					"scope": "window",
+					"type": "array",
+					"default": [
+						"include"
+					],
+					"description": "Global include paths, to be added to compile attempts."
+				},
+				"zscript.defaultIncludeFiles": {
+					"scope": "window",
+					"type": "array",
+					"default": [
+						"include/std.zh"
+					],
+					"description": "Global includes, to be added to compile attempts."
+				},
+				"zscript.trace.server": {
+					"scope": "window",
+					"type": "string",
+					"enum": [
+						"off",
+						"messages",
+						"verbose"
+					],
+					"default": "off",
+					"description": "Traces the communication between VS Code and the language server."
+				}
+			}
+		}
+	},
+	"scripts": {
+		"vscode:prepublish": "npm run compile",
+		"compile": "tsc -b",
+		"watch": "tsc -b -w",
+		"lint": "eslint ./client/src ./server/src --ext .ts,.tsx",
+		"check-zscript-grammar": "node scripts/check-zscript-grammar.mjs",
+		"postinstall": "cd client && npm install && cd ../server && npm install && cd ..",
+		"test": "sh ./scripts/e2e.sh"
+	},
+	"devDependencies": {
+		"@eslint/js": "^9.13.0",
+		"@stylistic/eslint-plugin": "^2.9.0",
+		"@types/glob": "^8.1.0",
+		"@types/mocha": "^10.0.6",
+		"@types/node": "^20",
+		"eslint": "^9.13.0",
+		"mocha": "^10.3.0",
+		"mocha-expect-snapshot": "^7.1.0",
+		"shiki": "^3.23.0",
+		"typescript": "^5.7.3",
+		"typescript-eslint": "^8.22.0"
+	}
+}

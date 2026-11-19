@@ -1,0 +1,785 @@
+// Unit tests for the ZASM optimizer. These reach into the optimizer's internals
+// via zasm_optimize_internal.h. Run with `zplayer -test-zc`.
+
+#include "test_runner/test_runner.h"
+#include "test_runner/assert.h"
+#include "zc/zasm_optimize.h"
+#include "zc/zasm_optimize_internal.h"
+#include "zc/zasm_utils.h"
+#include "zc/ffscript.h"
+#include "components/zasm/defines.h"
+#include "components/zasm/serialize.h"
+#include "base/util.h"
+#include "base/zapp.h"
+#include <fmt/format.h>
+#include <fstream>
+#include <functional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#define C(i) (ctx.script->zasm[i])
+
+// State for the EXPECT macro and the currently-running test.
+static const char* expect_file;
+static int expect_line;
+static std::string name;
+static bool current_test_failed;
+
+#define EXPECT(...) {\
+	expect_file = __FILE__;\
+	expect_line = __LINE__;\
+	expect(__VA_ARGS__);\
+}
+
+static void print_string_delta(const std::string& expected, const std::string& got)
+{
+	std::vector<std::string> expected_lines, got_lines;
+	util::split(expected, expected_lines, '\n');
+	util::split(got, got_lines, '\n');
+	if (expected_lines.size() <= 1 && got_lines.size() <= 1)
+		return;
+
+	fmt::println("= delta\n");
+	for (int i = 0; i < std::max(expected_lines.size(), got_lines.size()); i++)
+	{
+		std::string expected_line = i < expected_lines.size() ? expected_lines[i] : "EOF";
+		std::string got_line = i < got_lines.size() ? got_lines[i] : "EOF";
+		if (expected_line == got_line)
+		{
+			fmt::println("  {}", expected_lines[i]);
+		}
+		else
+		{
+			fmt::println("- {}", expected_lines[i]);
+			fmt::println("+ {}", got_lines[i]);
+		}
+	}
+}
+
+static void normalize_whitespace(std::string& text)
+{
+	util::trimstr(text);
+	std::vector<std::string> lines;
+	util::split(text, lines, '\n');
+	for (auto& line : lines)
+		line.erase(line.find_last_not_of("\t\n\v\f\r ") + 1);
+
+    std::ostringstream os;
+    for (int i = 0; i < lines.size() - 1; ++i) {
+        os << lines.at(i) << "\n";
+    }
+    os << lines.back();
+    text = os.str();
+}
+
+static std::string zasm_to_string_clean(const zasm_script* script)
+{
+	std::string str = zasm_to_string(script);
+	normalize_whitespace(str);
+	util::trimstr(str);
+	return str + "\n";
+}
+
+static void expect(std::string name, const SimulationValue& expected, const SimulationValue& got)
+{
+	if (expected != got)
+	{
+		current_test_failed = true;
+		fmt::println("failure: {}\n{}:{}\n", name, expect_file, expect_line);
+		fmt::println("expected {}, but got: {}\n", expected.to_string(), got.to_string());
+	}
+}
+
+static bool same_instruction(const zasm_script* a, const ffscript& a_op, const zasm_script* b, const ffscript& b_op)
+{
+	if (a_op.command != b_op.command || a_op.arg1 != b_op.arg1 || a_op.arg2 != b_op.arg2 || a_op.arg3 != b_op.arg3)
+		return false;
+
+	auto a_literal = a->literals.get(a_op);
+	auto b_literal = b->literals.get(b_op);
+	if (!a_literal || !b_literal)
+		return a_literal == b_literal;
+	return *a_literal == *b_literal;
+}
+
+static void expect(std::string name, zasm_script* script, const zasm_script* expected_script)
+{
+	const auto& s = expected_script->zasm;
+	bool success = script->size == s.size();
+	for (int i = 0; i < s.size(); i++)
+	{
+		if (!success) break;
+		if (script->zasm[i].command == NOP && s[i].command == NOP)
+			continue;
+		if (!same_instruction(script, script->zasm[i], expected_script, s[i]))
+			success = false;
+	}
+
+	if (!success)
+	{
+		current_test_failed = true;
+		std::string expected = zasm_to_string_clean(expected_script);
+		std::string got = zasm_to_string_clean(script);
+		fmt::println("failure: {}\n{}:{}\n", name, expect_file, expect_line);
+		fmt::println("= expected:\n\n{}", expected);
+		fmt::println("= got:\n\n{}", got);
+		print_string_delta(expected, got);
+	}
+}
+
+static void expect(std::string name, zasm_script* script, std::vector<ffscript>&& s)
+{
+	auto expected_script = zasm_script{std::move(s)};
+	expect(name, script, &expected_script);
+}
+
+// Simplified version of parsing ZASM.
+static zasm_script zasm_from_string(std::string text)
+{
+	normalize_whitespace(text);
+
+	std::vector<ffscript> instructions;
+	zasm_literals literals;
+	std::vector<std::string> lines;
+	util::split(text, lines, '\n');
+	for (auto& line : lines)
+	{
+		util::trimstr(line);
+		if (line.empty() || line.starts_with("Function"))
+			continue;
+
+		instructions.push_back(parse_zasm_op(line, literals));
+	}
+
+	instructions.emplace_back(0xFFFF);
+	return {std::move(instructions), std::move(literals)};
+}
+
+// Used by test_optimize_zasm_unit.py
+void zasm_optimize_run_for_file(std::string path)
+{
+	std::string text = util::read_text_file(path);
+
+	std::vector<std::string> lines;
+	util::split(text, lines, '\n');
+	int last_comment_line = 0;
+	for (auto& line : lines)
+	{
+		if (line.starts_with((";")))
+		{
+			last_comment_line++;
+		}
+		else break;
+	}
+
+	std::string zasm;
+	for (int i = last_comment_line; i < lines.size(); i++)
+		zasm += lines[i] + "\n";
+
+	auto script = zasm_from_string(zasm);
+	if (!script.valid())
+	{
+		fmt::println("error: no zasm parsed from '{}' (missing or empty file?)", path);
+		return;
+	}
+	// Configures the first function as the "entry".
+	script.script_datas.emplace_back(new script_data(ScriptType::None, 0));
+	script.script_datas.back()->pc = 0;
+
+	// Just in case there is a minor roundtrip difference, resave the input.
+	{
+		std::ofstream out(path, std::ios::binary);
+		for (int i = 0; i < last_comment_line; i++)
+			out << lines[i] + "\n";
+		out << zasm_to_string_clean(&script);
+		out.close();
+	}
+
+	fmt::println("\noutput:");
+	if (auto pc = zasm_find_invalid_jump(script.zasm, script.literals))
+		fmt::println("warning: jump to a pc outside of the script at pc {} (the quest loader would disable this script)", *pc);
+	zasm_optimize_verbose = true;
+	zasm_init_meta_cache();
+	zasm_optimize_script(&script);
+	fmt::println("{}", zasm_to_string_clean(&script));
+}
+
+// Runs one test case, counting it in the TestResults. A case fails if any EXPECT
+// reported a mismatch, or if an assert.h assertion (which throws) fired.
+static void TEST(const std::string& test_name, TestResults& tr, const std::function<void()>& body)
+{
+	static auto filter = get_flag_string("-test-filter");
+	if (filter.has_value() && test_name.find(filter.value()) == std::string::npos)
+		return;
+
+	name = test_name;
+	current_test_failed = false;
+	tr.total++;
+	try
+	{
+		body();
+	}
+	catch (const std::exception& e)
+	{
+		fmt::println("{}", e.what());
+		current_test_failed = true;
+	}
+	if (current_test_failed)
+		tr.failed++;
+}
+
+// Like zasm_from_string, for ZASM written without the pcs in front of each instruction.
+static zasm_script zasm_from_instructions(std::string text)
+{
+	normalize_whitespace(text);
+
+	std::vector<std::string> lines;
+	util::split(text, lines, '\n');
+	std::string numbered;
+	int pc = 0;
+	for (auto& line : lines)
+	{
+		util::trimstr(line);
+		if (!line.empty())
+			numbered += fmt::format("{}: {}\n", pc++, line);
+	}
+	return zasm_from_string(numbered);
+}
+
+// The liveness of the whole script, and of every function analyzed on its own (as the JIT does).
+struct LivenessResult
+{
+	StructuredZasm structured_zasm;
+	ZasmCFG cfg;
+	ZasmFunctionLivenessList function_liveness;
+	ZasmLiveness liveness;
+
+	// The D registers live just before the instruction at `pc`.
+	uint8_t live_before(const zasm_script* script, pc_t pc) const
+	{
+		pc_t block = cfg.block_id_containing(pc);
+		uint8_t live = liveness.at(block).out;
+		for (pc_t i = cfg.get_block_final(block); i >= pc; i--)
+		{
+			live = zasm_live_before(script->zasm[i], live, structured_zasm, function_liveness, true);
+			if (i == 0)
+				break;
+		}
+		return live;
+	}
+};
+
+static LivenessResult analyze_liveness(const zasm_script* script)
+{
+	LivenessResult r;
+	r.structured_zasm = zasm_construct_structured(script);
+	std::vector<std::pair<pc_t, pc_t>> pc_ranges;
+	for (const auto& fn : r.structured_zasm.functions)
+		pc_ranges.emplace_back(fn.start_pc, fn.final_pc);
+	r.cfg = zasm_construct_cfg(script, pc_ranges);
+	r.function_liveness = zasm_analyze_function_liveness(script, r.cfg, r.structured_zasm, true, &r.liveness);
+
+	// The analysis of each function on its own must match its part of the whole script's.
+	for (const auto& fn : r.structured_zasm.functions)
+	{
+		auto fn_cfg = zasm_construct_function_cfg(script, r.structured_zasm, fn);
+		std::vector<std::optional<uint8_t>> fixed_live_in(fn_cfg.block_starts.size());
+		for (pc_t b = 0; b < fn_cfg.block_starts.size(); b++)
+		{
+			pc_t pc = fn_cfg.block_starts[b];
+			if (pc < fn.start_pc || pc > fn.final_pc)
+				fixed_live_in[b] = r.liveness.at(r.cfg.block_id_from_start_pc(pc)).in;
+		}
+		auto fn_liveness = zasm_run_liveness_analysis(script, fn_cfg, r.structured_zasm, r.function_liveness, true, &fixed_live_in);
+		for (pc_t b = 0; b < fn_cfg.block_starts.size(); b++)
+		{
+			pc_t pc = fn_cfg.block_starts[b];
+			if (pc < fn.start_pc || pc > fn.final_pc)
+				continue;
+
+			const auto& expected = r.liveness.at(r.cfg.block_id_from_start_pc(pc));
+			assertEqual((int)fn_liveness.at(b).in, (int)expected.in);
+			assertEqual((int)fn_liveness.at(b).out, (int)expected.out);
+		}
+	}
+
+	return r;
+}
+
+static bool is_live(uint8_t mask, int reg)
+{
+	return mask & (1 << reg);
+}
+
+TestResults test_zasm_optimize([[maybe_unused]] bool verbose)
+{
+	TestResults tr{};
+	zasm_script script;
+
+	TEST("evaluate_binary_op", tr, [&]{
+		// Basics
+		// number op number -> number
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_EQ, num_one, num_one));
+		EXPECT(name, num(10000),
+			evaluate_binary_op(CMP_EQ | CMP_SETI, num_one, num_one));
+		EXPECT(name, num(10000),
+			evaluate_binary_op(CMP_EQ | CMP_SETI, num_one, num_one));
+		EXPECT(name, num_zero,
+			evaluate_binary_op(CMP_EQ, num_one, num(1337)));
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_LT, num_one, num(1337)));
+
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_EQ, num_one, num_one));
+		EXPECT(name, num_zero,
+			evaluate_binary_op(CMP_NE, num_one, num_one));
+		EXPECT(name, num_zero,
+			evaluate_binary_op(CMP_LT, num_one, num_one));
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_LE, num_one, num_one));
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_LE, num_zero, num_one));
+
+		// CMP_BOOL
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_EQ | CMP_BOOL, num_one, num_one));
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_EQ | CMP_BOOL, num(100), num_one));
+		EXPECT(name, num_zero,
+			evaluate_binary_op(CMP_EQ | CMP_BOOL, num_zero, num_one));
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_EQ | CMP_BOOL, num_zero, num_zero));
+
+		// Comparing a number with a register results in an expression
+		// register op number -> expression
+		// number op register -> expression
+		EXPECT(name, expr(reg(1), CMP_LT, num(1337)),
+			evaluate_binary_op(CMP_LT, reg(1), num(1337)));
+		EXPECT(name, expr(reg(1), CMP_GT, num(1337)),
+			evaluate_binary_op(CMP_LT, num(1337), reg(1)));
+		EXPECT(name, expr(reg(1), CMP_GE, num(1337)),
+			evaluate_binary_op(CMP_LE, num(1337), reg(1)));
+
+		// Comparing with "Never"
+		// any Never op -> num_zero
+		EXPECT(name, num_zero,
+			evaluate_binary_op(0, num_one, num(1337)));
+		EXPECT(name, num_zero,
+			evaluate_binary_op(0, reg(1), num(1337)));
+		EXPECT(name, num_zero,
+			evaluate_binary_op(0, {ValueType::Expression}, {ValueType::Expression}));
+		EXPECT(name, num_zero,
+			evaluate_binary_op(0, {ValueType::Unknown}, {ValueType::Unknown}));
+
+		// Comparing with "Always"
+		// any Always op -> num_one
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_FLAGS, num_one, num(1337)));
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_FLAGS, reg(1), num(1337)));
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_FLAGS, {ValueType::Expression}, {ValueType::Expression}));
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_FLAGS, {ValueType::Unknown}, {ValueType::Unknown}));
+		EXPECT(name, num(10000),
+			evaluate_binary_op(CMP_FLAGS | CMP_SETI, {ValueType::Unknown}, {ValueType::Unknown}));
+
+		// Comparison with equal operands.
+		auto do_identity_test_cases = [&](const SimulationValue& expected_result, int cmp) {
+			auto T = [&](const SimulationValue& x){
+				EXPECT(name, expected_result,
+					evaluate_binary_op(cmp, x, x));
+			};
+			T(num(0));
+			T(num(1));
+			T(num(10000));
+			T(reg(1));
+			T(expr(reg(1), CMP_EQ, num(2)));
+			auto compound_expr = SimulationValue{ValueType::Expression, CMP_EQ};
+			compound_expr.op1 = std::make_shared<SimulationValue>(expr(reg(2), CMP_EQ, num(1337)));
+			compound_expr.op2 = std::make_shared<SimulationValue>(expr(reg(2), CMP_EQ, num(1337)));
+			T(compound_expr);
+		};
+		do_identity_test_cases(num_one, CMP_FLAGS);
+		do_identity_test_cases(num_one, CMP_EQ);
+		do_identity_test_cases(num_one, CMP_GE);
+		do_identity_test_cases(num_one, CMP_LE);
+		do_identity_test_cases(num_zero, CMP_NE);
+		do_identity_test_cases(num_zero, CMP_GT);
+		do_identity_test_cases(num_zero, CMP_LT);
+		do_identity_test_cases(num_zero, 0);
+
+		EXPECT(name, {ValueType::Unknown},
+			evaluate_binary_op(CMP_EQ, {ValueType::Unknown}, {ValueType::Unknown}));
+		EXPECT(name, {ValueType::Unknown},
+			evaluate_binary_op(CMP_NE, {ValueType::Unknown}, {ValueType::Unknown}));
+
+		// Comparing independent expressions
+		// expr_a ? expr_b -> expr_c
+		auto compound_expr = SimulationValue{ValueType::Expression, CMP_EQ};
+		compound_expr.op1 = std::make_shared<SimulationValue>(expr(reg(1), CMP_EQ, num(1337)));
+		compound_expr.op2 = std::make_shared<SimulationValue>(expr(reg(2), CMP_EQ, num(1337)));
+		EXPECT(name, compound_expr,
+			evaluate_binary_op(CMP_EQ, expr(reg(1), CMP_EQ, num(1337)), expr(reg(2), CMP_EQ, num(1337))));
+
+		// Boolean cast.
+		// int CMP_NE 0 -> boolean
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_NE, num(1337), num(0)));
+
+		// Returns boolean when possible.
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_EQ, num_zero, num(0)));
+		EXPECT(name, num_zero,
+			evaluate_binary_op(CMP_EQ, num_one, num(0)));
+		EXPECT(name, num_zero,
+			evaluate_binary_op(CMP_EQ, num(10000), num(0)));
+
+		// Negation.
+		// x CMP_EQ 0 -> !x
+		EXPECT(name, expr(reg(2), CMP_LT, num(1337)),
+			evaluate_binary_op(CMP_EQ, expr(reg(2), CMP_GE, num(1337)), num(0)));
+		EXPECT(name, expr(reg(2), CMP_LT, num(1337)),
+			evaluate_binary_op(CMP_EQ, expr(reg(2), CMP_GE, num(1337)), num_zero));
+		EXPECT(name, expr(reg(2), CMP_LT, num(1337)),
+			evaluate_binary_op(CMP_NE, expr(reg(2), CMP_GE, num(1337)), num_one));
+
+		// Basic reductions.
+		// (x == y) == True -> x == y
+		EXPECT(name, expr(reg(2), CMP_EQ, reg(3)),
+			evaluate_binary_op(CMP_EQ, expr(reg(2), CMP_EQ, reg(3)), num_one));
+		EXPECT(name, expr(reg(2), CMP_EQ, reg(3)),
+			evaluate_binary_op(CMP_EQ, num_one, expr(reg(2), CMP_EQ, reg(3))));
+		// (x == y) == False -> x != y
+		EXPECT(name, expr(reg(2), CMP_NE, reg(3)),
+			evaluate_binary_op(CMP_EQ, expr(reg(2), CMP_EQ, reg(3)), num_zero));
+		EXPECT(name, expr(reg(2), CMP_NE, reg(3)),
+			evaluate_binary_op(CMP_EQ, num_zero, expr(reg(2), CMP_EQ, reg(3))));
+
+		// Comparing w/o CMP_SETI on expressions w/ CMP_SETI removes CMP_SETI.
+		EXPECT(name, expr(reg(2), CMP_EQ, reg(3)),
+			evaluate_binary_op(CMP_NE, expr(reg(2), CMP_EQ|CMP_SETI, reg(3)), num_zero));
+		// ... and the reverse adds it.
+		EXPECT(name, expr(reg(2), CMP_EQ|CMP_SETI, reg(3)),
+			evaluate_binary_op(CMP_NE|CMP_SETI, expr(reg(2), CMP_EQ, reg(3)), num_zero));
+
+		// An expression w/ CMP_SETI is 0 or 10000, never 1: (x i== y) == 0.0001 -> false.
+		EXPECT(name, num_zero,
+			evaluate_binary_op(CMP_EQ, expr(reg(2), CMP_EQ|CMP_SETI, reg(3)), num_one));
+		// (x i< y) == true, as the compiler emits it (bool-cast compare against 10000) -> x < y
+		EXPECT(name, expr(reg(2), CMP_LT, reg(3)),
+			evaluate_binary_op(CMP_EQ|CMP_BOOL, expr(reg(2), CMP_LT|CMP_SETI, reg(3)), num(10000)));
+		// (x i< y) != 2 -> always true (the expression is 0 or 10000).
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_NE, expr(reg(2), CMP_LT|CMP_SETI, reg(3)), num(20000)));
+		// (x i!= 0) == 1 -> x != 0, keeping the value form of the outer comparison.
+		EXPECT(name, expr(reg(2), CMP_NE, num_zero),
+			evaluate_binary_op(CMP_EQ, evaluate_binary_op(CMP_NE|CMP_SETI, reg(2), num_zero), num(10000)));
+
+		// Weird stuff.
+		// 0 <= (10 < D(2)) -> true
+		EXPECT(name, num_one,
+			evaluate_binary_op(CMP_LE, num(0), expr(num(10), CMP_LT, reg(2))));
+		// 0 > (10 < D(2)) -> false
+		EXPECT(name, num_zero,
+			evaluate_binary_op(CMP_GT, num(0), expr(num(10), CMP_LT, reg(2))));
+		// 0 >= (10 < D(2)) -> 10 >= D(2)
+		EXPECT(name, expr(num(10), CMP_GE, reg(2)),
+			evaluate_binary_op(CMP_GE, num(0), expr(num(10), CMP_LT, reg(2))));
+		// 0 < (10 < D(2)) -> 10 < D(2)
+		EXPECT(name, expr(num(10), CMP_LT, reg(2)),
+			evaluate_binary_op(CMP_LT, num(0), expr(num(10), CMP_LT, reg(2))));
+		// 1 < (10 < D(2)) -> false
+		EXPECT(name, num_zero,
+			evaluate_binary_op(CMP_LT, num(1), expr(num(10), CMP_LT, reg(2))));
+		// 10000 < (10 i< D(2)) -> 10 < D(2)
+		EXPECT(name, num_zero,
+			evaluate_binary_op(CMP_LT, num(10000), expr(num(10), CMP_LT | CMP_SETI, reg(2))));
+		// 0 > (10 i< D(2)) -> 10 i< D(2)
+		EXPECT(name, num_zero,
+			evaluate_binary_op(CMP_GT, num(0), expr(num(10), CMP_LT, reg(2))));
+
+		// Reduce comparison between mutually exclusive expressions.
+		EXPECT(name, num_zero,
+			evaluate_binary_op(CMP_EQ, expr(reg(2), CMP_GT, num(5)), expr(reg(2), CMP_LE, num(5))));
+		EXPECT(name, num_zero,
+			evaluate_binary_op(CMP_EQ, expr(reg(2), CMP_EQ, num(5)), expr(reg(2), CMP_NE, num(5))));
+	});
+
+	TEST("simulate", tr, [&]{
+		std::vector<ffscript> s = {
+			/*  0 */ {COMPAREV, D(2), 0},         // [Block 0 -> 1, 2]
+			/*  1 */ {SETFALSE, D(2)},
+			/*  2 */ {COMPAREV, D(3), 0},
+			/*  3 */ {SETFALSE, D(3)},
+			/*  4 */ {COMPARER, D(2), D(3)},
+			/*  5 */ {SETFALSE, D(2)},
+			/*  6 */ {COMPAREV, D(2), 0},
+			/*  7 */ {GOTOTRUE, 9},
+
+			/*  8 */ {TRACEV, 1},                 // [Block 1 -> 2]
+
+			/*  9 */ {QUIT},                      // [Block 2 ->  ]
+			/* 10 */ {0xFFFF},
+		};
+		script = zasm_script{0, "", std::move(s)};
+
+		StructuredZasm structured_zasm = zasm_construct_structured(&script);
+		OptContext ctx = create_context(structured_zasm, &script, structured_zasm.functions.at(0));
+		SimulationState state{};
+		state.pc = 0;
+		state.final_pc = 7;
+
+		simulate_and_advance(ctx, state);
+		assertEqual(state.pc, pc_t(1));
+		EXPECT(name, reg(2), state.operand_1);
+		EXPECT(name, num(0), state.operand_2);
+
+		simulate_and_advance(ctx, state);
+		assertEqual(state.pc, pc_t(2));
+		assertEqual(state.d[2].to_string(), std::string("Bool(D2)"));
+
+		simulate_and_advance(ctx, state);
+		simulate_and_advance(ctx, state);
+		assertEqual(state.pc, pc_t(4));
+		assertEqual(state.d[3].to_string(), std::string("Bool(D3)"));
+
+		simulate_and_advance(ctx, state);
+		simulate_and_advance(ctx, state);
+		assertEqual(state.pc, pc_t(6));
+		assertEqual(state.d[2].to_string(), std::string("(Bool(D2)) != (Bool(D3))"));
+
+		simulate_and_advance(ctx, state);
+		simulate_and_advance(ctx, state);
+		assertEqual(state.pc, pc_t(7));
+		int cmp = command_to_cmp(C(state.pc).command, C(state.pc).arg1);
+		assertEqual(evaluate_binary_op(cmp, state.operand_1, state.operand_2).to_string(), std::string("(Bool(D2)) == (Bool(D3))"));
+	});
+
+	TEST("compile_conditional", tr, [&]{
+		{
+			std::vector<ffscript> r;
+			compile_conditional(r, {GOTOCMP, 0, CMP_EQ}, reg(2), num_one);
+			auto script = zasm_script(std::move(r));
+			EXPECT(name, &script, {
+				{COMPAREV, D(2), 1},
+				{GOTOCMP, 0, CMP_EQ},
+			});
+		}
+
+		{
+			std::vector<ffscript> r;
+			auto e = expr(reg(2), CMP_NE, num(0));
+			compile_conditional(r, {GOTOCMP, 0, CMP_EQ},
+				e, num(1));
+			auto script = zasm_script(std::move(r));
+			EXPECT(name, &script, {
+				{COMPAREV, D(2), 0},
+				{GOTOCMP, 0, CMP_NE},
+			});
+		}
+
+		{
+			std::vector<ffscript> r;
+			auto e = expr(reg(2), CMP_GT, num(10));
+			compile_conditional(r, {GOTOCMP, 0, CMP_NE},
+				e, num(0));
+			auto script = zasm_script(std::move(r));
+			EXPECT(name, &script, {
+				{COMPAREV, D(2), 10},
+				{GOTOCMP, 0, CMP_GT},
+			});
+		}
+
+		{
+			std::vector<ffscript> r;
+			auto e = expr(reg(2), CMP_NE, num(0));
+			compile_conditional(r, {GOTOCMP, 0, CMP_NE},
+				e, num(0));
+			auto script = zasm_script(std::move(r));
+			EXPECT(name, &script, {
+				{COMPAREV, D(2), 0},
+				{GOTOCMP, 0, CMP_NE},
+			});
+		}
+
+		{
+			std::vector<ffscript> r;
+			compile_conditional(r, {GOTOCMP, 0, CMP_NE},
+				boolean_cast(reg(2)), boolean_cast(reg(3)));
+			auto script = zasm_script(std::move(r));
+			EXPECT(name, &script, {
+				{COMPARER, D(2), D(3)},
+				{GOTOCMP, 0, CMP_NE|CMP_BOOL},
+			});
+		}
+	});
+
+	TEST("zasm_literals", tr, [&]{
+		zasm_literals literals;
+		ffscript op{WRITEPODSTRING, D(2)};
+
+		// A literal with neither a string nor an array is not stored.
+		assertTrue(literals.set(op, {}));
+		assertEqual(op.literal, uint16_t(0));
+		assertTrue(literals.get(op) == nullptr);
+
+		assertTrue(literals.set(op, {.str = ""}));
+		assertEqual(op.literal, uint16_t(1));
+		assertEqual(*literals.str(op), std::string(""));
+		assertTrue(literals.vec(op) == nullptr);
+
+		while (literals.size() < zasm_literals::max_size)
+			assertTrue(literals.add({.vec = std::vector<int32_t>{(int32_t)literals.size()}}) != 0);
+		assertEqual(literals.add({.str = "x"}), uint16_t(0));
+		assertTrue(!literals.set(op, {.str = "x"}));
+		assertEqual(op.literal, uint16_t(0));
+
+		ffscript last{WRITEPODARRAY, D(2)};
+		last.literal = zasm_literals::max_size;
+		assertEqual((*literals.vec(last))[0], int32_t(zasm_literals::max_size - 1));
+	});
+
+	TEST("zasm_text_round_trip", tr, [&]{
+		// The snippet tests re-save their input by printing what they parsed, so
+		// parsing printed ZASM must give back the same script.
+		zasm_literals literals;
+		auto with_string = [&](std::string str){
+			ffscript op{WRITEPODSTRING, D(2)};
+			literals.set(op, {.str = std::move(str)});
+			return op;
+		};
+		auto with_vector = [&](int command, int arg1, std::vector<int32_t> vec){
+			ffscript op(command, arg1);
+			literals.set(op, {.vec = std::move(vec)});
+			return op;
+		};
+
+		std::vector<ffscript> zasm;
+		// Block starts, long enough to reach the column of their annotations.
+		zasm.push_back(with_vector(GOTOTABLE, SWITCHKEY, {10000, 7, 1, 1, 1, 1}));
+		zasm.push_back(with_vector(GOTORANGES, SWITCHKEY, {7, 10000, 20000, 2, 40000, 50000, 3}));
+		// A block start with no string, so its annotation directly follows the register.
+		zasm.push_back({WRITEPODSTRING, D(2)});
+		zasm.push_back(with_string("  two  spaces, \"quoted\", C:\\new\n\t\xe9"));
+		zasm.push_back(with_string(""));
+		zasm.push_back({WRITEPODARRAY, D(2)});
+		zasm.push_back(with_vector(WRITEPODARRAY, D(2), {}));
+		zasm.push_back({QUIT});
+		zasm.emplace_back(0xFFFF);
+
+		zasm_script script{std::move(zasm), std::move(literals)};
+		auto parsed = zasm_from_string(zasm_to_string_clean(&script));
+		EXPECT(name, &parsed, &script);
+	});
+
+	TEST("liveness_branch_then_call", tr, [&]{
+		// D3 is written before a branch into two calls of a function that never touches it, and
+		// read after they merge. It must be live at the branch.
+		auto script = zasm_from_instructions(R"(
+			SETV            D3               7
+			COMPAREV        D2               0
+			GOTOCMP         5                ==
+			CALLFUNC        8
+			GOTO            6
+			CALLFUNC        8
+			TRACER          D3
+			QUIT
+			SETV            D2               1
+			RETURNFUNC
+		)");
+		zasm_init_meta_cache();
+		auto r = analyze_liveness(&script);
+		assertTrue(is_live(r.live_before(&script, 2), 3));
+		assertTrue(is_live(r.live_before(&script, 3), 3));
+		assertTrue(is_live(r.live_before(&script, 5), 3));
+	});
+
+	TEST("liveness_written_before_return", tr, [&]{
+		// The callee writes D3, then branches to its return. The caller reads D3 after the call.
+		auto script = zasm_from_instructions(R"(
+			CALLFUNC        3
+			TRACER          D3
+			QUIT
+			SETV            D3               9
+			COMPAREV        D2               0
+			GOTOCMP         6                ==
+			RETURNFUNC
+		)");
+		zasm_init_meta_cache();
+		auto r = analyze_liveness(&script);
+		assertTrue(is_live(r.function_liveness.at(1).read_after_return, 3));
+		assertTrue(is_live(r.live_before(&script, 5), 3));
+		assertTrue(is_live(r.live_before(&script, 6), 3));
+		// Nothing calls the entry function, but its return value is still read (the debugger can
+		// call any function).
+		assertEqual((int)r.function_liveness.at(0).read_after_return, 1 << 2);
+	});
+
+	TEST("liveness_kept_across_calls", tr, [&]{
+		// D3 is kept across two calls of a function that never touches it. D2 is not: the callee
+		// always writes it.
+		auto script = zasm_from_instructions(R"(
+			SETV            D3               7
+			SETV            D2               7
+			CALLFUNC        7
+			CALLFUNC        7
+			TRACER          D3
+			TRACER          D2
+			QUIT
+			SETV            D2               1
+			RETURNFUNC
+		)");
+		zasm_init_meta_cache();
+		auto r = analyze_liveness(&script);
+		assertEqual((int)r.function_liveness.at(1).must_write, 1 << 2);
+		assertTrue(is_live(r.live_before(&script, 2), 3));
+		assertTrue(is_live(r.live_before(&script, 3), 3));
+		assertTrue(!is_live(r.live_before(&script, 2), 2));
+		assertTrue(!is_live(r.live_before(&script, 3), 2));
+	});
+
+	TEST("liveness_must_write", tr, [&]{
+		// D3 is written on only one path to the return (just before a recursive call), so it is not
+		// written for sure. D2 is written on every path to the return.
+		auto script = zasm_from_instructions(R"(
+			SETV            D3               7
+			CALLFUNC        5
+			TRACER          D3
+			TRACER          D2
+			QUIT
+			COMPAREV        D2               0
+			GOTOCMP         9                ==
+			SETV            D3               1
+			CALLFUNC        5
+			SETV            D2               1
+			RETURNFUNC
+		)");
+		zasm_init_meta_cache();
+		auto r = analyze_liveness(&script);
+		assertEqual((int)r.function_liveness.at(1).must_write, 1 << 2);
+		assertTrue(is_live(r.live_before(&script, 1), 3));
+		// The callee reads D2 (for the comparison) before writing it.
+		assertTrue(is_live(r.function_liveness.at(1).live_in, 2));
+	});
+
+	TEST("liveness_callee_reads_on_entry", tr, [&]{
+		// The callee reads D3 on entry, and the block calling it reads nothing itself. (The
+		// analysis of the caller on its own used to miss this.)
+		auto script = zasm_from_instructions(R"(
+			SETV            D3               7
+			CALLFUNC        3
+			QUIT
+			TRACER          D3
+			RETURNFUNC
+		)");
+		zasm_init_meta_cache();
+		auto r = analyze_liveness(&script);
+		assertTrue(is_live(r.function_liveness.at(1).live_in, 3));
+		assertTrue(is_live(r.live_before(&script, 1), 3));
+	});
+
+	return tr;
+}

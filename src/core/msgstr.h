@@ -1,0 +1,198 @@
+#ifndef CORE_MSGSTR_H_
+#define CORE_MSGSTR_H_
+
+#include <string>
+#include "base/ints.h"
+#include "base/headers.h"
+#include "base/containers.h"
+#include "components/scc/scc.h"
+
+#define MSG_NEW_SIZE 8192
+#define MSGBUF_SIZE (MSG_NEW_SIZE*8)
+
+#define STRINGFLAG_WRAP             0x01
+#define STRINGFLAG_CONT             0x02
+//0x04
+//0x08
+#define STRINGFLAG_FULLTILE         0x10
+#define STRINGFLAG_TRANS_BG         0x20
+#define STRINGFLAG_TRANS_FG         0x40
+#define STRINGFLAG_NOFREEZE         0x80
+enum
+{
+	STR_ADVP_TEXT,
+	STR_ADVP_NEXTSTR,
+	STR_ADVP_POSSZ,
+	STR_ADVP_PORTRAIT,
+	STR_ADVP_BACKGROUND,
+	STR_ADVP_FONT,
+	STR_ADVP_SFX,
+	STR_ADVP_SPACING,
+	STR_ADVP_MARGINS,
+	STR_ADVP_SHADOW,
+	STR_ADVP_LAYER,
+	STR_ADVP_FLAGS,
+	STR_ADVP_ICON_MORE,
+	STR_ADVP_ICON_SCROLL_UP,
+	STR_ADVP_ICON_SCROLL_DOWN,
+	STR_ADVP_SCROLL_SPEEDS,
+	STR_ADVP_SZ
+};
+
+struct message_portrait
+{
+	int tile = 0;
+	byte cset = 0, x = 0, y = 0, tw = 1, th = 1;
+	
+	void clear();
+};
+
+enum class message_anchor : uint8_t
+{
+	// anchor to 8-dir sides of the messagebox
+	up, down, left, right, l_up, r_up, l_down, r_down,
+	// anchor centered
+	center,
+	// anchor to the screen
+	screen,
+	// anchor x to screen + y to up
+	screen_y_offset,
+	
+	//
+	max_anchor
+};
+struct message_icon
+{
+	int16_t sprite = -1;
+	message_anchor anchor = message_anchor::r_down;
+	int16_t x = 0, y = 0;
+};
+
+struct MsgStr
+{
+	enum class EncodingType {Binary, Ascii};
+
+	// This is the underlying, raw data. If encoding_type is binary,
+	// this uses the "legacy" function to parse.
+	// Use `serialize` instead to get a human readable string.
+	std::string s;
+	EncodingType encoding_type;
+	mutable ParsedMsgStr parsed_msg_str;
+	mutable std::vector<zfix> segments_as_zfix_array;
+	word nextstring;
+	int32_t tile;
+	byte cset;
+	bool trans;
+	byte font;
+	int16_t x;
+	int16_t y;
+	uint16_t w;
+	uint16_t h;
+	word sfx, adv_sfx, menu_move_sfx, menu_close_sfx;
+	word listpos;
+	byte vspace;
+	byte hspace;
+	byte stringflags;
+	int16_t margins[4];
+	message_portrait portrait;
+	byte shadow_type;
+	byte shadow_color;
+	byte drawlayer;
+	message_icon icon_more, icon_scroll_up, icon_scroll_down;
+	byte active_scroll_speed, passive_scroll_speed;
+	
+	// Copy everything except listpos
+	MsgStr& operator=(MsgStr const& other);
+	// Copy text data - just s and nextstring
+	void copyText(MsgStr const& other);
+	// Copy style data - everything except s, nextstring, and listpos
+	void copyStyle(MsgStr const& other);
+	void copyAll(MsgStr const& other);
+	void advpaste(MsgStr const& other, bitstring const& pasteflags);
+	void clear();
+	warnings setFromAsciiEncoding(std::string text);
+	warnings setFromLegacyEncoding(std::string text);
+	warnings set(std::string text, EncodingType encoding_type);
+	warnings parse() const;
+	void ensureLegacyEncoding();
+	void ensureAsciiEncoding();
+	// A human-readable encoding of the string.
+	std::string serialize() const;
+	// Returns `s` re-encoded as `type`, without modifying this MsgStr.
+	std::string serialize(EncodingType type) const;
+	const std::vector<zfix>& segmentsAsZFixArray() const;
+
+	struct iterator
+	{
+		enum State {
+			NOT_STARTED,
+			CHARACTER,
+			COMMAND,
+			IDLE,
+			DONE,
+		};
+
+		iterator(const MsgStr* str) : str(str) {}
+
+		// Do one iteration of processing the msg str, and sets `state` as appropriate.
+		// Returns true if done.
+		bool next();
+		void set_buffer(std::string text);
+		// Returns true if done.
+		bool done() const;
+		// Returns then nth next character (where 0 is the next one).
+		// Only looks as far as the current buffer - the start of the next segment is a breakpoint.
+		std::string peek(byte n) const;
+		// Returns the rest of the current word.
+		const char* remaining_word() const;
+
+		// Set how many frames to idle after a segment finishes. If forced, then holding the A
+		// button to speed up messages will not have an effect.
+		void set_post_segment_delay(int frames, bool forced);
+		void set_post_segment_delay_fast(bool fast);
+		int get_post_segment_delay() const;
+		bool get_post_segment_delay_forced() const;
+
+		State state = NOT_STARTED;
+		// A single character. This is a string because eventually this may contain a unicode
+		// character, which is larger than one byte.
+		// This is only valid if `state` is CHARACTER.
+		std::string character;
+		// This is only valid if `state` is COMMAND.
+		StringCommand command;
+
+	private:
+		bool next_segment();
+		bool next_word();
+		bool next_character();
+
+		const MsgStr* str;
+		// The text from the current segment.
+		std::string buffer;
+		// The text from buffer for the current "word".
+		std::string word;
+		// The next index to use for `str->parsed_msg_str.segment_types`.
+		int segment_index = 0;
+		// The next index to use for `str->parsed_msg_str.literals`.
+		int literal_index = 0;
+		// The next index to use for `str->parsed_msg_str.commands`.
+		int command_index = 0;
+		// The index into `buffer`, where the next `word` will begin.
+		int j = 0;
+		// The index into `word` - `character` will be set based on this when `next()` is called.
+		int k = 0;
+		// How many frames to idle after a segment finishes.
+		int post_segment_delay = 0;
+		// If holding down "A/B" will decrease post_segment_delay faster.
+		bool post_segment_delay_forced = false;
+		// Set to true when the A button is held to speed up post_segment_delay (if post_segment_delay_forced is false).
+		bool post_segment_delay_fast = false;
+	};
+
+	iterator create_iterator() const;
+};
+
+extern MsgStr* MsgStrings;
+
+#endif
+

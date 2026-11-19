@@ -1,0 +1,277 @@
+name: Test
+run-name: Test (${{ inputs.runs-on }}, ${{ inputs.arch }}) ${{ inputs.extra-args }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs-on:
+        type: string
+        description: 'runs-on'
+      arch:
+        type: string
+        description: 'arch'
+      compiler:
+        type: string
+        description: 'compiler'
+      config:
+        type: choice
+        description: 'config'
+        default: 'Release'
+        options: ['Release', 'Debug', 'RelWithDebInfo', 'Coverage', 'Asan']
+      extra-args:
+        type: string
+        description: 'extra-args'
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+        required: true
+      arch:
+        type: string
+        required: true
+      compiler:
+        type: string
+        required: true
+      config:
+        type: string
+        required: true
+      extra-args:
+        type: string
+      from-ci-workflow:
+        type: boolean
+    secrets:
+      # Repository secrets are never exposed to pull_request runs from forks, so
+      # this arrives empty there and the steps that need it are skipped.
+      GH_PAT_ZSCRIPT_DATABASE:
+        required: false
+
+env:
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  # Get the LFS cache ready. This avoids every shard of each environment downloading the LFS objects
+  # at the same time on any change, which is bad for quota.
+  warm-lfs-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - name: git clone
+        uses: connorjclark/action-cached-lfs-checkout@3ea4dc59b06f3baa8c01ba891fbfc2dbfdce5bc8
+        with:
+          enableCrossOsArchive: true
+
+  build:
+    needs: warm-lfs-cache
+    # See https://github.com/community/community/discussions/40777
+    # uses: ./.github/workflows/build.yml
+    uses: ZQuestClassic/ZQuestClassic/.github/workflows/build.yml@main
+    with:
+      runs-on: ${{ inputs.runs-on }}
+      arch: ${{ inputs.arch }}
+      compiler: ${{ inputs.compiler }}
+      config: ${{ inputs.config }}
+      debug-info: true
+      test-runner: true
+
+  test:
+    needs: build
+    strategy:
+      matrix:
+        num_shards: [6]
+        shard_index: [1, 2, 3, 4, 5, 6]
+      fail-fast: false
+    name: Replays ${{ matrix.shard_index }}/${{ matrix.num_shards }}
+    runs-on: ${{ inputs.runs-on }}
+    env:
+      # The zscript database is a private repo. Without the token (pull requests
+      # from forks) its checkout is skipped and tests/test_zscript_database.py
+      # skips itself.
+      HAS_ZSCRIPT_DATABASE_TOKEN: ${{ secrets.GH_PAT_ZSCRIPT_DATABASE != '' }}
+    steps:
+      - name: git clone
+        uses: connorjclark/action-cached-lfs-checkout@3ea4dc59b06f3baa8c01ba891fbfc2dbfdce5bc8
+        with:
+          enableCrossOsArchive: true
+      # For test_zscript_version_docs.
+      - run: git fetch origin releases/2.55
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Linux Test Dependencies
+        if: ${{ contains(inputs.runs-on, 'ubuntu') }}
+        run: sudo apt-get update && sudo apt-get install libopengl0 libglu1 lldb libpulse0 xvfb
+
+      - run: mkdir -p .tmp
+
+      - name: Install Node.js 22.x
+        if: ${{ matrix.shard_index == 1 && inputs.from-ci-workflow }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: 22.x
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: ${{ needs.build.outputs.artifact-name }}
+
+      # Extract the build artifact to zc-extracted.
+      - name: Extract package
+        run: >
+          bash .github/workflows/run_python.sh .github/workflows/ci.py extract-package
+          --repo ${{ github.repository }}
+          --config ${{ inputs.config }}
+          --package "${{ needs.build.outputs.artifact-name }}/${{ needs.build.outputs.package-name }}"
+          --artifact-name "${{ needs.build.outputs.artifact-name }}"
+          --build-folder zc-extracted
+
+      - name: Run replay tests
+        env:
+          EXTRA_ARGS: ${{ inputs.extra-args }}
+        run: >
+          bash .github/workflows/run_python.sh .github/workflows/ci.py replay-tests
+          --repo ${{ github.repository }}
+          --runs-on ${{ inputs.runs-on }}
+          --arch ${{ inputs.arch }}
+          --compiler ${{ inputs.compiler }}
+          --config ${{ inputs.config }}
+          --run-id ${{ github.run_id }}
+          --shard ${{ matrix.shard_index }}/${{ matrix.num_shards }}
+          --extra-args "$EXTRA_ARGS"
+          --build-folder zc-extracted
+
+      # Just run a few replays with JIT disabled.
+      # Also, without headless.
+      - name: Test w/o JIT
+        if: ${{ matrix.shard_index == 1 && inputs.from-ci-workflow && inputs.compiler != 'msvc' }}
+        env:
+          EXTRA_ARGS: ${{ inputs.extra-args }}
+        run: >
+          bash .github/workflows/run_python.sh .github/workflows/ci.py replay-tests
+          --repo ${{ github.repository }}
+          --runs-on ${{ inputs.runs-on }}
+          --arch ${{ inputs.arch }}
+          --compiler ${{ inputs.compiler }}
+          --config ${{ inputs.config }}
+          --run-id ${{ github.run_id }}
+          --no-jit
+          --extra-args "$EXTRA_ARGS"
+          --build-folder zc-extracted
+
+      # Run the same subset with the ZASM optimizer disabled. Some JIT bugs only
+      # surface when the optimizer isn't rewriting the ZASM beforehand.
+      - name: Test w/o ZASM optimizer
+        if: ${{ matrix.shard_index == 1 && inputs.from-ci-workflow && inputs.compiler != 'msvc' }}
+        env:
+          EXTRA_ARGS: ${{ inputs.extra-args }}
+        run: >
+          bash .github/workflows/run_python.sh .github/workflows/ci.py replay-tests
+          --repo ${{ github.repository }}
+          --runs-on ${{ inputs.runs-on }}
+          --arch ${{ inputs.arch }}
+          --compiler ${{ inputs.compiler }}
+          --config ${{ inputs.config }}
+          --run-id ${{ github.run_id }}
+          --no-optimize-zasm
+          --extra-args "$EXTRA_ARGS"
+          --build-folder zc-extracted
+
+      - name: Updater cache
+        if: ${{ matrix.shard_index == 1 && inputs.from-ci-workflow }}
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.tmp/test_updater/cache
+          key: updater-cache-${{ inputs.runs-on }}-${{ runner.arch }}
+
+      - name: Archives cache
+        if: ${{ matrix.shard_index == 1 && inputs.from-ci-workflow }}
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.tmp/archives
+          key: archives-cache-${{ inputs.runs-on }}-${{ runner.arch }}
+
+      # The vscode extension test downloads a pinned VS Code into this folder;
+      # the key follows the file that holds the pinned version.
+      - name: VS Code test cache
+        if: ${{ matrix.shard_index == 1 && inputs.from-ci-workflow }}
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/vscode-extension/.vscode-test/vscode-*
+          key: vscode-test-cache-${{ inputs.runs-on }}-${{ runner.arch }}-${{ hashFiles('vscode-extension/client/src/test/runTest.ts') }}
+
+      - name: Checkout zscript database
+        if: ${{ matrix.shard_index == 1 && inputs.from-ci-workflow && env.HAS_ZSCRIPT_DATABASE_TOKEN == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT_ZSCRIPT_DATABASE }}
+          repository: ZQuestClassic/zscript-database
+          ref: 68f3d886d7fd929038deb729f38c440ed0250fc0
+          path: ${{ github.workspace }}/.tmp/zscript-database
+
+      - name: Run unit tests
+        if: ${{ matrix.shard_index == 1 && inputs.from-ci-workflow }}
+        shell: bash
+        # xvfb provides a real X display on Linux; some test binaries touch X
+        # (e.g. keyboard setup) and the runner images vary in DISPLAY setup.
+        run: |
+          CMD="bash .github/workflows/run_python.sh .github/workflows/ci.py unit-tests
+            --repo ${{ github.repository }}
+            --compiler ${{ inputs.compiler }}
+            --config ${{ inputs.config }}
+            --build-folder zc-extracted"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            xvfb-run --auto-servernum $CMD
+          else
+            $CMD
+          fi
+
+      - name: Generate coverage json
+        if: inputs.config == 'Coverage'
+        run: >
+          bash .github/workflows/run_python.sh .github/workflows/ci.py coverage
+          --repo ${{ github.repository }}
+          --compiler ${{ inputs.compiler }}
+          --config ${{ inputs.config }}
+
+      - name: Upload Coverage JSON
+        uses: actions/upload-artifact@v7
+        if: inputs.config == 'Coverage'
+        with:
+          name: coverage-${{ inputs.runs-on }}-${{ inputs.arch }}-${{ inputs.compiler }}-${{ matrix.shard_index }}-of-${{ matrix.num_shards }}
+          path: ${{ github.workspace }}/tests/.coverage/coverage.json
+
+      - name: Upload Generated Source Files
+        uses: actions/upload-artifact@v7
+        if: inputs.config == 'Coverage' && matrix.shard_index == 1
+        with:
+          name: generated-source-files
+          path: ${{ github.workspace }}/build/tmp-src
+
+      - name: Archive test results
+        if: (github.event_name == 'workflow_dispatch' && !contains(inputs.extra-args, '--update')) || failure()
+        shell: bash
+        run: |
+          if [[ -d ".tmp/test_results" ]] ; then
+            cd .tmp/test_results
+            bash ../../.github/workflows/run_python.sh -m tarfile -c ../test_results.tar .
+          fi
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v7
+        if: (github.event_name == 'workflow_dispatch' && !contains(inputs.extra-args, '--update')) || failure()
+        with:
+          name: replays-${{ inputs.runs-on }}-${{ inputs.arch }}-${{ inputs.compiler }}-${{ matrix.shard_index }}-of-${{ matrix.num_shards }}
+          path: ${{ github.workspace }}/.tmp/test_results.tar
+
+      - name: Upload updated files
+        uses: actions/upload-artifact@v7
+        if: contains(inputs.extra-args, '--update')
+        with:
+          name: replays-${{ inputs.runs-on }}-${{ inputs.arch }}-${{ inputs.compiler }}-${{ matrix.shard_index }}-of-${{ matrix.num_shards }}
+          path: ${{ github.workspace }}/.tmp/test_results/**/updated

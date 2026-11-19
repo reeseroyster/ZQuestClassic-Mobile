@@ -1,0 +1,639 @@
+# To download a specific build:
+#   python scripts/archives.py download 2.55-alpha-109
+#
+# For more, see --help
+
+import argparse
+import functools
+import io
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import textwrap
+import zipfile
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+import common
+import git_helpers
+import requests
+import s3_helpers
+
+from github import Github, UnknownObjectException
+from joblib import Memory
+
+
+def _get_historical():
+    import build_historical
+
+    return build_historical
+
+
+script_dir = Path(os.path.dirname(os.path.realpath(__file__)))
+root_dir = script_dir.parent
+archives_dir = root_dir / '.tmp/archives'
+memory = Memory(root_dir / '.tmp/memory_archives', verbose=0)
+bucket_url = 'https://zc-archives.nyc3.cdn.digitaloceanspaces.com'
+
+
+@dataclass
+class Revision:
+    tag: str  # also could be a full sha hash
+    commit_count: int
+    type: Literal['release', 'test', 'local']
+    is_local_build: bool = False
+
+    def dir(self):
+        return archives_dir / self.type / self.tag
+
+    def binaries(self, release_platform: str):
+        if self.is_local_build:
+            try:
+                dir = _get_historical().build_locally(self, release_platform)
+            except KeyboardInterrupt:
+                exit(1)
+            except Exception as e:
+                print(e)
+                return None
+        else:
+            dir = download_revision(self, release_platform)
+
+        # Tolerate builds missing some binaries (ex: no zscript in old
+        # releases); run_zc_command raises if a missing one is actually used.
+        return create_binary_paths(dir, release_platform, missing_ok=True)
+
+
+# For a given branch, assign a number (commit count) to every commit. Commits are
+# numbered in order from oldest to newest - the older the commit, the smaller
+# the commit count.
+@functools.cache
+def get_commit_counts(branch: str):
+    commit_counts = {}
+    shas = subprocess.check_output(
+        ['git', 'log', '--format=format:%H', '--reverse', '--first-parent', branch],
+        encoding='utf-8',
+    ).splitlines()
+    for i, sha in enumerate(shas):
+        commit_counts[sha] = i
+    return commit_counts
+
+
+def get_release_commit_count(branch: str, sha: str):
+    commit_counts = get_commit_counts(branch)
+    if sha not in commit_counts:
+        raise Exception(f'no commit count found: {sha}')
+    return commit_counts[sha]
+
+
+def get_release_commit_count_main(sha: str):
+    return get_release_commit_count('main', sha)
+
+
+@memory.cache
+def _get_release_commit_count_of_tag(branch: str, tag: str):
+    # Raises if the tag can't be resolved to a commit on the branch. Only
+    # successful lookups reach the cache.
+    sha = git_helpers.rev_parse(tag)
+    try:
+        return get_release_commit_count(branch, sha)
+    except Exception:
+        pass
+
+    sha = git_helpers.tag_to_sha_on_branch(tag, branch)
+    return get_release_commit_count(branch, sha)
+
+
+@functools.cache
+def get_reachable_shas(branch: str):
+    return set(
+        subprocess.check_output(
+            ['git', 'rev-list', branch], encoding='utf-8'
+        ).splitlines()
+    )
+
+
+# Every local tag's commit sha, in one git call.
+@functools.cache
+def get_tag_shas():
+    lines = subprocess.check_output(
+        [
+            'git',
+            'for-each-ref',
+            '--format=%(refname:short) %(objectname) %(*objectname)',
+            'refs/tags',
+        ],
+        encoding='utf-8',
+    ).splitlines()
+    tag_shas = {}
+    for line in lines:
+        tag, sha, peeled_sha = line.split(' ')
+        tag_shas[tag] = peeled_sha or sha
+    return tag_shas
+
+
+def _is_full_sha(commitish: str):
+    return len(commitish) == 40 and all(c in '0123456789abcdef' for c in commitish)
+
+
+def get_release_commit_count_of_tag(branch: str, tag: str):
+    # Failures are not cached, since they may be transient (ex: the tag or
+    # the branch simply isn't fetched locally yet).
+    try:
+        # A commit the branch can't reach has no merge into it either, so
+        # skip the git lookups. Without this, listing a channel's builds
+        # (most of which belong to the other channel) costs two git
+        # subprocesses per unreachable commit, every run.
+        sha = tag if _is_full_sha(tag) else get_tag_shas().get(tag)
+        if sha is not None and sha not in get_reachable_shas(branch):
+            return None
+        return _get_release_commit_count_of_tag(branch, tag)
+    except Exception:
+        return None
+
+
+def get_release_commit_count_of_tag_or_raise(branch: str, tag: str):
+    commit_count = get_release_commit_count_of_tag(branch, tag)
+    if commit_count is None:
+        raise Exception(f'can not find {branch} commit for tag: {tag}')
+    return commit_count
+
+
+@memory.cache
+def _has_release_package(tag: str, release_platform: str):
+    try:
+        return get_gh_release_package_url(tag, release_platform) is not None
+    except UnknownObjectException:
+        # No GitHub release exists for this tag.
+        return False
+
+
+def has_release_package(tag: str, release_platform: str):
+    # Only genuine "checked GitHub and it isn't there" answers are cached.
+    # Transient errors (no GH_PAT set, network issues) must not be, or the
+    # wrong answer would stick until .tmp/memory_archives is deleted.
+    try:
+        return _has_release_package(tag, release_platform)
+    except Exception as e:
+        print(
+            f'warning: could not check release package for {tag}: {e}',
+            file=sys.stderr,
+        )
+        return False
+
+
+def revision_count_supports_platform(
+    revision_count: int, platform_str: str, branch: str
+):
+    if platform_str == 'windows':
+        return True
+    if (
+        platform_str == 'mac'
+        and revision_count
+        < get_release_commit_count_of_tag_or_raise(branch, '2.55-alpha-108')
+    ):
+        return False
+    if (
+        platform_str == 'linux'
+        and revision_count
+        < get_release_commit_count_of_tag_or_raise(branch, '2.55-alpha-112')
+    ):
+        return False
+    return True
+
+
+@functools.cache
+def get_download_urls(release_platform: str):
+    keys = s3_helpers.list_bucket(bucket_url)
+
+    keys_by_commitish = {}
+    for key in keys:
+        commitish = key.split('/', 1)[0]
+        if commitish not in keys_by_commitish:
+            keys_by_commitish[commitish] = []
+        keys_by_commitish[commitish].append(key)
+
+    urls_by_commitish = {}
+    for commitish, keys in keys_by_commitish.items():
+        key = None
+        if release_platform == 'windows':
+            # Exclude things that are certainly not windows packages, so a
+            # commitish with only (say) a mac build doesn't match below.
+            candidates = [
+                k
+                for k in keys
+                if not k.endswith(('.dmg', '.tar.gz', '.tgz', 'web.zip'))
+            ]
+            if len(candidates) == 1:
+                key = candidates[0]
+            else:
+                candidates = [k for k in candidates if 'windows' in k]
+                if len(candidates) == 1:
+                    key = candidates[0]
+                else:
+                    key = next((k for k in candidates if 'x64' in k), None) or next(
+                        (k for k in candidates if 'x86' in k), None
+                    )
+        elif release_platform == 'mac':
+            key = next(
+                (k for k in keys if k.endswith('mac-universal.dmg')), None
+            ) or next((k for k in keys if k.endswith('.dmg')), None)
+        elif release_platform == 'linux':
+            key = next((k for k in keys if k.endswith('linux.tar.gz')), None) or next(
+                (k for k in keys if k.endswith(('ubuntu.tar.gz', 'ubuntu.tgz'))), None
+            )
+        if key:
+            urls_by_commitish[commitish] = f'{bucket_url}/{key}'
+
+    return urls_by_commitish
+
+
+def get_local_builds(branch: str, revisions=None):
+    if revisions is None:
+        revisions = []
+
+    commit_counts = get_commit_counts(branch)
+    for sha, commit_count in commit_counts.items():
+        if not next((r for r in revisions if r.commit_count == commit_count), None):
+            r = Revision(sha, commit_count, type='local')
+            r.is_local_build = True
+            revisions.append(r)
+
+    return revisions
+
+
+def get_revisions(
+    release_platform: str,
+    channel: str,
+    include_test_builds=True,
+    may_build_locally=False,
+    exclude_failed_local_builds=True,
+):
+    revisions: list[Revision] = []
+
+    if channel == 'main':
+        branch = 'main'
+        tags = subprocess.check_output(
+            [
+                'git',
+                '-P',
+                'tag',
+                '--merged=main',
+                '--sort=committerdate',
+                'nightly*',
+                '2.55-[Aa]lpha-*',
+                '3.*',
+            ],
+            encoding='utf-8',
+        ).splitlines()
+    elif channel == '2.55':
+        branch = 'releases/2.55'
+        tags = subprocess.check_output(
+            [
+                'git',
+                '-P',
+                'tag',
+                '--merged=releases/2.55',
+                '--sort=committerdate',
+                'nightly*',
+                '2.55-[Aa]lpha-*',
+                '2.55.*',
+            ],
+            encoding='utf-8',
+        ).splitlines()
+    else:
+        raise Exception(f'unknown channel: {channel}')
+
+    ignore_commit_counts = []
+
+    for tag in tags:
+        commit_count = get_release_commit_count_of_tag(branch, tag)
+
+        if commit_count is not None and not revision_count_supports_platform(
+            commit_count, release_platform, branch
+        ):
+            ignore_commit_counts.append(commit_count)
+            continue
+
+        # Every release after this one will have binaries, but before only some do.
+        if (
+            commit_count is not None
+            and commit_count
+            < get_release_commit_count_of_tag_or_raise(branch, '2.55-alpha-107')
+        ):
+            # The s3 bucket has packages for some old releases, so only ask
+            # GitHub (which needs a GH_PAT token) when the bucket lacks one.
+            has_package = tag in get_download_urls(
+                release_platform
+            ) or has_release_package(tag, release_platform)
+            if not has_package:
+                ignore_commit_counts.append(commit_count)
+                continue
+
+        if commit_count is None:
+            continue
+
+        revisions.append(Revision(tag, commit_count, type='release'))
+
+    if include_test_builds:
+        urls_by_commitish = get_download_urls(release_platform)
+        for commitish in urls_by_commitish.keys():
+            if any(r for r in revisions if r.tag == commitish):
+                continue
+
+            commit_count = get_release_commit_count_of_tag(branch, commitish)
+            if commit_count is None or commit_count in ignore_commit_counts:
+                continue
+
+            revisions.append(Revision(commitish, commit_count, type='test'))
+
+    if may_build_locally:
+        revisions = get_local_builds(branch, revisions)
+        if exclude_failed_local_builds:
+            revisions = [
+                r for r in revisions if not _get_historical().local_build_error(r)
+            ]
+
+    revisions.sort(key=lambda x: x.commit_count)
+    return revisions
+
+
+def create_binary_paths(dir: Path, release_platform: str, missing_ok=False):
+    binaries = {'dir': dir}
+
+    if release_platform == 'mac':
+        zc_app_path = next(dir.glob('*.app'))
+        binaries['zc'] = common.find_path(
+            zc_app_path / 'Contents/Resources', ['zplayer', 'zelda'], missing_ok
+        )
+        binaries['zq'] = common.find_path(
+            zc_app_path / 'Contents/Resources', ['zeditor', 'zquest'], missing_ok
+        )
+        binaries['zl'] = zc_app_path / 'Contents/Resources/zlauncher'
+        binaries['zs'] = common.find_path(
+            zc_app_path / 'Contents/Resources', ['zscript'], missing_ok
+        )
+    elif release_platform == 'windows':
+        binaries['zc'] = common.find_path(dir, ['zplayer.exe', 'zelda.exe'], missing_ok)
+        binaries['zq'] = common.find_path(
+            dir, ['zeditor.exe', 'zquest.exe'], missing_ok
+        )
+        binaries['zl'] = dir / 'zlauncher.exe'
+        binaries['zs'] = common.find_path(dir, ['zscript.exe'], missing_ok)
+    elif release_platform == 'linux':
+        binaries['zc'] = common.find_path(
+            dir, ['bin/zplayer', 'zplayer', 'zelda'], missing_ok
+        )
+        binaries['zq'] = common.find_path(
+            dir, ['bin/zeditor', 'zeditor', 'zquest'], missing_ok
+        )
+        binaries['zl'] = common.find_path(
+            dir, ['bin/zlauncher', 'zlauncher'], missing_ok
+        )
+        binaries['zs'] = common.find_path(dir, ['bin/zscript', 'zscript'], missing_ok)
+
+    return binaries
+
+
+def get_repo():
+    token = os.environ.get('GH_PAT', None)
+    if not token:
+        raise Exception('token required - set GH_PAT env variable')
+
+    gh = Github(token)
+    return gh.get_repo('ZQuestClassic/ZQuestClassic')
+
+
+# TODO: remove this when uploading releases to s3 bucket is automated.
+def get_gh_release_package_url(tag: str, release_platform: str):
+    repo = get_repo()
+    release = repo.get_release(tag)
+    assets = list(release.get_assets())
+
+    asset = None
+    if release_platform == 'mac':
+        asset = next(
+            (a for a in assets if a.name.endswith('mac-universal.dmg')), None
+        ) or next((asset for asset in assets if asset.name.endswith('.dmg')), None)
+    elif release_platform == 'windows':
+        # Exclude things that are certainly not windows packages, so a
+        # release with only (say) a mac build doesn't match below.
+        candidates = [
+            asset
+            for asset in assets
+            if not asset.name.endswith(('.dmg', '.tar.gz', '.tgz'))
+            and 'web' not in asset.name
+        ]
+        if len(candidates) == 1:
+            asset = candidates[0]
+        else:
+            candidates = [asset for asset in candidates if 'windows' in asset.name]
+            asset = next(
+                (asset for asset in candidates if 'x64' in asset.name), None
+            ) or next((asset for asset in candidates if 'x86' in asset.name), None)
+    elif release_platform == 'linux':
+        asset = next(
+            (
+                asset
+                for asset in assets
+                if asset.name.endswith('.tar.gz') or asset.name.endswith('.tgz')
+            ),
+            None,
+        )
+
+    if not asset:
+        return None
+
+    return asset.browser_download_url
+
+
+def download(tag_or_sha: str, release_platform: str, quiet=False):
+    if len(tag_or_sha) == 40:
+        revision_type = 'test'
+    else:
+        revision_type = 'release'
+    revision = Revision(tag_or_sha, -1, revision_type)
+    return download_revision(revision, release_platform, quiet)
+
+
+def download_revision(revision: Revision, release_platform: str, quiet=False):
+    final_dest = revision.dir()
+    if final_dest.exists() and list(final_dest.glob('*')):
+        return final_dest
+
+    def log(msg: str):
+        if not quiet:
+            print(msg, file=sys.stderr)
+
+    tag = revision.tag
+    prefix = f'{bucket_url}/{tag}/'
+
+    if release_platform == 'windows':
+        urls = [
+            f'{prefix}windows-x64.zip',
+            f'{prefix}windows-x86.zip',
+        ]
+    elif release_platform == 'mac':
+        urls = [
+            f'{prefix}mac-universal.dmg',
+            f'{prefix}mac.dmg',
+        ]
+    elif release_platform == 'linux':
+        urls = [
+            f'{prefix}linux.tar.gz',
+            f'{prefix}ubuntu.tar.gz',
+            f'{prefix}ubuntu.tgz',
+        ]
+    else:
+        raise Exception(f'unexpected release_platform: {release_platform}')
+
+    found_url = None
+    for url in urls:
+        log(f'downloading {url}')
+        r = requests.get(url)
+        if not r.ok:
+            log(f'not found: {url}')
+            continue
+
+        found_url = url
+        break
+
+    if not found_url:
+        log(f'Not found on {bucket_url}, falling back to using the GitHub API')
+        url = get_gh_release_package_url(revision.tag, release_platform)
+        if not url:
+            raise Exception(f'could not find package url for {revision.tag}')
+        r = requests.get(url)
+        r.raise_for_status()
+
+    # Extract into a scratch folder and only rename it into place once
+    # complete, so an interrupted extraction (even one killed outright, ex: a
+    # background prefetch at exit) is never mistaken for a finished download.
+    dest = final_dest.with_name(f'{final_dest.name}.partial')
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if release_platform == 'mac':
+            (dest / 'ZQuestClassic.dmg').write_bytes(r.content)
+            subprocess.check_call(
+                [
+                    'hdiutil',
+                    'attach',
+                    '-mountpoint',
+                    str(dest / 'zc-mounted'),
+                    str(dest / 'ZQuestClassic.dmg'),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL if quiet else None,
+            )
+            try:
+                zc_app_path = next((dest / 'zc-mounted').glob('*.app'))
+                shutil.copytree(zc_app_path, dest / zc_app_path.name)
+            finally:
+                subprocess.check_call(
+                    ['hdiutil', 'unmount', str(dest / 'zc-mounted')],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL if quiet else None,
+                )
+            (dest / 'ZQuestClassic.dmg').unlink()
+        elif url.endswith(('.tar.gz', '.tgz')):
+            tf = tarfile.open(fileobj=io.BytesIO(r.content), mode='r')
+            tf.extractall(dest, filter='data')
+            tf.close()
+        else:
+            zf = zipfile.ZipFile(io.BytesIO(r.content))
+            zf.extractall(dest)
+            zf.close()
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+
+    shutil.rmtree(final_dest, ignore_errors=True)
+    dest.rename(final_dest)
+    log(f'finished downloading {tag}')
+    return final_dest
+
+
+class CLI:
+    def __init__(self):
+        parser = argparse.ArgumentParser(
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            description='Download and run any release build. Also supports various builds inbetween releases',
+            epilog=textwrap.dedent('''
+			Command template:
+				- %zc is replaced with the path to the player
+				- %zq is the editor
+				- %zl is the launcher
+				- %zs is the zscript parser
+			
+			Example command to open the player in test mode: %zc -test someqst.qst 0 118
+			'''),
+        )
+        subparsers = parser.add_subparsers(dest='command')
+
+        base = argparse.ArgumentParser(add_help=False)
+        base.add_argument(
+            '--platform',
+            default=common.get_release_platform(),
+            choices=['windows', 'mac', 'linux'],
+        )
+
+        list_cmd = subparsers.add_parser('list', parents=[base])
+        list_cmd.add_argument('--channel', default='main')
+        list_cmd.add_argument(
+            '--test_builds',
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help='Includes pre-built builds not associated with official releases',
+        )
+
+        download_cmd = subparsers.add_parser(
+            'download',
+            parents=[base],
+            help='Downloads the given release (tag or commit sha) to .tmp/archives',
+        )
+        download_cmd.add_argument('tag_or_sha')
+
+        run_cmd = subparsers.add_parser(
+            'run',
+            parents=[base],
+            help='Runs a command for the given version (can be release tag or commit sha), downloading as necessary',
+        )
+        run_cmd.add_argument('tag_or_sha')
+        run_cmd.add_argument('command_args', nargs=argparse.REMAINDER)
+
+        backfill_cmd = subparsers.add_parser('backfill_local_builds', parents=[base])
+
+        args = parser.parse_args()
+        if not args.command:
+            parser.print_help()
+            exit(1)
+        getattr(self, args.command)(args)
+
+    def download(self, args):
+        print(download(args.tag_or_sha, args.platform))
+
+    def list(self, args):
+        revisions = get_revisions(
+            args.platform, args.channel, include_test_builds=args.test_builds
+        )
+        for revision in revisions:
+            print(f'@{revision.commit_count} {revision.tag}')
+
+    def run(self, args):
+        binary_dir = download(args.tag_or_sha, args.platform)
+        binaries = create_binary_paths(binary_dir, args.platform)
+        command_args = args.command_args or ['%zl']
+        p = common.run_zc_command(binaries, command_args)
+        exit(p.wait())
+
+    def backfill_local_builds(self, args):
+        _get_historical().backfill(args.platform)
+
+
+if __name__ == '__main__':
+    CLI()

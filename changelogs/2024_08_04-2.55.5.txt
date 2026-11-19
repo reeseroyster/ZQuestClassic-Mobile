@@ -1,0 +1,77 @@
+https://zquestclassic.com/releases/2.55.5
+
+# Features
+
+
+zc: Add opt-in automation for uploading replays
+  When enabled, once a week replays are uploaded to a server when the
+  program exits. Only replays of known quests from the database are
+  uploaded. There is also an option to manually trigger this process
+  rather than enabling it automatically.
+  
+  Please consider enabling this, as it greatly helps out with development
+  by allowing us to prevent bugs. This is important for any new features
+  we add, but extremely so for the upcoming Z3 scrolling overhaul.
+  
+  See `docs/replays.md` for more information about the replay system.
+
+
+# Bug Fixes
+
+Avoid crash when loading midi using native file dialog
+Capture allegro 5 systems logging in allegro.log
+Crash in native file picker from bad string
+Sprite drawing not deleting all bitmaps it created
+Crash when file prompt initial path has no slash
+zc: Kill all sound effects for passageways, item cellars, and when stepping out of a warp
+zc: [windows] save path being cut off in log
+zc: Resolve replay qst against quests dir, handle missing file better
+zc: Prevent replay save from happening on title screen
+zc: Also save replay when selecting Quit Without Saving
+zc: Shadows for rocks and boulders not drawing
+zc: Side shield flags on npcs being flipped when facing left/right
+zq: [windows] Load Tileset with native file dialog no longer busted
+zq: Wording consistency issue (`trigger` should refer to the `Triggers` tab)
+
+zq: Some number entries (using SWAP_ZSINT_NO_DEC) being broken
+  Notably fixes many spots in the "Insert SCC" dialog, and some in combo wizards.
+
+zq: Death/spawn sprites not properly updating on tile move
+zq: Mark ffc count dirty when using Paste Special > FFC
+  This was preventing FFCs from being retained on a screen when using
+  the special FFC paste mode.
+
+zq: Restore proper animation speed for combos in screen view
+launcher: Remove defunct "Allow Multiple Instances" option
+
+# Build
+
+
+Upgrade allegro
+  https://github.com/liballeg/allegro5/compare/549f189df3408bba27524763289545f20771c3b0...c6b10fff225a0c94e2785e2e2d6d99a2f068ccf4
+
+Enable type-limits diagnostic as error, fix many issues found
+
+# Refactors
+
+zc: Remove epilipsey dialog on fresh install, add toggle in launcher
+zc: Remove prompt about recording when starting a new save file
+zq: Add sub-menu for changing tile color depth
+
+zscript: Remove unused greyscale and monochrome filters
+  Removes these methods:
+  
+  * `Graphics->Greyscale()`
+  * `Graphics->Monochrome()`
+  * `Game->GreyscaleOff()`
+  * `Game->GreyscaleOn()`
+  
+  None of these are used in published quests, `Graphics->Tint()` and
+  `Graphics->MonochromeHue()` can be used instead, and removing these
+  simplifies some rendering logic.
+
+zscript: Remove option to configure run function name
+
+# Misc.
+
+zc: Add qst_title, qst_hash as replay meta fields

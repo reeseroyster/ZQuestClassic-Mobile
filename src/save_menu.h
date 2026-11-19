@@ -1,0 +1,82 @@
+#pragma once
+
+#include "base/headers.h"
+#include "zalleg/zalleg.h"
+#include "core/flags.h"
+#include "sfx.h"
+#include <optional>
+
+namespace flags {
+enum save_menu_flags : uint16_t
+{
+	SMENU_CONFIRM_A       = F(0),
+	SMENU_CANCEL_B        = F(1),
+	SMENU_DONT_KILL_MUSIC = F(2),
+	SMENU_REPEAT_BG       = F(3),
+	SMENU_DONT_KILL_SFX   = F(4),
+};
+enum save_menu_option_flags : uint16_t
+{
+	SMENU_OPT_EXIT        = F(0),
+	SMENU_OPT_CONTINUE    = F(1),
+	SMENU_OPT_RELOAD      = F(2),
+	SMENU_OPT_SAVE        = F(3),
+	SMENU_OPT_CANCEL      = F(4),
+};
+} // ends namespace
+#define SMENU_FLAG_COUNT 5
+#define SMENU_OPTION_FLAG_COUNT 5
+struct SaveMenuOption
+{
+	string text {};
+	save_menu_option_flags flags {};
+	byte color = WHITE, picked_color = WHITE;
+	byte shadow_type = sstsNORMAL;
+	byte shadow_color = BLACK, picked_shadow_color = BLACK;
+	int32_t font = 0;
+	script_config gen_scrconfig {};
+	bool operator==(SaveMenuOption const& other) const = default;
+};
+struct SaveMenuMiscText
+{
+	string text {};
+	byte color = WHITE, shadow_type = sstsNORMAL, shadow_color = BLACK;
+	int32_t font = 0;
+	byte x = 128, y = 32;
+	byte text_align = ALIGN_CENTER;
+	bool operator==(SaveMenuMiscText const& other) const = default;
+};
+
+#define MAX_SAVEMENU_OPTIONS 20
+#define MAX_SAVEMENU_MISC_TEXTS 20
+
+#define SAVEMENU_NAME_LENGTH 32
+#define SAVEMENU_OPTION_TEXT_LENGTH 48
+#define SAVEMENU_MISC_TEXT_LENGTH 48
+
+struct SaveMenu
+{
+	string name;
+	save_menu_flags flags;
+	int32_t cursor_tile, bg_tile;
+	byte cursor_cset, bg_cset, bg_tw = 1, bg_th = 1;
+	byte bg_color = BLACK;
+	word cursor_sfx = WAV_CHINK, choose_sfx = WAV_CHINK;
+	byte hspace = 6, vspace = 16;
+	byte opt_x = 128, opt_y = 48;
+	int16_t opt_sel_x_offset = 0, opt_sel_y_offset = 0;
+	byte text_align = ALIGN_LEFT, textbox_align = ALIGN_CENTER;
+	word close_frames = 30;
+	byte close_flash_rate = 5;
+	word music;
+	std::vector<SaveMenuOption> options;
+	std::vector<SaveMenuMiscText> misc_texts;
+	
+	bool is_empty() const;
+	bool is_valid() const;
+	void clear();
+	optional<byte> run(optional<byte> cursor = nullopt, bool continue_point = false) const;
+	bool tick(optional<byte>& cursor, word& clk) const;
+	void draw(BITMAP* dest, optional<byte> cursor, word clk) const;
+	bool operator==(SaveMenu const& other) const = default;
+};

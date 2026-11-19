@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Sampled from ZQuest's own in-game dialog: panel, cyan text, green highlight. -->
+    <color name="zc_background">#0B0F10</color>
+    <color name="zc_panel">#31393A</color>
+    <color name="zc_panel_edge">#425152</color>
+    <color name="zc_text">#E6EDEE</color>
+    <color name="zc_text_dim">#8A9A9B</color>
+    <color name="zc_cyan">#109ABD</color>
+    <color name="zc_green">#19C68C</color>
+    <color name="zc_gold">#E19C0D</color>
+</resources>

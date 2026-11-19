@@ -1,0 +1,83 @@
+name: Code Coverage
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths: ["tests/**"]
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  # Get the LFS cache ready. This avoids every shard of each environment downloading the LFS objects
+  # at the same time on any change, which is bad for quota.
+  warm-lfs-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - name: git clone
+        uses: connorjclark/action-cached-lfs-checkout@3ea4dc59b06f3baa8c01ba891fbfc2dbfdce5bc8
+        with:
+          enableCrossOsArchive: true
+
+  collect-coverage:
+    needs: warm-lfs-cache
+    if: github.repository == 'ZQuestClassic/ZQuestClassic'
+    # See https://github.com/community/community/discussions/40777
+    # uses: ./.github/workflows/test.yml
+    uses: ZQuestClassic/ZQuestClassic/.github/workflows/test.yml@main
+    with:
+      runs-on: ubuntu-22.04
+      arch: x64
+      compiler: clang
+      config: Coverage
+      # TODO yuurand.zplay rng desyncs on frame 449856, because Debug mode.
+      extra-args: --replay --frame=yuurand.zplay=449855
+      from-ci-workflow: true
+    secrets:
+      GH_PAT_ZSCRIPT_DATABASE: ${{ secrets.GH_PAT_ZSCRIPT_DATABASE }}
+
+  upload-coverage:
+    needs: ["collect-coverage"]
+    runs-on: ubuntu-22.04
+    if: github.repository == 'ZQuestClassic/ZQuestClassic'
+
+    steps:
+      - name: git clone
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - run: pip install -r requirements.txt
+
+      - uses: actions/download-artifact@v6
+        with:
+          path: coverage-json
+
+      - run: cp -r coverage-json/generated-source-files/* src/
+
+      - name: Generate coverage report
+        run: bash tests/generate_coverage_report.sh --add-tracefile "coverage-json/**/coverage.json"
+        env:
+          GCOV: llvm-cov-14 gcov
+
+      - name: Install Node.js 18.x
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18.x
+      - run: |
+          git remote set-url origin https://git:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
+          mkdir tmp
+          npx gh-pages --dist tests/.coverage/report --dest coverage -u "github-actions-bot <support+actions@github.com>"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # https://github.com/tschaub/gh-pages/issues/354
+          CACHE_DIR: tmp
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: tests/.coverage/coverage.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-html-report
+          path: ${{ github.workspace }}/tests/.coverage/report/

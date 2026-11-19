@@ -1,0 +1,42 @@
+stderr:
+
+Compiling 'modify_input.zs'
+Pass 1: Parsing
+Pass 2: Preprocessing
+Pass 3: Registration
+Pass 4: Analyzing Code
+Pass 5: Checking code paths
+Pass 6: Generating object code
+Pass 7: Assembling
+Success!
+Compile finished with exit code '0' (success)
+
+stdout:
+
+{
+  "success": true,
+  "diagnostics": [],
+  "metadata": {
+    "currentFileSymbols": 2,
+    "symbols": 6,
+    "identifiers": 7,
+    "elided": true
+  }
+}
+
+zasm:
+
+QUIT; void run() Body
+SETR D4 SP2; void run() Body Start
+NOP
+SETR D2 INPUTPRESSA; if() #8 Test AND while(true) #1 Body [Opt:AlwaysOn] Start
+COMPAREV D2 0
+GOTOCMP 12 ==; Test 'if'
+SETV D2 0; if() #8 Body Start
+PUSHR D2
+POP D2
+CASTBOOLI D2
+SETR INPUTA D2; if() #8 Body End
+NOP
+WAITFRAME; InlineFunc[void Waitframe()] Body AND while(true) #1 Body [Opt:AlwaysOn] End
+GOTO 3; while() #1 End AND [Opt:NeverRet] AND void run() Body End

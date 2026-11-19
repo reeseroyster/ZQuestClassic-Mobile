@@ -1,0 +1,83 @@
+Function run_none-0
+    0: SETR            D4               SP2         [Block 0 -> ]
+    1: PUSHR           SP2
+    2: NOP
+    3: NOP
+    4: PUSHR           D4
+    5: NOP
+    6: NOP
+    7: NOP
+    8: PUSHR           GD0
+    9: CALLFUNC        66                           [Function #4]
+   10: POP             D4
+   11: PUSHR           D2
+   12: PUSHR           D4
+   13: NOP
+   14: NOP
+   15: PUSHR           D4
+   16: NOP
+   17: NOP
+   18: NOP
+   19: PUSHR           GD0
+   20: CALLFUNC        37                           [Function #1]
+   21: POP             D4
+   22: PUSHR           D2
+   23: SETV            D2               80000
+   24: POP             D3
+   25: ADDR            D2               D3
+   26: PUSHR           D2
+   27: CALLFUNC        42                           [Function #2]
+   28: POP             D4
+   29: POP             D3
+   30: SUBR            D3               D2
+   31: NOP
+   32: PUSHR           D3
+   33: CALLFUNC        62                           [Function #3]
+   34: POP             D4
+   35: TRACER          D2
+   36: QUIT
+
+
+Function Function #1
+   37: POP             D3                           [Block 0 -> ]
+   38: NOP
+   39: SETR            D2               LINKX
+   40: NOP
+   41: RETURNFUNC
+
+
+Function Function #2
+   42: NOP                                          [Block 0 -> ]
+   43: SETR            D4               SP2
+   44: NOP
+   45: NOP
+   46: LOAD            D2               0
+   47: PUSHR           D2
+   48: SETV            D2               40000
+   49: POP             D3
+   50: RSHIFTR         D3               D2
+   51: NOP
+   52: NOP
+   53: SETV            D2               40000
+   54: NOP
+   55: LSHIFTR         D3               D2
+   56: SETR            D2               D3
+   57: NOP
+   58: NOP
+   59: POP             D3
+   60: NOP
+   61: RETURNFUNC
+
+
+Function Function #3
+   62: POP             D2                           [Block 0 -> ]
+   63: ABS             D2
+   64: NOP
+   65: RETURNFUNC
+
+
+Function Function #4
+   66: POP             D2                           [Block 0 -> ]
+   67: ARRAYSIZE       D2
+   68: NOP
+   69: RETURNFUNC

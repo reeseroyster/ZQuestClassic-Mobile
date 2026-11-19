@@ -1,0 +1,266 @@
+stderr:
+
+Compiling 'errors_7.zs'
+Pass 1: Parsing
+Pass 2: Preprocessing
+Pass 3: Registration
+Pass 4: Analyzing Code
+errors_7.zs Line 8 @ Columns 2-13 - Warning S108: Array mismatch for types int and int[]
+
+6    
+7        // Due to legacy array type conversion, the default here is to warn.
+8        arr2[0] = 5;
+         ^~~~~~~~~~~
+
+
+errors_7.zs Line 9 @ Columns 2-15 - Warning S108: Array mismatch for types int[][] and int
+
+ 7    // Due to legacy array type conversion, the default here is to warn.
+ 8    arr2[0] = 5;
+ 9    arr[0] = arr2;
+      ^~~~~~~~~~~~~
+
+
+errors_7.zs Line 10 @ Columns 2-16 - Warning S108: Array mismatch for types int[][] and int[]
+
+ 8    arr2[0] = 5;
+ 9    arr[0] = arr2;
+10    arr2[2] = arr2;
+      ^~~~~~~~~~~~~~
+
+
+errors_7.zs Line 11 @ Columns 8-16 - Warning S108: Array mismatch for types int[][] and int[]
+
+ 9    arr[0] = arr2;
+10    arr2[2] = arr2;
+11    int[] arr3_bad = {arr,arr};
+            ^~~~~~~~
+
+
+errors_7.zs Line 16 @ Columns 3-14 - Error S109: Array mismatch for types int and int[]
+
+14    
+15            // Error.
+16            arr2[0] = 5;
+              ^~~~~~~~~~~
+
+
+errors_7.zs Line 17 @ Columns 3-16 - Error S109: Array mismatch for types int[][] and int
+
+15    // Error.
+16    arr2[0] = 5;
+17    arr[0] = arr2;
+      ^~~~~~~~~~~~~
+
+
+errors_7.zs Line 18 @ Columns 3-17 - Error S109: Array mismatch for types int[][] and int[]
+
+16    arr2[0] = 5;
+17    arr[0] = arr2;
+18    arr2[2] = arr2;
+      ^~~~~~~~~~~~~~
+
+
+errors_7.zs Line 19 @ Columns 9-17 - Error S109: Array mismatch for types int[][] and int[]
+
+17    arr[0] = arr2;
+18    arr2[2] = arr2;
+19    int[] arr3_bad = {arr,arr};
+            ^~~~~~~~
+
+
+errors_7.zs Line 32 @ Columns 2-19 - Error T017: Cannot cast from npc[] to int[].
+
+30    
+31        //Errors
+32        arr2[1] = enemies;
+          ^~~~~~~~~~~~~~~~~
+
+
+errors_7.zs Line 33 @ Columns 2-21 - Error T017: Cannot cast from npc to int.
+
+31    //Errors
+32    arr2[1] = enemies;
+33    arr[0] = enemies[0];
+      ^~~~~~~~~~~~~~~~~~~
+
+
+errors_7.zs Line 34 @ Columns 2-25 - Error T017: Cannot cast from npc to int.
+
+32    arr2[1] = enemies;
+33    arr[0] = enemies[0];
+34    arr2[1][0] = enemies[1];
+      ^~~~~~~~~~~~~~~~~~~~~~~
+
+
+Failure!
+Compile finished with exit code '109' (compiled with errors)
+
+stdout:
+
+{
+  "success": false,
+  "code": 109,
+  "diagnostics": [
+    {
+      "range": {
+        "start": {
+          "line": 7,
+          "character": 1
+        },
+        "end": {
+          "line": 7,
+          "character": 12
+        }
+      },
+      "severity": 2,
+      "message": "S108: Array mismatch for types int and int[]"
+    },
+    {
+      "range": {
+        "start": {
+          "line": 8,
+          "character": 1
+        },
+        "end": {
+          "line": 8,
+          "character": 14
+        }
+      },
+      "severity": 2,
+      "message": "S108: Array mismatch for types int[][] and int"
+    },
+    {
+      "range": {
+        "start": {
+          "line": 9,
+          "character": 1
+        },
+        "end": {
+          "line": 9,
+          "character": 15
+        }
+      },
+      "severity": 2,
+      "message": "S108: Array mismatch for types int[][] and int[]"
+    },
+    {
+      "range": {
+        "start": {
+          "line": 10,
+          "character": 7
+        },
+        "end": {
+          "line": 10,
+          "character": 15
+        }
+      },
+      "severity": 2,
+      "message": "S108: Array mismatch for types int[][] and int[]"
+    },
+    {
+      "range": {
+        "start": {
+          "line": 15,
+          "character": 2
+        },
+        "end": {
+          "line": 15,
+          "character": 13
+        }
+      },
+      "severity": 1,
+      "message": "S109: Array mismatch for types int and int[]"
+    },
+    {
+      "range": {
+        "start": {
+          "line": 16,
+          "character": 2
+        },
+        "end": {
+          "line": 16,
+          "character": 15
+        }
+      },
+      "severity": 1,
+      "message": "S109: Array mismatch for types int[][] and int"
+    },
+    {
+      "range": {
+        "start": {
+          "line": 17,
+          "character": 2
+        },
+        "end": {
+          "line": 17,
+          "character": 16
+        }
+      },
+      "severity": 1,
+      "message": "S109: Array mismatch for types int[][] and int[]"
+    },
+    {
+      "range": {
+        "start": {
+          "line": 18,
+          "character": 8
+        },
+        "end": {
+          "line": 18,
+          "character": 16
+        }
+      },
+      "severity": 1,
+      "message": "S109: Array mismatch for types int[][] and int[]"
+    },
+    {
+      "range": {
+        "start": {
+          "line": 31,
+          "character": 1
+        },
+        "end": {
+          "line": 31,
+          "character": 18
+        }
+      },
+      "severity": 1,
+      "message": "T017: Cannot cast from npc[] to int[]."
+    },
+    {
+      "range": {
+        "start": {
+          "line": 32,
+          "character": 1
+        },
+        "end": {
+          "line": 32,
+          "character": 20
+        }
+      },
+      "severity": 1,
+      "message": "T017: Cannot cast from npc to int."
+    },
+    {
+      "range": {
+        "start": {
+          "line": 33,
+          "character": 1
+        },
+        "end": {
+          "line": 33,
+          "character": 24
+        }
+      },
+      "severity": 1,
+      "message": "T017: Cannot cast from npc to int."
+    }
+  ],
+  "metadata": {
+    "currentFileSymbols": 8,
+    "symbols": 16,
+    "identifiers": 53,
+    "elided": true
+  }
+}
