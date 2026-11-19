@@ -52,6 +52,10 @@ The app adapts to any screen orientation — here it is in portrait and landscap
 
 <img src="./.github/screenshots/library.png" width="300" alt="ZQuest Classic Mobile quest library, portrait">
 
+**Gameplay · portrait**
+
+<img src="./.github/screenshots/gameplay-portrait.png" width="300" alt="ZQuest Classic Mobile gameplay, portrait">
+
 **Gameplay · landscape**
 
 <img src="./.github/screenshots/gameplay.png" width="640" alt="ZQuest Classic Mobile gameplay, landscape">
