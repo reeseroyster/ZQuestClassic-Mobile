@@ -4,13 +4,30 @@
 
 # ZQuest Classic Mobile
 
-An unofficial Android port of the [ZQuest Classic](https://github.com/ZQuestClassic/ZQuestClassic) player. Very early — a proof of concept, built almost entirely by an AI agent, that is slowly becoming a playable mobile app. Expect rough edges.
+An unofficial Android port of the [ZQuest Classic](https://github.com/ZQuestClassic/ZQuestClassic) player. An **open-source early alpha** — built with heavy help from an AI agent, and genuinely hoping for contributors. Expect rough edges.
 
 [Preview builds](https://github.com/reeseroyster/zquestclassic-android/releases) · [Upstream project](https://github.com/ZQuestClassic/ZQuestClassic) · [Port patch](./android-port.patch)
 
 ## Status
 
-Early preview. Quests load and play on a phone with touch controls, but nothing here is polished or guaranteed. This is not an official release and is not affiliated with the ZQuest Classic team — all engine credit belongs to them.
+Early alpha. Quests load and play on a phone with touch controls and proper
+save/load, but nothing here is polished or guaranteed. This is not an official
+release and is not affiliated with the ZQuest Classic team — all engine credit
+belongs to them.
+
+## Contributing
+
+This is meant to grow past one person. It began as a proof of concept and is now
+open-source — **pull requests are just as welcome as issue reports.** Current
+priorities if you want a place to start:
+
+- **Physical gamepad/controller support** (the next item on the roadmap)
+- Porting the **quest editor** to mobile
+- **Testing on more devices** (audio, touch layout, orientation)
+
+The whole thing is built with an AI agent doing much of the scaffolding and
+testing, so the bar to contribute is low and the help is genuinely wanted.
+Open an issue to chat about an idea first if you like, or jump straight in.
 
 ## Install
 
