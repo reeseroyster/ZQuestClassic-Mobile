@@ -46,9 +46,15 @@ The engine itself is upstream's C++ core; this repo only adds the Android layer 
 
 ## Images
 
-| Library | Gameplay |
-| --- | --- |
-| ![Library](./.github/screenshots/library.png) | ![Gameplay](./.github/screenshots/gameplay.png) |
+The app adapts to any screen orientation — here it is in portrait and landscape.
+
+**Quest library · portrait**
+
+<img src="./.github/screenshots/library.png" width="300" alt="ZQuest Classic Mobile quest library, portrait">
+
+**Gameplay · landscape**
+
+<img src="./.github/screenshots/gameplay.png" width="640" alt="ZQuest Classic Mobile gameplay, landscape">
 
 ## License
 
