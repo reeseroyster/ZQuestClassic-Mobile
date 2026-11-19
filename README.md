@@ -10,7 +10,7 @@ This repo did none of that work. It is simply the existing ZQuest Classic engine
 
 It's an open-source early alpha — rough edges expected, and honest help genuinely welcome. But the authors of record, always, are upstream's.
 
-[Preview builds](https://github.com/reeseroyster/zquestclassic-android/releases) · [Upstream project](https://github.com/ZQuestClassic/ZQuestClassic) · [Port patch](./android-port.patch)
+[Releases](https://github.com/reeseroyster/ZQuestClassic-Mobile/releases) · [Upstream project](https://github.com/ZQuestClassic/ZQuestClassic) · [Port patch](./android-port.patch)
 
 ## Status
 
@@ -35,14 +35,16 @@ Open an issue to chat about an idea first if you like, or jump straight in.
 
 ## Install
 
-Grab the latest `ZQuestClassicMobile-*.apk` from the [releases page](https://github.com/reeseroyster/zquestclassic-android/releases) and sideload it, or track this repo with [Obtainium](https://github.com/ImranR98/Obtainium) (enable *Include prereleases*) to get updates automatically. Then grant a quest folder or import a `.qst` and tap a quest to play.
+Grab the latest `ZQuestClassicMobile-*.apk` from the [releases page](https://github.com/reeseroyster/ZQuestClassic-Mobile/releases) and sideload it, or track this repo with [Obtainium](https://github.com/ImranR98/Obtainium) to get updates automatically. Then add your quests (a `.qst` or a `.zip` containing one) and tap one to play.
 
 ## What's in this repo
 
-- **[Releases](https://github.com/reeseroyster/zquestclassic-android/releases)** — prebuilt preview APKs (`arm64-v8a` + `x86_64`, Android 6+).
-- **[`android-port.patch`](./android-port.patch)** — the Android shell and mobile changes, applied against upstream ZQuest Classic.
+- **[Releases](https://github.com/reeseroyster/ZQuestClassic-Mobile/releases)** — the current alpha and any preview APKs (`arm64-v8a` + `x86_64`, Android 6+).
+- **The full ported source** — the entire upstream ZQuest Classic engine plus the Android layer in `android/` (quest library, on-screen touch pad, native cog menu, save states) and the save-state serializer in `src/zc/savestate.*`.
+- **[`android-port.patch`](./android-port.patch)** — the port's changes to upstream, as a patch.
+- **Build CI** — `.github/workflows/build.yml` compiles the debug APK on every push and pull request.
 
-The engine itself is upstream's C++ core; this repo only adds the Android layer and distributes preview builds.
+All game and engine credit belongs to upstream; this repository is simply where the Android port of them lives.
 
 ## Images
 
