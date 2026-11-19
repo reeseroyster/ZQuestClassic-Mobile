@@ -52,7 +52,10 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DWANT_NFD=OFF -DWANT_ZUPDATER=OFF -DWANT_WEBSOCKETS=OFF -DWANT_ZC_TESTS=OFF
           cmake --build build-android --target aar -j2
-          cp build-android/_deps/allegro5-build/lib/allegro-release.aar android/app/libs/
+          mkdir -p android/app/libs
+          AAR="$(find build-android -name allegro-release.aar | head -1)"
+          test -n "$AAR" || { echo "allegro-release.aar was not produced"; exit 1; }
+          cp "$AAR" android/app/libs/allegro-release.aar
 
       - name: Assemble debug APK
         run: |
