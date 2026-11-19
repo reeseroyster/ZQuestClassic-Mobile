@@ -4,7 +4,11 @@
 
 # ZQuest Classic Mobile
 
-An unofficial Android port of the [ZQuest Classic](https://github.com/ZQuestClassic/ZQuestClassic) player. An **open-source early alpha** — built with heavy help from an AI agent, and genuinely hoping for contributors. Expect rough edges.
+**All the credit goes to the people who actually made ZQuest Classic and Zelda Classic.** The game, the engine, the quest format, everything that makes this worth playing — that's their work, and this port would not exist without it. Think of this as their game running somewhere it never ran before.
+
+This repo did none of that work. It is simply the existing ZQuest Classic engine, ported to Android **by an AI agent** — we wrote almost nothing ourselves. If you enjoy this, thank [the ZQuest Classic team](https://github.com/ZQuestClassic), not us. And if you want to build or contribute to the real thing, [upstream](https://github.com/ZQuestClassic/ZQuestClassic) is the place to do it.
+
+It's an open-source early alpha — rough edges expected, and honest help genuinely welcome. But the authors of record, always, are upstream's.
 
 [Preview builds](https://github.com/reeseroyster/zquestclassic-android/releases) · [Upstream project](https://github.com/ZQuestClassic/ZQuestClassic) · [Port patch](./android-port.patch)
 
