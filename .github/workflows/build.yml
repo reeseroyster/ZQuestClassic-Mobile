@@ -28,17 +28,22 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # GitHub ubuntu-latest ships an Android SDK; just point at it. (The
+      # android-actions/setup-android action fails here — it tries to install
+      # the legacy "tools" package that Google removed from the SDK repo.)
+      - name: Set up Android SDK (runner-provided)
+        run: |
+          echo "ANDROID_HOME=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}" >> "$GITHUB_ENV"
+          dirname "$(find "${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}/cmdline-tools" -name sdkmanager -type f -print -quit)" >> "$GITHUB_PATH"
 
       - name: Install SDK components
         run: |
+          yes | sdkmanager --licenses >/dev/null || true
           sdkmanager --install "platforms;android-35" "build-tools;35.0.0" \
             "platform-tools" "ndk;27.3.13750724" "cmake;3.30.5"
 
       - name: Build Allegro AAR (arm64-v8a)
         run: |
-          export ANDROID_HOME="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$ANDROID_SDK_PATH}}"
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.3.13750724"
           export PATH="$ANDROID_HOME/cmake/3.30.5/bin:$PATH"
           cmake -G Ninja -S . -B build-android \
