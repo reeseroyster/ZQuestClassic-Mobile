@@ -35,7 +35,7 @@ Open an issue to chat about an idea first if you like, or jump straight in.
 
 ## Install
 
-Grab `app-debug.apk` from the [latest preview release](https://github.com/reeseroyster/zquestclassic-android/releases) and sideload it, or track this repo with [Obtainium](https://github.com/ImranR98/Obtainium) (enable *Include prereleases*) to get updates automatically. Then grant a quest folder or import a `.qst` and tap a quest to play.
+Grab the latest `ZQuestClassicMobile-*.apk` from the [releases page](https://github.com/reeseroyster/zquestclassic-android/releases) and sideload it, or track this repo with [Obtainium](https://github.com/ImranR98/Obtainium) (enable *Include prereleases*) to get updates automatically. Then grant a quest folder or import a `.qst` and tap a quest to play.
 
 ## What's in this repo
 
