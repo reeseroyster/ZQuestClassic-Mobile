@@ -1,11 +1,22 @@
 name: Build Android APK
 
-# Builds the debug APK so every contribution gets a real check. Uses only the
-# built-in GITHUB_TOKEN — no secrets, nothing published automatically.
+# Builds the debug APK when source changes. Docs-only edits (README, docs,
+# screenshots) are skipped, and the heavy layers (Android SDK, Gradle, the
+# native build state) are cached so repeated builds only recompile what changed.
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'README*'
+      - 'docs/**'
+      - '.github/screenshots/**'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'README*'
+      - 'docs/**'
+      - '.github/screenshots/**'
   workflow_dispatch:
 
 permissions:
@@ -14,6 +25,10 @@ permissions:
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  NDK_VER: 27.3.13750724
+  CMAKE_VER: 3.30.5
 
 jobs:
   build:
@@ -36,26 +51,65 @@ jobs:
           echo "ANDROID_HOME=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}" >> "$GITHUB_ENV"
           dirname "$(find "${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}/cmdline-tools" -name sdkmanager -type f -print -quit)" >> "$GITHUB_PATH"
 
+      # NDK + cmake downloads are large; cache them so installs are fast and stable.
+      - name: Cache Android SDK components
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VER }}
+            ${{ env.ANDROID_HOME }}/cmake/${{ env.CMAKE_VER }}
+            ${{ env.ANDROID_HOME }}/platforms/android-35
+            ${{ env.ANDROID_HOME }}/build-tools/35.0.0
+            ${{ env.ANDROID_HOME }}/platform-tools
+          key: android-sdk-${{ runner.os }}-${{ env.NDK_VER }}-${{ env.CMAKE_VER }}
+
       - name: Install SDK components
         run: |
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager --install "platforms;android-35" "build-tools;35.0.0" \
-            "platform-tools" "ndk;27.3.13750724" "cmake;3.30.5"
+            "platform-tools" "ndk;${{ env.NDK_VER }}" "cmake;${{ env.CMAKE_VER }}"
 
-      - name: Build Allegro AAR (arm64-v8a)
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}
+          restore-keys: gradle-${{ runner.os }}
+
+      # The native build state (CMake dir + AAR + Gradle's .cxx). On a cache hit
+      # ninja/Gradle recompile only what changed, and the AAR is reused outright.
+      - name: Cache native build
+        uses: actions/cache@v4
+        with:
+          path: |
+            android/app/.cxx
+            build-android
+            android/app/libs
+          key: native-${{ runner.os }}-${{ github.ref }}
+          restore-keys: |
+            native-${{ runner.os }}-refs/heads/main
+            native-${{ runner.os }}
+
+      - name: Build Allegro AAR (used as-is when cached)
         run: |
-          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.3.13750724"
-          export PATH="$ANDROID_HOME/cmake/3.30.5/bin:$PATH"
-          cmake -G Ninja -S . -B build-android \
-            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-23 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DWANT_NFD=OFF -DWANT_ZUPDATER=OFF -DWANT_WEBSOCKETS=OFF -DWANT_ZC_TESTS=OFF
-          cmake --build build-android --target aar -j2
-          mkdir -p android/app/libs
-          AAR="$(find build-android -name allegro-release.aar | head -1)"
-          test -n "$AAR" || { echo "allegro-release.aar was not produced"; exit 1; }
-          cp "$AAR" android/app/libs/allegro-release.aar
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VER"
+          export PATH="$ANDROID_HOME/cmake/$CMAKE_VER/bin:$PATH"
+          if [ -f android/app/libs/allegro-release.aar ]; then
+            echo "allegro-release.aar present from cache — skipping engine build"
+          else
+            cmake -G Ninja -S . -B build-android \
+              -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-23 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DWANT_NFD=OFF -DWANT_ZUPDATER=OFF -DWANT_WEBSOCKETS=OFF -DWANT_ZC_TESTS=OFF
+            cmake --build build-android --target aar -j2
+            mkdir -p android/app/libs
+            AAR="$(find build-android -name allegro-release.aar | head -1)"
+            test -n "$AAR" || { echo "allegro-release.aar was not produced"; exit 1; }
+            cp "$AAR" android/app/libs/allegro-release.aar
+          fi
 
       - name: Assemble debug APK
         run: |
