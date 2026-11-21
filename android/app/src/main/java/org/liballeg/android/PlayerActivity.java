@@ -14,6 +14,7 @@ import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.DisplayCutout;
 import android.view.Gravity;
+import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
@@ -179,6 +180,7 @@ public final class PlayerActivity extends AllegroActivity {
 
     private void addTouchControls() {
         ViewGroup decor = (ViewGroup) getWindow().getDecorView();
+        padViews.clear();          // rebuilds replace every button view
         if (controlsOverlay != null && controlsOverlay.getParent() instanceof ViewGroup) {
             ((ViewGroup) controlsOverlay.getParent()).removeView(controlsOverlay);
         }
@@ -203,12 +205,19 @@ public final class PlayerActivity extends AllegroActivity {
                 case MotionEvent.ACTION_DOWN:
                 case MotionEvent.ACTION_POINTER_DOWN:
                 case MotionEvent.ACTION_MOVE:
+                    if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                        // A 0.7 s hold flips the controls (see holdToggle). Any real
+                        // tap releases well before that, so taps stay taps.
+                        mainHandler.removeCallbacks(holdToggle);
+                        mainHandler.postDelayed(holdToggle, 700);
+                    }
                     cancelPendingMouseRelease();
                     nativeSetGameMouse((int) event.getX(), (int) event.getY(), true);
                     return true;
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_POINTER_UP:
                 case MotionEvent.ACTION_CANCEL: {
+                    mainHandler.removeCallbacks(holdToggle);
                     final int x = (int) event.getX();
                     final int y = (int) event.getY();
                     cancelPendingMouseRelease();
@@ -291,11 +300,9 @@ public final class PlayerActivity extends AllegroActivity {
         rBtn = makeControl("R", KeyEvent.KEYCODE_W, sc(78));
         FrameLayout.LayoutParams rTop = new FrameLayout.LayoutParams(sc(78), sc(78), Gravity.TOP | Gravity.END);
 
-        // The gear stays in the controls overlay (OUTSIDE gamePad) so hiding the pad
-        // never strands you without the cog. In landscape it normally sits hidden and
-        // the centre trio carries the visible cog; it reappears if the pad is hidden.
-        cfgBtn = makeCogButton(sc(66));
-        FrameLayout.LayoutParams cfgTop;
+        // No standby gear: it was what a player who hid the pad saw parked at the
+        // bottom of the screen. Hiding the pad now hides every overlay, and holding
+        // the screen brings the controls back (see dispatchTouchEvent).
 
         // Movement stick, plus the primary face buttons.
         stick = new StickView();
@@ -327,9 +334,6 @@ public final class PlayerActivity extends AllegroActivity {
             centerRow.addView(makeCogButton(sc(70)));   // same Map/Start/cog trio as landscape
             centerParams = new FrameLayout.LayoutParams(-2, sc(70) + dp(20), Gravity.CENTER_HORIZONTAL | Gravity.BOTTOM);
             centerParams.setMargins(0, 0, 0, dp(14));
-            // Standby gear (bottom-right) shows only when the pad is hidden.
-            cfgTop = new FrameLayout.LayoutParams(sc(66), sc(66), Gravity.END | Gravity.BOTTOM);
-            cfgTop.setMargins(0, 0, dp(12), dp(14));
         } else {
             // Symmetric LANDSCAPE layout, positioned from the native-rendered game
             // top/bottom (placeLandscapeDeck) so it centres on ANY screen: L/R raised
@@ -345,8 +349,6 @@ public final class PlayerActivity extends AllegroActivity {
             // Game fills the screen in landscape, so the trio clusters bottom-right.
             centerParams = new FrameLayout.LayoutParams(-2, sc(70) + dp(20), Gravity.END | Gravity.BOTTOM);
             centerParams.setMargins(0, 0, dp(20), dp(8));
-            cfgTop = new FrameLayout.LayoutParams(sc(66), sc(66), Gravity.CENTER_HORIZONTAL | Gravity.BOTTOM);
-            cfgTop.setMargins(0, 0, dp(6), dp(6));
         }
 
         gamePadContainer.addView(lBtn, lTop);
@@ -362,16 +364,6 @@ public final class PlayerActivity extends AllegroActivity {
         gamePad.setVisibility(isVisible ? View.VISIBLE : View.GONE);
 
         controls.addView(gamePad, new ViewGroup.LayoutParams(-1, -1));
-
-        // Add the gear after the pad so it sits on top in z-order and stays
-        // visible even when the pad is hidden (Show/Hide Pad).
-        controls.addView(cfgBtn, cfgTop);
-        // In both orientations the live cog lives in the center trio (inside the pad),
-        // so the standalone gear is a standby for when the pad is hidden. Respect the
-        // persisted pad state at launch so the menu stays reachable after a relaunch.
-        boolean isVisible2 = getSharedPreferences("zquestclassic", MODE_PRIVATE)
-                .getBoolean("controls-visible", true);
-        cfgBtn.setVisibility(isVisible2 ? View.GONE : View.VISIBLE);
 
         // Keep nudging the shoulder row down onto the black until the native
         // render reports the real game bottom (it fills in shortly after launch).
@@ -593,20 +585,42 @@ public final class PlayerActivity extends AllegroActivity {
     }
 
     private void toggleGamePad() {
-        if (gamePad == null) return;
-        // Toggle the PERSISTED preference and apply it directly (the pad is now
-        // always visible, even under the open menu, so no modal special-casing).
-        boolean newState = !getSharedPreferences("zquestclassic", MODE_PRIVATE)
+        boolean show = !controlsShown();
+        setControlsVisible(show);
+        if (!show) {
+            Toast.makeText(this, "Controls hidden — press and hold the screen to bring them back",
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private boolean controlsShown() {
+        return getSharedPreferences("zquestclassic", MODE_PRIVATE)
                 .getBoolean("controls-visible", true);
+    }
+
+    /** Owns the persisted pref, so every path (row, gesture, launch) agrees. */
+    private void setControlsVisible(boolean visible) {
         getSharedPreferences("zquestclassic", MODE_PRIVATE)
                 .edit()
-                .putBoolean("controls-visible", newState)
+                .putBoolean("controls-visible", visible)
                 .apply();
-        gamePad.setVisibility(newState ? View.VISIBLE : View.GONE);
-        // In both orientations the visible cog lives in the center trio (inside the
-        // pad), so the standalone gear is the standby: show it only once the pad is
-        // hidden, to keep the menu reachable.
-        if (cfgBtn != null) cfgBtn.setVisibility(newState ? View.GONE : View.VISIBLE);
+        if (gamePad != null) gamePad.setVisibility(visible ? View.VISIBLE : View.GONE);
+    }
+
+    /** Hold anywhere the pad itself does not claim -> flip the controls. Buttons and
+     *  the stick consume their own touches, so holding B or the stick never trips it;
+     *  only a hold on the open game area (or on the bare screen once hidden) does. */
+    private final Runnable holdToggle = () -> {
+        if (menuOpen()) return;
+        boolean show = !controlsShown();
+        setControlsVisible(show);
+        Toast.makeText(this, show ? "Controls shown"
+                : "Controls hidden — hold the screen to bring them back",
+                Toast.LENGTH_SHORT).show();
+    };
+
+    private boolean menuOpen() {
+        return menuScrim != null && menuScrim.getVisibility() == View.VISIBLE;
     }
 
     // The library runs in its own process, so the game can shut its own process
@@ -726,7 +740,7 @@ public final class PlayerActivity extends AllegroActivity {
         int top = Math.max(0, gb + dp(20) - padTopInset);
         FrameLayout.LayoutParams l = (FrameLayout.LayoutParams) lBtn.getLayoutParams();
         l.topMargin = top; lBtn.setLayoutParams(l);
-        // cfgBtn (the gear) is fixed bottom-right, not part of this row.
+        // The gear now lives only in the centre trio, inside the pad.
         FrameLayout.LayoutParams r = (FrameLayout.LayoutParams) rBtn.getLayoutParams();
         r.topMargin = top; rBtn.setLayoutParams(r);
     }
@@ -766,6 +780,7 @@ public final class PlayerActivity extends AllegroActivity {
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(size, size);
         params.setMargins(sc(11), sc(11), sc(11), sc(11));
         button.setLayoutParams(params);
+        padViews.put(keyCode, button);
         return button;
     }
 
@@ -800,6 +815,7 @@ public final class PlayerActivity extends AllegroActivity {
      */
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        if (!syntheticKey && handleGamepadKey(event)) return true;
         if (textCapture && !syntheticKey && event.getAction() == KeyEvent.ACTION_DOWN) {
             int code = event.getKeyCode();
             if (code == KeyEvent.KEYCODE_DEL) {
@@ -817,6 +833,102 @@ public final class PlayerActivity extends AllegroActivity {
             }
         }
         return super.dispatchKeyEvent(event);
+    }
+
+    // --------------------------------------------------------------- gamepad
+    // A physical controller is mapped onto the SAME bindings the on-screen pad
+    // presses (Z/X/W/Q, Space, Enter, arrows), so it works no matter which
+    // control scheme is active — exactly like the touch pad does.
+
+    /** Directions currently held, so a key-up and an axis-at-rest cannot fight. */
+    private final java.util.HashSet<Integer> gamepadDirs = new java.util.HashSet<>();
+
+    /** On-screen button per pad keycode, so a controller press can light the same
+     *  glyph the finger would. Filled by makeControl(). */
+    private final Map<Integer, TextView> padViews = new HashMap<>();
+
+    /** Mirrors controller input onto the visible pad: press/release a button glyph. */
+    private void setPadVisual(int keyCode, boolean down) {
+        TextView v = padViews.get(keyCode);
+        if (v != null) v.setBackground(background(down));
+    }
+
+    /** Hardware button -> the pad button's Android keycode. 0 = not one. */
+    private int gamepadButtonKey(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_BUTTON_A: return KeyEvent.KEYCODE_Z;           // A
+            case KeyEvent.KEYCODE_BUTTON_B: return KeyEvent.KEYCODE_X;           // B
+            case KeyEvent.KEYCODE_BUTTON_Y: return KeyEvent.KEYCODE_Q;           // L
+            case KeyEvent.KEYCODE_BUTTON_X: return KeyEvent.KEYCODE_W;           // R
+            case KeyEvent.KEYCODE_BUTTON_L1: return KeyEvent.KEYCODE_Q;          // L
+            case KeyEvent.KEYCODE_BUTTON_R1: return KeyEvent.KEYCODE_W;          // R
+            case KeyEvent.KEYCODE_BUTTON_SELECT: return KeyEvent.KEYCODE_SPACE;  // Map
+            case KeyEvent.KEYCODE_BUTTON_START: return KeyEvent.KEYCODE_ENTER;   // Start
+            default: return 0;
+        }
+    }
+
+    /** Hardware d-pad -> engine direction scancode (Allegro KEY_UP/DOWN/LEFT/RIGHT). */
+    private int gamepadDirScancode(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_DPAD_UP: return 84;
+            case KeyEvent.KEYCODE_DPAD_DOWN: return 85;
+            case KeyEvent.KEYCODE_DPAD_LEFT: return 82;
+            case KeyEvent.KEYCODE_DPAD_RIGHT: return 83;
+            default: return -1;
+        }
+    }
+
+    private void setGamepadDir(int scancode, boolean down) {
+        if (down == gamepadDirs.contains(scancode)) return;
+        if (down) gamepadDirs.add(scancode);
+        else gamepadDirs.remove(scancode);
+        nativeSetGameKey(scancode, down);
+    }
+
+    /** True when the event was a controller input we consumed. */
+    private boolean handleGamepadKey(KeyEvent event) {
+        if (event.getAction() == KeyEvent.ACTION_MULTIPLE) return false;
+        boolean down = event.getAction() == KeyEvent.ACTION_DOWN;
+        int code = event.getKeyCode();
+        int padKey = gamepadButtonKey(code);
+        if (padKey != 0) {
+            // Same dual path as the on-screen buttons: the key event drives the
+            // game loop, the held state is what blocking prompts read.
+            sendKey(padKey, down ? KeyEvent.ACTION_DOWN : KeyEvent.ACTION_UP);
+            int compat = compatScancode(padKey);
+            if (compat >= 0) nativeSetGameKey(compat, down);
+            setPadVisual(padKey, down);
+            return true;
+        }
+        int dir = gamepadDirScancode(code);
+        if (dir >= 0) {
+            setGamepadDir(dir, down);
+            return true;
+        }
+        return false;
+    }
+
+    /** Left stick and d-pad hat -> held direction state, like the thumbstick. */
+    @Override
+    public boolean dispatchGenericMotionEvent(MotionEvent event) {
+        int src = event.getSource();
+        boolean pad = (src & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
+                || src == InputDevice.SOURCE_GAMEPAD;
+        if (!syntheticKey && pad && event.getAction() == MotionEvent.ACTION_MOVE) {
+            float x = event.getAxisValue(MotionEvent.AXIS_X);
+            float y = event.getAxisValue(MotionEvent.AXIS_Y);
+            float hx = event.getAxisValue(MotionEvent.AXIS_HAT_X);
+            float hy = event.getAxisValue(MotionEvent.AXIS_HAT_Y);
+            setGamepadDir(84, y < -0.5f || hy < -0.5f);
+            setGamepadDir(85, y > 0.5f || hy > 0.5f);
+            setGamepadDir(82, x < -0.5f || hx < -0.5f);
+            setGamepadDir(83, x > 0.5f || hx > 0.5f);
+            // Move the on-screen knob too, so the pad reflects the real stick.
+            if (stick != null && controlsShown()) stick.setFromAxes(x, y);
+            return true;
+        }
+        return super.dispatchGenericMotionEvent(event);
     }
 
     /** Android keycode -> the compat layer's scancode for the same key. */
@@ -936,6 +1048,16 @@ public final class PlayerActivity extends AllegroActivity {
             for (int i = 0; i < held.length; i++) setDirection(i, false);
             centreX = getWidth() / 2f;
             centreY = getHeight() / 2f;
+            invalidate();
+        }
+
+        /** Controller stick position (-1..1 axes); ignored while a finger owns it.
+         *  Visual only — the directions are already driven by the pad bridge. */
+        void setFromAxes(float ax, float ay) {
+            if (activePointer >= 0) return;
+            float r = radius();
+            knobX = ax * r;
+            knobY = ay * r;
             invalidate();
         }
 
@@ -1778,7 +1900,7 @@ public final class PlayerActivity extends AllegroActivity {
 
     // Shoulder-row buttons; repositioned once the native render reports the real
     // game bottom, so they sit on the black below the game on any screen.
-    private TextView lBtn, rBtn, cfgBtn;
+    private TextView lBtn, rBtn;
     private boolean padPortrait;
     private int padTopInset;
 
